@@ -105,6 +105,7 @@ export interface Turn {
   errorCode?: string | null;
   errorMessage?: string | null;
   result?: TurnResult | null;
+  priority?: number;
   createdAt: string;
   startedAt?: string | null;
   finishedAt?: string | null;

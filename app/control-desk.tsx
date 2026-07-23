@@ -56,6 +56,7 @@ import {
   Zap,
 } from "lucide-react";
 import {
+  type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type ReactNode,
   useCallback,
@@ -103,6 +104,60 @@ type ConfirmState = {
 
 const LIVE_TURN = new Set(["queued", "preparing", "running", "saving"]);
 const LIVE_TASK = new Set(["queued", "running"]);
+
+const TASK_PRIORITY_OPTIONS = [
+  { value: 100, label: "紧急", detail: "优先于其他等级" },
+  { value: 10, label: "较高", detail: "优先于普通任务" },
+  { value: 0, label: "普通", detail: "按当前队列顺序" },
+] as const;
+
+function taskTitleFromContent(content: string) {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  const firstSentence = normalized.split(/[。！？!?；;]/, 1)[0]?.trim();
+  return (firstSentence || normalized || "新任务").slice(0, 60);
+}
+
+function estimateTaskStart({
+  priority,
+  project,
+  workers,
+  turns,
+}: {
+  priority: number;
+  project: Project;
+  workers: Worker[];
+  turns: Turn[];
+}) {
+  const compatibleWorkers = workers.filter(
+    (worker) =>
+      worker.enabled &&
+      (worker.projectId === project.id ||
+        worker.projectIds?.includes(project.id) ||
+        project.compatibleWorkerIds?.includes(worker.id)),
+  );
+  const readyWorkers = compatibleWorkers.filter(
+    (worker) => worker.status === "ready",
+  ).length;
+  const activeWorkers = compatibleWorkers.filter((worker) =>
+    ["busy", "preparing"].includes(worker.status),
+  ).length;
+  const queuedAhead = turns.filter(
+    (turn) =>
+      turn.status === "queued" && Number(turn.priority ?? 0) >= priority,
+  ).length;
+
+  if (readyWorkers > queuedAhead) return "可立即开始";
+  const usableSlots = readyWorkers + activeWorkers;
+  if (usableSlots === 0) return "等待工位恢复";
+
+  const turnsUntilStart = Math.max(1, queuedAhead - readyWorkers + 1);
+  const waves = Math.max(1, Math.ceil(turnsUntilStart / usableSlots));
+  const minutes = waves * 30;
+  if (minutes < 60) return `约 ${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `约 ${hours} 小时 ${remainder} 分` : `约 ${hours} 小时`;
+}
 
 const taskStatusLabel: Record<string, string> = {
   queued: "排队中",
@@ -911,6 +966,7 @@ export default function ControlDesk() {
         <CreateTaskModal
           projects={snapshot.projects.filter((project) => project.enabled)}
           workers={snapshot.workers}
+          turns={snapshot.turns}
           busy={busy}
           onClose={() => setCreateTaskOpen(false)}
           onSubmit={async (payload, files) => {
@@ -919,16 +975,11 @@ export default function ControlDesk() {
               const attachments = [];
               for (const file of files)
                 attachments.push(await uploadFile(file));
-              const referenceLines = Array.isArray(payload.references)
-                ? payload.references.filter(
-                    (item): item is string =>
-                      typeof item === "string" && Boolean(item),
-                  )
-                : [];
-              const message = `${String(payload.requirement ?? "")}${referenceLines.length ? `\n\n参考链接：\n${referenceLines.map((item) => `- ${item}`).join("\n")}` : ""}`;
+              const message = String(payload.requirement ?? "");
               const idempotencyKey = String(payload.idempotencyKey ?? "");
               const taskPayload = { ...payload };
               delete taskPayload.idempotencyKey;
+              delete taskPayload.requirement;
               const created = await api<{ task: Task } | Task>("/api/tasks", {
                 method: "POST",
                 headers: { "Idempotency-Key": idempotencyKey },
@@ -2635,54 +2686,119 @@ function SettingsPage({
   );
 }
 
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function ImageAttachmentPreview({ file }: { file: File }) {
+  const [preview] = useState(() => URL.createObjectURL(file));
+
+  useEffect(() => () => URL.revokeObjectURL(preview), [preview]);
+
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img src={preview} alt="" />;
+}
+
+function AttachmentChip({
+  file,
+  onRemove,
+}: {
+  file: File;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="attachment-chip">
+      {file.type.startsWith("image/") ? (
+        <ImageAttachmentPreview file={file} />
+      ) : (
+        <span className="attachment-file-icon">
+          <FileCode2 size={18} />
+        </span>
+      )}
+      <span className="attachment-chip-copy">
+        <strong>{file.name}</strong>
+        <small>{formatFileSize(file.size)}</small>
+      </span>
+      <IconButton label={`移除 ${file.name}`} type="button" onClick={onRemove}>
+        <X size={15} />
+      </IconButton>
+    </div>
+  );
+}
+
 function CreateTaskModal({
   projects,
   workers,
+  turns,
   busy,
   onClose,
   onSubmit,
 }: {
   projects: Project[];
   workers: Worker[];
+  turns: Turn[];
   busy: boolean;
   onClose: () => void;
   onSubmit: (payload: Record<string, unknown>, files: File[]) => Promise<void>;
 }) {
   const dialogRef = useDialogFocusTrap(onClose);
   const idempotencyKey = useRef(crypto.randomUUID());
-  const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
-  const [title, setTitle] = useState("");
   const [requirement, setRequirement] = useState("");
-  const [baseBranch, setBaseBranch] = useState(
-    projects[0]?.defaultBranch ?? "main",
-  );
-  const [priority, setPriority] = useState("0");
-  const [references, setReferences] = useState("");
+  const [priority, setPriority] = useState(0);
   const [autoRelease, setAutoRelease] = useState(true);
   const [files, setFiles] = useState<File[]>([]);
-  const [advanced, setAdvanced] = useState(false);
-  const project = projects.find((item) => item.id === projectId);
-  const readyCompatible = workers.filter(
-    (worker) =>
-      worker.status === "ready" &&
-      (worker.projectIds?.includes(projectId) ||
-        project?.compatibleWorkerIds?.includes(worker.id)),
-  ).length;
-  const queued = readyCompatible === 0;
+  const project = projects[0];
+
+  const addFiles = (incoming: File[]) => {
+    setFiles((current) => {
+      const known = new Set(
+        current.map(
+          (file) =>
+            `${file.name}:${file.size}:${file.lastModified}:${file.type}`,
+        ),
+      );
+      return [
+        ...current,
+        ...incoming.filter((file) => {
+          const key = `${file.name}:${file.size}:${file.lastModified}:${file.type}`;
+          if (known.has(key)) return false;
+          known.add(key);
+          return true;
+        }),
+      ];
+    });
+  };
+
+  const pasteImages = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const timestamp = Date.now();
+    const images = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file))
+      .map((file, index) => {
+        const extension =
+          file.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
+        return new File(
+          [file],
+          `粘贴图片-${timestamp}-${index + 1}.${extension}`,
+          { type: file.type, lastModified: timestamp + index },
+        );
+      });
+    if (images.length) addFiles(images);
+  };
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!projectId || !title.trim() || !requirement.trim()) return;
+    if (!project || !requirement.trim()) return;
     void onSubmit(
       {
-        projectId,
-        title: title.trim(),
+        projectId: project.id,
+        title: taskTitleFromContent(requirement),
         requirement: requirement.trim(),
-        baseBranch,
-        priority: Number(priority),
-        references: references
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean),
+        baseBranch: project.defaultBranch,
+        priority,
         autoRelease,
         idempotencyKey: idempotencyKey.current,
       },
@@ -2717,145 +2833,102 @@ function CreateTaskModal({
         </div>
         {projects.length ? (
           <>
-            <label className="form-field project-select">
-              <span>项目</span>
-              <select
-                value={projectId}
-                onChange={(event) => {
-                  const id = event.target.value;
-                  setProjectId(id);
-                  setBaseBranch(
-                    projects.find((item) => item.id === id)?.defaultBranch ??
-                      "main",
-                  );
-                }}
-              >
-                {projects.map((item) => (
-                  <option value={item.id} key={item.id}>
-                    {item.name}
-                  </option>
-                ))}
-              </select>
-              <FolderGit2 size={17} />
-            </label>
-            <label className="form-field">
-              <span>任务标题</span>
-              <input
-                autoFocus
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                placeholder="例如：活动页面红点状态修复"
-                maxLength={120}
-              />
-            </label>
             <label className="form-field requirement-field">
-              <span>希望 Codex 完成什么？</span>
+              <span>
+                任务内容
+                <small>可以直接 Ctrl+V 粘贴截图</small>
+              </span>
               <textarea
+                autoFocus
                 value={requirement}
                 onChange={(event) => setRequirement(event.target.value)}
-                placeholder="描述期望行为、复现步骤、限制条件和验收标准…"
-                rows={7}
+                onPaste={pasteImages}
+                placeholder="直接描述需要完成的内容、复现步骤和验收标准；截图可以直接粘贴到这里…"
+                rows={9}
               />
             </label>
-            <label className="attachment-drop">
-              <Paperclip size={18} />
-              <span>
-                <strong>添加截图或参考文件</strong>
-                <small>
-                  {files.length
-                    ? `已选择 ${files.length} 个文件`
-                    : "PNG、JPG、TXT、LOG，单个文件不超过服务端限制"}
-                </small>
-              </span>
-              <input
-                type="file"
-                multiple
-                onChange={(event) =>
-                  setFiles(Array.from(event.target.files ?? []))
-                }
-              />
-            </label>
-            <div className="task-context-strip">
-              <div>
-                <GitBranch size={15} />
-                <span>
-                  基础分支<strong>{baseBranch}</strong>
-                </span>
-              </div>
-              <div>
-                <Box size={15} />
-                <span>
-                  Unity 环境<strong>{project?.unityVersion || "已配置"}</strong>
-                </span>
-              </div>
-              <div>
-                <Clock3 size={15} />
-                <span>
-                  预计开始
-                  <strong>{queued ? "进入队列等待" : "可立即分配"}</strong>
-                </span>
-              </div>
+            <div className="attachment-actions">
+              <label className="attachment-button">
+                <Paperclip size={17} />
+                添加图片或文件
+                <input
+                  type="file"
+                  multiple
+                  onChange={(event) => {
+                    addFiles(Array.from(event.target.files ?? []));
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </label>
+              <span>支持图片、文本和日志；也可以在上方直接粘贴截图</span>
             </div>
-            <button
-              type="button"
-              className="advanced-toggle"
-              onClick={() => setAdvanced((value) => !value)}
-            >
-              高级选项{" "}
-              <ChevronDown className={advanced ? "rotated" : ""} size={15} />
-            </button>
-            {advanced && (
-              <div className="advanced-fields">
-                <label className="form-field">
-                  <span>基础分支</span>
-                  <input
-                    value={baseBranch}
-                    onChange={(event) => setBaseBranch(event.target.value)}
+            {files.length > 0 && (
+              <div className="attachment-list" aria-label="已添加的文件">
+                {files.map((file, index) => (
+                  <AttachmentChip
+                    key={`${file.name}:${file.size}:${file.lastModified}:${index}`}
+                    file={file}
+                    onRemove={() =>
+                      setFiles((current) =>
+                        current.filter((_, itemIndex) => itemIndex !== index),
+                      )
+                    }
                   />
-                </label>
-                <label className="form-field">
-                  <span>优先级</span>
-                  <select
-                    value={priority}
-                    onChange={(event) => setPriority(event.target.value)}
-                  >
-                    <option value="0">普通</option>
-                    <option value="10">较高</option>
-                    <option value="100">紧急</option>
-                  </select>
-                </label>
-                <label className="form-field wide">
-                  <span>参考链接（每行一个）</span>
-                  <textarea
-                    rows={2}
-                    value={references}
-                    onChange={(event) => setReferences(event.target.value)}
-                  />
-                </label>
-                <label className="toggle-row wide">
-                  <input
-                    type="checkbox"
-                    checked={autoRelease}
-                    onChange={(event) => setAutoRelease(event.target.checked)}
-                  />
-                  <span>
-                    <strong>交付成功后自动释放工位</strong>
-                    <small>只有 push 与远程 SHA 核验都成功后才会释放</small>
-                  </span>
-                </label>
+                ))}
               </div>
             )}
-            {queued && (
-              <div className="queue-notice">
-                <Clock3 size={18} />
-                <div>
-                  <strong>暂时没有可分配的兼容工位</strong>
-                  <p>
-                    任务会自动排队。你可以关闭页面；对话和执行状态会持续保存。
-                  </p>
-                </div>
+            <fieldset className="priority-fieldset">
+              <legend>预计开始</legend>
+              <p>选择调度等级；时间会根据当前工位和队列动态估算。</p>
+              <div className="priority-options">
+                {TASK_PRIORITY_OPTIONS.map((option) => {
+                  const estimate = estimateTaskStart({
+                    priority: option.value,
+                    project,
+                    workers,
+                    turns,
+                  });
+                  return (
+                    <label
+                      key={option.value}
+                      className={cx(
+                        "priority-option",
+                        priority === option.value && "selected",
+                      )}
+                    >
+                      <input
+                        type="radio"
+                        name="priority"
+                        value={option.value}
+                        checked={priority === option.value}
+                        onChange={() => setPriority(option.value)}
+                      />
+                      <span className="priority-card">
+                        <span className="priority-copy">
+                          <strong>{option.label}</strong>
+                          <small>{option.detail}</small>
+                        </span>
+                        <span className="priority-estimate">
+                          <Clock3 size={15} />
+                          <strong>{estimate}</strong>
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
               </div>
-            )}
+            </fieldset>
+            <label className="task-release-toggle">
+              <input
+                type="checkbox"
+                checked={autoRelease}
+                onChange={(event) => setAutoRelease(event.target.checked)}
+              />
+              <span>
+                <strong>交付成功后自动释放工位</strong>
+                <small>关闭后会保留工位，方便继续人工检查</small>
+              </span>
+            </label>
             <div className="modal-actions">
               <span>
                 <ShieldCheck size={14} />
@@ -2870,7 +2943,7 @@ function CreateTaskModal({
               </button>
               <button
                 className="primary-action"
-                disabled={busy || !title.trim() || !requirement.trim()}
+                disabled={busy || !requirement.trim()}
               >
                 {busy ? (
                   <LoaderCircle className="spin" size={17} />
