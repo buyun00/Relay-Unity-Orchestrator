@@ -54,8 +54,53 @@ function buildPrompt(context) {
 }
 
 export class CodexRunner {
-  constructor(config) {
+  constructor(config, { processRunner = runProcess } = {}) {
     this.config = config;
+    this.processRunner = processRunner;
+  }
+
+  environment() {
+    return this.config.codexHome
+      ? { CODEX_HOME: this.config.codexHome }
+      : undefined;
+  }
+
+  async inspect() {
+    const status = {
+      command: this.config.codexCommand,
+      home: this.config.codexHome,
+      available: false,
+      authenticated: false,
+      version: null,
+      loginStatus: null,
+      error: null,
+    };
+    try {
+      const version = await this.processRunner(
+        this.config.codexCommand,
+        ["--version"],
+        {
+          env: this.environment(),
+          timeoutMs: 15_000,
+        },
+      );
+      status.available = true;
+      status.version = (version.stdout || version.stderr).trim() || null;
+      const login = await this.processRunner(
+        this.config.codexCommand,
+        ["login", "status"],
+        {
+          env: this.environment(),
+          timeoutMs: 15_000,
+          acceptExitCodes: [0, 1],
+        },
+      );
+      status.authenticated = login.exitCode === 0;
+      status.loginStatus = (login.stdout || login.stderr).trim() || null;
+    } catch (error) {
+      status.error = error.message;
+    }
+    return status;
   }
 
   async run(context, { signal, onEvent }) {
@@ -101,7 +146,7 @@ export class CodexRunner {
     }
     args.push(
       "--sandbox",
-      "workspace-write",
+      "danger-full-access",
       "--ask-for-approval",
       "never",
       "exec",
@@ -136,8 +181,9 @@ export class CodexRunner {
     };
 
     try {
-      await runProcess(this.config.codexCommand, args, {
+      await this.processRunner(this.config.codexCommand, args, {
         cwd: workspace,
+        env: this.environment(),
         signal,
         timeoutMs: this.config.codexTimeoutMs,
         onStdout: consumeLines,

@@ -188,7 +188,6 @@ export class Store {
     );
     this.migrate();
     this.reconcileInterruptedWork();
-    if (config.adapter === "mock" && config.seedMockData) this.seedMockData();
   }
 
   close() {
@@ -315,6 +314,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS turns_queue_idx ON turns(status, priority DESC, created_at ASC);
       CREATE INDEX IF NOT EXISTS turns_task_idx ON turns(task_id, sequence DESC);
       CREATE INDEX IF NOT EXISTS events_created_idx ON events(id DESC);
+      CREATE INDEX IF NOT EXISTS events_task_idx ON events(task_id, id ASC);
       CREATE INDEX IF NOT EXISTS workers_ready_idx ON workers(enabled, status, project_id);
     `);
     const projectColumns = this.db.prepare("PRAGMA table_info(projects)").all();
@@ -335,93 +335,6 @@ export class Store {
       SET unity_health_url = unity_skill_url
       WHERE unity_health_url IS NULL AND unity_skill_url LIKE '%/health'
     `);
-    this.db
-      .prepare(
-        `
-      UPDATE projects SET
-        unity_skill_url='http://{internalIp}:8090/mcp',
-        unity_health_url='http://{internalIp}:8090/health',
-        unity_save_url='http://{internalIp}:8090/api/save',
-        updated_at=?
-      WHERE id='project-unity-client'
-        AND repo_url='https://example.invalid/unity-client.git'
-    `,
-      )
-      .run(now());
-  }
-
-  seedMockData() {
-    const count = this.db
-      .prepare("SELECT COUNT(*) AS count FROM projects")
-      .get().count;
-    if (count > 0) return;
-    const timestamp = now();
-    const projectId = "project-unity-client";
-    this.db
-      .prepare(
-        `
-      INSERT INTO projects (
-        id, name, repo_url, default_branch, guest_project_path, smb_path,
-        unity_version, unity_skill_url, unity_health_url, unity_save_url, checkpoint_name, enabled,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-    `,
-      )
-      .run(
-        projectId,
-        "Unity Client",
-        "https://example.invalid/unity-client.git",
-        "main",
-        "D:\\Work\\unity-client",
-        "\\\\172.30.240.11\\Work\\unity-client",
-        "2022.3 LTS",
-        "http://{internalIp}:8090/mcp",
-        "http://{internalIp}:8090/health",
-        "http://{internalIp}:8090/api/save",
-        "PROJECT_READY",
-        timestamp,
-        timestamp,
-      );
-    const workers = [
-      ["worker-lin-01", "lin-worker-01", "172.30.240.11", "ready"],
-      ["worker-lin-02", "lin-worker-02", "172.30.240.12", "ready"],
-      ["worker-lin-03", "lin-worker-03", "172.30.240.13", "stopped"],
-    ];
-    const statement = this.db.prepare(`
-      INSERT INTO workers (
-        id, name, vm_name, project_id, checkpoint_name, internal_ip, share_path,
-        status, enabled, health_json, last_seen_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'PROJECT_READY', ?, ?, ?, 1, ?, ?, ?, ?)
-    `);
-    for (const [workerId, name, internalIp, status] of workers) {
-      const running = status === "ready";
-      statement.run(
-        workerId,
-        name,
-        name,
-        projectId,
-        internalIp,
-        `\\\\${internalIp}\\Work\\unity-client`,
-        status,
-        stringifyJson({
-          vm: running,
-          heartbeat: running,
-          smb: running,
-          unity: running,
-          skill: running,
-          checkedAt: timestamp,
-        }),
-        timestamp,
-        timestamp,
-        timestamp,
-      );
-    }
-    this.emit({
-      type: "system.seeded",
-      level: "info",
-      message: "Mock project and workers are ready",
-      data: { projectId, workerCount: workers.length },
-    });
   }
 
   reconcileInterruptedWork() {
@@ -529,6 +442,17 @@ export class Store {
       )
       .all(afterId, limit)
       .reverse()
+      .map(eventFromRow);
+  }
+
+  listTaskEvents(taskId) {
+    return this.db
+      .prepare(
+        `
+      SELECT * FROM events WHERE task_id=? ORDER BY id ASC
+    `,
+      )
+      .all(taskId)
       .map(eventFromRow);
   }
 

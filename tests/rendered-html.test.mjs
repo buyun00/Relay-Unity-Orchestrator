@@ -41,6 +41,8 @@ test("starter preview is removed and the product shell is durable", async () => 
   assert.match(controlDesk, /追加一轮/);
   assert.match(controlDesk, /现场已保留/);
   assert.match(controlDesk, /同一任务|持久对话|Codex thread/);
+  assert.match(controlDesk, /codex\.agent_message/);
+  assert.match(controlDesk, /Codex 进度消息/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
   assert.match(css, /--signal:\s*#72e0b2/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

@@ -1,4 +1,4 @@
-export type ServiceMode = "mock" | "hyperv";
+export type ServiceMode = "hyperv";
 
 export type WorkerStatus =
   | "ready"
@@ -141,6 +141,44 @@ export interface PipelineEvent {
   createdAt: string;
 }
 
+export interface HostVirtualMachine {
+  id: string;
+  name: string;
+  state: string;
+  status: string;
+  generation: number;
+  version: string;
+  cpuUsage: number;
+  memoryAssigned: number;
+  uptime: string;
+  heartbeat?: string | null;
+  ipAddresses: string[];
+}
+
+export interface HostRuntime {
+  ready: boolean;
+  checkedAt: string;
+  checkpointsEnabled: boolean;
+  hyperv: {
+    computerName?: string;
+    moduleAvailable: boolean;
+    canManage: boolean;
+    elevated?: boolean;
+    vmCount: number;
+    virtualMachines?: HostVirtualMachine[];
+    error?: string | null;
+  };
+  codex: {
+    command?: string;
+    home?: string | null;
+    available: boolean;
+    authenticated: boolean;
+    version?: string | null;
+    loginStatus?: string | null;
+    error?: string | null;
+  };
+}
+
 export interface Snapshot {
   server: {
     mode: ServiceMode;
@@ -149,6 +187,7 @@ export interface Snapshot {
     startedAt?: string;
     schedulerRunning?: boolean;
     requiresAuth?: boolean;
+    runtime?: HostRuntime | null;
   };
   projects: Project[];
   workers: Worker[];
@@ -158,7 +197,7 @@ export interface Snapshot {
 }
 
 export const EMPTY_SNAPSHOT: Snapshot = {
-  server: { mode: "mock", connected: false, schedulerRunning: false },
+  server: { mode: "hyperv", connected: false, schedulerRunning: false },
   projects: [],
   workers: [],
   tasks: [],

@@ -6,11 +6,12 @@ import { Scheduler } from "./scheduler.mjs";
 
 const store = new Store(config);
 const adapter = createAdapter(config);
+const runtime = await adapter.initialize();
 const scheduler = new Scheduler({ config, store, adapter });
 const api = new PipelineHttpServer({ config, store, scheduler });
 
 await api.listen();
-scheduler.start();
+await scheduler.start({ paused: !runtime.ready });
 
 console.log(
   `Relay pipeline API listening on http://${config.host}:${config.port}`,
@@ -18,6 +19,18 @@ console.log(
 console.log(
   `Adapter: ${config.adapter}; authentication: ${config.authRequired ? "required" : "disabled"}`,
 );
+console.log(
+  `Hyper-V access: ${runtime.hyperv.canManage ? "ready" : "unavailable"}; Codex: ${
+    runtime.codex.authenticated
+      ? runtime.codex.version || "authenticated"
+      : "not authenticated"
+  }; checkpoints: ${runtime.checkpointsEnabled ? "enabled" : "disabled"}`,
+);
+if (!runtime.ready) {
+  console.warn(
+    "Scheduler started paused because the Hyper-V/Codex host preflight is not ready. Check GET /api/runtime.",
+  );
+}
 
 let stopping = false;
 async function shutdown(signal) {

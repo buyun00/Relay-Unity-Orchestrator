@@ -1,12 +1,12 @@
-import { id, shortSha, sleep } from "../util.mjs";
+import { id, shortSha, sleep } from "../../server/util.mjs";
 
-function mockFailure(message, phase) {
+function fakeFailure(message, phase) {
   return String(message || "")
     .toLowerCase()
-    .includes(`[mock:fail=${phase}]`);
+    .includes(`[fake:fail=${phase}]`);
 }
 
-export class MockAdapter {
+export class FakeAdapter {
   constructor(config) {
     this.config = config;
     this.workerOverrides = new Map();
@@ -24,15 +24,15 @@ export class MockAdapter {
       smb: running,
       unity: running,
       skill: running,
-      adapter: "mock",
+      adapter: "test",
     };
   }
 
   async prepare(context, { signal, onProgress }) {
     onProgress?.("restore", "Restoring PROJECT_READY checkpoint");
-    await sleep(this.config.mockPhaseMs, signal);
-    if (mockFailure(context.turn.userMessage, "prepare")) {
-      throw Object.assign(new Error("Mock checkpoint restore failed"), {
+    await sleep(this.config.phaseMs, signal);
+    if (fakeFailure(context.turn.userMessage, "prepare")) {
+      throw Object.assign(new Error("Fake checkpoint restore failed"), {
         code: "CHECKPOINT_RESTORE_FAILED",
       });
     }
@@ -40,9 +40,9 @@ export class MockAdapter {
       "workspace",
       `Checking out ${context.task.branchName} inside the guest`,
     );
-    await sleep(this.config.mockPhaseMs, signal);
+    await sleep(this.config.phaseMs, signal);
     onProgress?.("unity", "Unity and Unity Skill are ready");
-    await sleep(this.config.mockPhaseMs, signal);
+    await sleep(this.config.phaseMs, signal);
     return {
       workspace: context.worker.sharePath,
       resumed: Boolean(context.task.codexThreadId),
@@ -51,22 +51,36 @@ export class MockAdapter {
 
   async runCodex(context, { signal, onEvent }) {
     const steps = [
-      ["turn.started", "Codex accepted the turn"],
-      ["item.started", "Inspecting project and Unity assets"],
-      ["item.completed", "Applied requested changes"],
-      ["item.completed", "Completed static validation"],
+      { type: "turn.started", message: "Codex accepted the turn" },
+      { type: "item.started", message: "Inspecting project and Unity assets" },
+      {
+        type: "item.completed",
+        item: {
+          id: "agent-message-1",
+          type: "agent_message",
+          text: "I found the relevant Unity assets and am applying the requested changes.",
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          id: "agent-message-2",
+          type: "agent_message",
+          text: "The changes are in place; I am running the final validation now.",
+        },
+      },
     ];
-    for (const [type, message] of steps) {
-      await sleep(this.config.mockPhaseMs, signal);
-      onEvent?.({ type, message });
+    for (const event of steps) {
+      await sleep(this.config.phaseMs, signal);
+      onEvent?.(event);
     }
-    if (mockFailure(context.turn.userMessage, "codex")) {
-      throw Object.assign(new Error("Mock Codex execution failed"), {
+    if (fakeFailure(context.turn.userMessage, "codex")) {
+      throw Object.assign(new Error("Fake Codex execution failed"), {
         code: "CODEX_EXEC_FAILED",
       });
     }
     return {
-      threadId: context.task.codexThreadId || id("mock-thread-"),
+      threadId: context.task.codexThreadId || id("test-thread-"),
       final: {
         status: "completed",
         summary: `Completed turn ${context.turn.sequence}: ${context.turn.userMessage.slice(0, 120)}`,
@@ -88,22 +102,22 @@ export class MockAdapter {
 
   async finalize(context, { signal, onProgress }) {
     onProgress?.("unity-save", "Saving all Unity assets to disk");
-    await sleep(this.config.mockPhaseMs, signal);
-    if (mockFailure(context.turn.userMessage, "unity-save")) {
-      throw Object.assign(new Error("Mock Unity save failed"), {
+    await sleep(this.config.phaseMs, signal);
+    if (fakeFailure(context.turn.userMessage, "unity-save")) {
+      throw Object.assign(new Error("Fake Unity save failed"), {
         code: "UNITY_SAVE_FAILED",
       });
     }
     onProgress?.("commit", "Committing changes inside the guest");
-    await sleep(this.config.mockPhaseMs, signal);
+    await sleep(this.config.phaseMs, signal);
     onProgress?.(
       "push",
       `Pushing ${context.task.branchName} and verifying remote SHA`,
     );
-    await sleep(this.config.mockPhaseMs, signal);
-    if (mockFailure(context.turn.userMessage, "push")) {
+    await sleep(this.config.phaseMs, signal);
+    if (fakeFailure(context.turn.userMessage, "push")) {
       throw Object.assign(
-        new Error("Mock remote push failed; workspace preserved"),
+        new Error("Fake remote push failed; workspace preserved"),
         { code: "GIT_PUSH_FAILED" },
       );
     }
@@ -118,9 +132,9 @@ export class MockAdapter {
 
   async release(context, { signal, onProgress }) {
     onProgress?.("release", "Restoring clean PROJECT_READY state");
-    await sleep(this.config.mockPhaseMs, signal);
-    if (mockFailure(context.turn.userMessage, "release")) {
-      throw Object.assign(new Error("Mock worker release failed"), {
+    await sleep(this.config.phaseMs, signal);
+    if (fakeFailure(context.turn.userMessage, "release")) {
+      throw Object.assign(new Error("Fake worker release failed"), {
         code: "WORKER_RELEASE_FAILED",
       });
     }
@@ -136,7 +150,7 @@ export class MockAdapter {
       throw Object.assign(new Error(`Unsupported worker action: ${action}`), {
         code: "ACTION_NOT_SUPPORTED",
       });
-    await sleep(Math.min(500, this.config.mockPhaseMs));
+    await sleep(Math.min(500, this.config.phaseMs));
     return { action, ...(await this.probeWorker(worker)) };
   }
 }

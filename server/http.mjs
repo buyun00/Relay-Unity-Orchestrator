@@ -170,6 +170,27 @@ function routeId(pathname, prefix) {
   return decodeURIComponent(rest);
 }
 
+function publicRuntimeStatus(runtime) {
+  if (!runtime) return null;
+  return {
+    ready: runtime.ready,
+    checkedAt: runtime.checkedAt,
+    checkpointsEnabled: runtime.checkpointsEnabled,
+    hyperv: {
+      moduleAvailable: Boolean(runtime.hyperv?.moduleAvailable),
+      canManage: Boolean(runtime.hyperv?.canManage),
+      vmCount: Number(runtime.hyperv?.vmCount || 0),
+      error: runtime.hyperv?.error || null,
+    },
+    codex: {
+      available: Boolean(runtime.codex?.available),
+      authenticated: Boolean(runtime.codex?.authenticated),
+      version: runtime.codex?.version || null,
+      error: runtime.codex?.error || null,
+    },
+  };
+}
+
 export class PipelineHttpServer {
   constructor({ config, store, scheduler }) {
     this.config = config;
@@ -382,6 +403,7 @@ export class PipelineHttpServer {
       }
 
       if (request.method === "GET" && pathname === "/api/health") {
+        const runtime = this.scheduler.runtimeStatus();
         json(
           response,
           200,
@@ -391,6 +413,7 @@ export class PipelineHttpServer {
             adapter: this.config.adapter,
             authRequired: this.config.authRequired,
             scheduler: this.scheduler.status(),
+            runtime: publicRuntimeStatus(runtime),
             uptimeSeconds: Math.round(process.uptime()),
             now: new Date().toISOString(),
           },
@@ -422,6 +445,12 @@ export class PipelineHttpServer {
           "A valid pipeline session token is required",
         );
 
+      if (request.method === "GET" && pathname === "/api/runtime") {
+        const runtime = await this.scheduler.inspectRuntime({ force: true });
+        json(response, 200, { ok: true, runtime }, cors);
+        return;
+      }
+
       if (request.method === "GET" && pathname === "/api/events") {
         this.handleSse(request, response, url, cors);
         return;
@@ -430,6 +459,7 @@ export class PipelineHttpServer {
       if (request.method === "GET" && pathname === "/api/snapshot") {
         const snapshot = this.store.snapshot();
         const scheduler = this.scheduler.status();
+        const runtime = this.scheduler.runtimeStatus();
         json(
           response,
           200,
@@ -444,6 +474,7 @@ export class PipelineHttpServer {
               schedulerRunning: scheduler.running && !scheduler.paused,
               authRequired: this.config.authRequired,
               requiresAuth: this.config.authRequired,
+              runtime,
             },
           },
           cors,
@@ -621,7 +652,12 @@ export class PipelineHttpServer {
         json(
           response,
           200,
-          { ok: true, task, turns: this.store.listTaskTurns(taskDetail) },
+          {
+            ok: true,
+            task,
+            turns: this.store.listTaskTurns(taskDetail),
+            events: this.store.listTaskEvents(taskDetail),
+          },
           cors,
         );
         return;

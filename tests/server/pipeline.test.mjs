@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { MockAdapter } from "../../server/adapters/mock.mjs";
+import { FakeAdapter } from "./fake-adapter.mjs";
 import { Store } from "../../server/db.mjs";
 import { PipelineHttpServer } from "../../server/http.mjs";
 import { Scheduler } from "../../server/scheduler.mjs";
@@ -19,7 +19,7 @@ function createConfig() {
     databasePath: path.join(dataDirectory, "pipeline.sqlite"),
     uploadDirectory: path.join(dataDirectory, "uploads"),
     logDirectory: path.join(dataDirectory, "logs"),
-    adapter: "mock",
+    adapter: "test",
     host: "127.0.0.1",
     port: 0,
     adminToken: "",
@@ -28,10 +28,9 @@ function createConfig() {
     sessionTtlMs: 60_000,
     requestBodyLimitBytes: 2 * 1024 * 1024,
     uploadLimitBytes: 25 * 1024 * 1024,
-    seedMockData: false,
     schedulerIntervalMs: 5,
     healthIntervalMs: 60_000,
-    mockPhaseMs: 1,
+    phaseMs: 1,
   };
 }
 
@@ -76,7 +75,7 @@ function createHarness(t, options = {}) {
   const config = createConfig();
   const store = new Store(config);
   const seeded = seedProjectAndWorker(store, options);
-  const adapter = options.adapter || new MockAdapter(config);
+  const adapter = options.adapter || new FakeAdapter(config);
   const scheduler = new Scheduler({ config, store, adapter });
   t.after(async () => {
     scheduler.stop();
@@ -111,7 +110,7 @@ async function nextTimestamp() {
   await new Promise((resolve) => setTimeout(resolve, 3));
 }
 
-class TrackingMockAdapter extends MockAdapter {
+class TrackingFakeAdapter extends FakeAdapter {
   releaseCalls = 0;
 
   async release(...args) {
@@ -203,7 +202,7 @@ test("a second turn keeps the Codex thread and branch, and blocks another active
   );
 
   const afterFirst = store.getTask(created.task.id);
-  assert.match(afterFirst.codexThreadId, /^mock-thread-/);
+  assert.match(afterFirst.codexThreadId, /^test-thread-/);
   const originalThreadId = afterFirst.codexThreadId;
   const originalBranchName = afterFirst.branchName;
 
@@ -252,9 +251,42 @@ test("a second turn keeps the Codex thread and branch, and blocks another active
   );
 });
 
+test("Codex progress messages are stored as durable conversation events", async (t) => {
+  const { store, scheduler, project } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Durable Codex progress",
+    message: "Keep every user-facing Codex progress update",
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      scheduler.status().activeTurns === 0,
+    "the turn and its Codex progress to complete",
+  );
+
+  const messages = store
+    .listTaskEvents(created.task.id)
+    .filter((event) => event.type === "codex.agent_message");
+  assert.deepEqual(
+    messages.map((event) => event.message),
+    [
+      "I found the relevant Unity assets and am applying the requested changes.",
+      "The changes are in place; I am running the final validation now.",
+    ],
+  );
+  assert.ok(messages.every((event) => event.turnId === created.turn.id));
+  assert.deepEqual(
+    messages.map((event) => event.data?.itemType),
+    ["agent_message", "agent_message"],
+  );
+});
+
 test("push failure preserves the worker in attention and never releases it", async (t) => {
   const config = createConfig();
-  const adapter = new TrackingMockAdapter(config);
+  const adapter = new TrackingFakeAdapter(config);
   const store = new Store(config);
   const { project, worker } = seedProjectAndWorker(store);
   const scheduler = new Scheduler({ config, store, adapter });
@@ -271,7 +303,7 @@ test("push failure preserves the worker in attention and never releases it", asy
 
   const created = createTask(store, project.id, {
     title: "Push failure",
-    message: "Change a prefab [mock:fail=push]",
+    message: "Change a prefab [fake:fail=push]",
   });
   scheduler.start();
   scheduler.notifyQueueChanged();
@@ -317,7 +349,7 @@ test("push failure preserves the worker in attention and never releases it", asy
 
 test("autoRelease=false leaves a successful worker reserved", async (t) => {
   const config = createConfig();
-  const adapter = new TrackingMockAdapter(config);
+  const adapter = new TrackingFakeAdapter(config);
   const store = new Store(config);
   const { project, worker } = seedProjectAndWorker(store);
   const scheduler = new Scheduler({ config, store, adapter });
@@ -443,7 +475,7 @@ test("browser preflight accepts the task idempotency header", async (t) => {
   const scheduler = new Scheduler({
     config,
     store,
-    adapter: new MockAdapter(config),
+    adapter: new FakeAdapter(config),
   });
   const api = new PipelineHttpServer({ config, store, scheduler });
   const address = await api.listen();
@@ -515,4 +547,26 @@ test("browser preflight accepts the task idempotency header", async (t) => {
   assert.equal(repeatedPayload.turn.id, firstPayload.turn.id);
   assert.equal(repeatedPayload.duplicate, true);
   assert.equal(store.listTasks().length, 1);
+
+  store.emit({
+    taskId: firstPayload.task.id,
+    turnId: firstPayload.turn.id,
+    type: "codex.agent_message",
+    phase: "codex",
+    message: "This progress card must survive a task-detail reload.",
+    data: { itemId: "http-progress-1", itemType: "agent_message" },
+  });
+  const detailResponse = await fetch(
+    `${base}/api/tasks/${encodeURIComponent(firstPayload.task.id)}`,
+  );
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json();
+  assert.ok(
+    detail.events.some(
+      (event) =>
+        event.type === "codex.agent_message" &&
+        event.message ===
+          "This progress card must survive a task-detail reload.",
+    ),
+  );
 });

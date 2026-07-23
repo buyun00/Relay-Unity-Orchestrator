@@ -1361,6 +1361,7 @@ kbd {
 }
 .user-message,
 .codex-message,
+.codex-progress-message,
 .codex-running-message {
   margin-bottom: 13px;
   padding: 16px 18px;
@@ -1387,7 +1388,8 @@ kbd {
   margin-left: 5px;
 }
 .user-message > p,
-.codex-message > p {
+.codex-message > p,
+.codex-progress-message > p {
   margin: 11px 0 0;
   white-space: pre-wrap;
   color: #d7dddf;
@@ -1411,6 +1413,28 @@ kbd {
     rgba(114, 224, 178, 0.055),
     rgba(255, 255, 255, 0.015)
   );
+}
+.codex-progress-message {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(114, 224, 178, 0.16);
+  background: rgba(114, 224, 178, 0.035);
+}
+.codex-progress-message::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: rgba(114, 224, 178, 0.72);
+}
+.message-kind {
+  padding: 2px 6px;
+  border: 1px solid rgba(114, 224, 178, 0.15);
+  border-radius: 999px;
+  color: var(--signal);
+  background: rgba(114, 224, 178, 0.045);
+  font-size: 11px;
+  line-height: 1.2;
 }
 .codex-running-message {
   display: flex;
@@ -3249,6 +3273,7 @@ kbd {
   }
   .user-message,
   .codex-message,
+  .codex-progress-message,
   .codex-running-message {
     padding: 13px;
   }

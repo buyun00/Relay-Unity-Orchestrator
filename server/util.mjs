@@ -89,7 +89,9 @@ export function slug(value, fallback = "task") {
   const normalized = String(value || "")
     .normalize("NFKD")
     .toLowerCase()
-    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
+    // Keep generated branch refs ASCII. Windows PowerShell 5.1 and Git can
+    // otherwise disagree about native stdout encoding across PS Direct.
+    .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 32);
   return normalized || fallback;

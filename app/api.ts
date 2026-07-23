@@ -1,4 +1,4 @@
-import type { Snapshot } from "./types";
+import type { PipelineEvent, Snapshot } from "./types";
 
 const TOKEN_KEY = "relay-admin-token";
 const API_KEY = "relay-api-base";
@@ -72,7 +72,7 @@ export function fetchSnapshot() {
   return api<
     Snapshot & {
       server: Snapshot["server"] & {
-        adapter?: "mock" | "hyperv";
+        adapter?: "hyperv";
         authRequired?: boolean;
         queuePaused?: boolean;
       };
@@ -144,7 +144,7 @@ export function fetchSnapshot() {
       ...snapshot,
       server: {
         ...snapshot.server,
-        mode: snapshot.server.mode ?? snapshot.server.adapter ?? "mock",
+        mode: snapshot.server.mode ?? snapshot.server.adapter ?? "hyperv",
         requiresAuth:
           snapshot.server.requiresAuth ?? snapshot.server.authRequired ?? false,
         schedulerRunning:
@@ -170,6 +170,12 @@ export function fetchSnapshot() {
       events,
     };
   });
+}
+
+export function fetchTaskEvents(taskId: string) {
+  return api<{ events?: PipelineEvent[] }>(
+    `/api/tasks/${encodeURIComponent(taskId)}`,
+  ).then((payload) => payload.events ?? []);
 }
 
 export async function uploadFile(
@@ -204,7 +210,7 @@ export async function uploadFile(
 }
 
 export async function subscribeEvents(
-  onEvent: () => void,
+  onEvent: (event?: PipelineEvent) => void,
   onDisconnect: () => void,
 ): Promise<() => void> {
   const adminToken = getToken();
@@ -218,9 +224,16 @@ export async function subscribeEvents(
   }
   const query = eventToken ? `?token=${encodeURIComponent(eventToken)}` : "";
   const source = new EventSource(`${getApiBase()}/api/events${query}`);
-  source.addEventListener("pipeline", onEvent);
-  source.addEventListener("message", onEvent);
-  source.onopen = onEvent;
+  const handleEvent = (event: MessageEvent<string>) => {
+    try {
+      onEvent(JSON.parse(event.data) as PipelineEvent);
+    } catch {
+      onEvent();
+    }
+  };
+  source.addEventListener("pipeline", handleEvent as EventListener);
+  source.addEventListener("message", handleEvent as EventListener);
+  source.onopen = () => onEvent();
   source.onerror = onDisconnect;
   return () => source.close();
 }

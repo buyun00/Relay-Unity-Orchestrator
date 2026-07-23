@@ -19,6 +19,22 @@ function codexMessage(event) {
   return "Codex emitted an event";
 }
 
+function codexAgentMessage(event) {
+  if (event?.type !== "item.completed") return null;
+  if (event?.item?.type !== "agent_message") return null;
+  const text =
+    typeof event.item.text === "string"
+      ? event.item.text.trim()
+      : typeof event.item.message === "string"
+        ? event.item.message.trim()
+        : "";
+  if (!text) return null;
+  return {
+    itemId: event.item.id || null,
+    text,
+  };
+}
+
 function threadIdFromEvent(event) {
   if (event?.type !== "thread.started") return null;
   return event.thread_id || event.threadId || event.thread?.id || null;
@@ -38,9 +54,10 @@ export class Scheduler {
     this.timers = [];
   }
 
-  start() {
+  async start({ paused = false } = {}) {
     if (this.running) return;
     this.running = true;
+    this.paused = Boolean(paused);
     this.timers.push(
       setInterval(() => this.pump(), this.config.schedulerIntervalMs),
     );
@@ -53,8 +70,8 @@ export class Scheduler {
       message: `Scheduler started with ${this.config.adapter} adapter`,
       data: { adapter: this.config.adapter },
     });
-    void this.probeAll();
-    void this.pump();
+    await this.probeAll();
+    await this.pump();
   }
 
   stop() {
@@ -103,6 +120,15 @@ export class Scheduler {
       paused: this.paused,
       activeTurns: this.controllers.size,
     };
+  }
+
+  runtimeStatus() {
+    return this.adapter.runtimeStatus?.() || null;
+  }
+
+  inspectRuntime(options) {
+    if (!this.adapter.inspectRuntime) return Promise.resolve(null);
+    return this.adapter.inspectRuntime(options);
   }
 
   notifyQueueChanged() {
@@ -173,6 +199,24 @@ export class Scheduler {
           const threadId = threadIdFromEvent(event);
           if (threadId) this.store.setTaskThread(context.task.id, threadId);
           const type = event?.type || "codex.event";
+          const agentMessage = codexAgentMessage(event);
+          if (agentMessage) {
+            this.store.emit({
+              taskId: context.task.id,
+              turnId: context.turn.id,
+              workerId: context.worker.id,
+              type: "codex.agent_message",
+              phase: "codex",
+              level: "info",
+              message: agentMessage.text.slice(0, 100_000),
+              data: {
+                eventType: type,
+                itemId: agentMessage.itemId,
+                itemType: "agent_message",
+              },
+            });
+            return;
+          }
           const noisy = ["item.updated", "turn.updated"].includes(type);
           if (!noisy) {
             this.store.emit({

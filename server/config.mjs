@@ -14,10 +14,15 @@ function boolean(value, fallback = false) {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
-const adapter = (process.env.PIPELINE_ADAPTER || "mock").toLowerCase();
-if (!["mock", "hyperv"].includes(adapter)) {
-  throw new Error(`Unsupported PIPELINE_ADAPTER: ${adapter}`);
+const requestedAdapter = (
+  process.env.PIPELINE_ADAPTER || "hyperv"
+).toLowerCase();
+if (requestedAdapter !== "hyperv") {
+  throw new Error(
+    `Unsupported PIPELINE_ADAPTER: ${requestedAdapter}. The production mock adapter has been removed; use hyperv.`,
+  );
 }
+const adapter = "hyperv";
 
 const adminToken = process.env.PIPELINE_ADMIN_TOKEN?.trim() || "";
 if (adapter === "hyperv" && !adminToken) {
@@ -38,7 +43,9 @@ export const config = Object.freeze({
   databasePath: path.join(dataDirectory, "pipeline.sqlite"),
   uploadDirectory: path.join(dataDirectory, "uploads"),
   logDirectory: path.join(dataDirectory, "logs"),
-  host: process.env.PIPELINE_HOST || "127.0.0.1",
+  // Listen on every interface by default so devices on the local network can
+  // reach the control API through the host machine's LAN address.
+  host: process.env.PIPELINE_HOST || "0.0.0.0",
   port: integer(process.env.PIPELINE_PORT, 4317),
   adapter,
   adminToken,
@@ -58,13 +65,22 @@ export const config = Object.freeze({
     1_500,
   ),
   healthIntervalMs: integer(process.env.PIPELINE_HEALTH_INTERVAL_MS, 30_000),
-  mockPhaseMs: integer(process.env.PIPELINE_MOCK_PHASE_MS, 650),
-  seedMockData: boolean(process.env.PIPELINE_SEED_MOCK_DATA, true),
+  checkpointsEnabled: boolean(
+    process.env.PIPELINE_CHECKPOINTS_ENABLED,
+    false,
+  ),
   allowUnitySaveSkip: boolean(
     process.env.PIPELINE_ALLOW_UNITY_SAVE_SKIP,
     false,
   ),
   codexCommand: process.env.PIPELINE_CODEX_COMMAND || "codex",
+  codexHome: process.env.CODEX_HOME?.trim() || null,
+  gitAuthorName:
+    process.env.PIPELINE_GIT_AUTHOR_NAME?.trim() ||
+    "Relay Unity Orchestrator",
+  gitAuthorEmail:
+    process.env.PIPELINE_GIT_AUTHOR_EMAIL?.trim() ||
+    "relay-unity-orchestrator@localhost",
   codexTimeoutMs:
     integer(process.env.PIPELINE_CODEX_TIMEOUT_MINUTES, 90) * 60 * 1000,
   powershellCommand:

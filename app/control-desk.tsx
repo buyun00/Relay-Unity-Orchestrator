@@ -68,6 +68,7 @@ import {
   ApiError,
   api,
   fetchSnapshot,
+  fetchTaskEvents,
   getApiBase,
   getToken,
   setApiBase,
@@ -78,6 +79,7 @@ import {
 import {
   EMPTY_SNAPSHOT,
   type HealthState,
+  type HostVirtualMachine,
   type PipelineEvent,
   type Project,
   type Snapshot,
@@ -115,6 +117,18 @@ function taskTitleFromContent(content: string) {
   const normalized = content.replace(/\s+/g, " ").trim();
   const firstSentence = normalized.split(/[。！？!?；;]/, 1)[0]?.trim();
   return (firstSentence || normalized || "新任务").slice(0, 60);
+}
+
+let idempotencySequence = 0;
+
+function createIdempotencyKey() {
+  idempotencySequence = (idempotencySequence + 1) % 1_000_000;
+  return [
+    "task",
+    Date.now().toString(36),
+    idempotencySequence.toString(36),
+    Math.random().toString(36).slice(2, 12),
+  ].join("-");
 }
 
 function estimateTaskStart({
@@ -265,6 +279,35 @@ function relativeTime(value?: string | null) {
 
 function compactSha(sha?: string | null) {
   return sha ? sha.slice(0, 8) : "尚未提交";
+}
+
+function compareEvents(a: PipelineEvent, b: PipelineEvent) {
+  const left = Number(a.id);
+  const right = Number(b.id);
+  if (Number.isFinite(left) && Number.isFinite(right)) return left - right;
+  return a.createdAt.localeCompare(b.createdAt);
+}
+
+function mergePipelineEvent(
+  events: PipelineEvent[],
+  incoming: PipelineEvent,
+) {
+  if (events.some((event) => String(event.id) === String(incoming.id)))
+    return events;
+  return [...events, incoming].sort(compareEvents);
+}
+
+function readableCodexMessage(message: string) {
+  const value = message.trim();
+  if (!value.startsWith("{")) return value;
+  try {
+    const parsed = JSON.parse(value) as { summary?: unknown };
+    if (typeof parsed.summary === "string" && parsed.summary.trim())
+      return parsed.summary.trim();
+  } catch {
+    /* A normal Codex message can begin with a brace. */
+  }
+  return value;
 }
 
 function projectById(snapshot: Snapshot, id: string) {
@@ -418,6 +461,9 @@ function HealthStrip({
 
 export default function ControlDesk() {
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
+  const [taskEventsById, setTaskEventsById] = useState<
+    Record<string, PipelineEvent[]>
+  >({});
   const [connected, setConnected] = useState(false);
   const [lastConnectedAt, setLastConnectedAt] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState(false);
@@ -501,7 +547,18 @@ export default function ControlDesk() {
     let unsubscribe = () => {};
     let disposed = false;
     void subscribeEvents(
-      () => void refresh(true),
+      (event) => {
+        if (event?.taskId) {
+          setTaskEventsById((current) => ({
+            ...current,
+            [event.taskId!]: mergePipelineEvent(
+              current[event.taskId!] ?? [],
+              event,
+            ),
+          }));
+        }
+        void refresh(true);
+      },
       () => void refresh(true),
     )
       .then((cleanup) => {
@@ -516,6 +573,30 @@ export default function ControlDesk() {
       unsubscribe();
     };
   }, [refresh]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    let disposed = false;
+    const load = async () => {
+      try {
+        const events = await fetchTaskEvents(selectedTaskId);
+        if (!disposed) {
+          setTaskEventsById((current) => ({
+            ...current,
+            [selectedTaskId]: events.sort(compareEvents),
+          }));
+        }
+      } catch {
+        /* The global snapshot remains available while the detail request retries. */
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 4_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedTaskId]);
 
   useEffect(() => {
     const applyLocation = () => {
@@ -713,11 +794,7 @@ export default function ControlDesk() {
             {connected ? <Wifi size={15} /> : <WifiOff size={15} />}
             <div>
               <strong>{connected ? "调度服务正常" : "服务已断开"}</strong>
-              <span>
-                {snapshot.server.mode === "hyperv"
-                  ? "真实 Hyper-V"
-                  : "安全模拟模式"}
-              </span>
+              <span>真实 Hyper-V</span>
             </div>
           </div>
           <div className="profile-row">
@@ -822,6 +899,12 @@ export default function ControlDesk() {
             <TaskDetail
               snapshot={snapshot}
               task={selectedTask}
+              events={
+                taskEventsById[selectedTask.id] ??
+                snapshot.events.filter(
+                  (event) => event.taskId === selectedTask.id,
+                )
+              }
               busy={busy}
               onBack={() => navigate("tasks")}
               onRefresh={() => void refresh()}
@@ -1035,6 +1118,9 @@ export default function ControlDesk() {
         <WorkerEditor
           worker={editingWorker}
           projects={snapshot.projects}
+          virtualMachines={
+            snapshot.server.runtime?.hyperv.virtualMachines ?? []
+          }
           busy={busy}
           onClose={() => setWorkerEditorOpen(false)}
           onSave={async (payload) => {
@@ -1145,11 +1231,7 @@ function Dashboard({
         <div className="hero-system-state">
           <span className="pulse-dot" />
           <div>
-            <strong>
-              {snapshot.server.mode === "hyperv"
-                ? "真实调度已启用"
-                : "安全模拟模式"}
-            </strong>
+            <strong>真实调度已启用</strong>
             <small>
               调度器{" "}
               {snapshot.server.schedulerRunning === false
@@ -1515,6 +1597,7 @@ function TasksPage({
 function TaskDetail({
   snapshot,
   task,
+  events,
   busy,
   onBack,
   onRefresh,
@@ -1526,6 +1609,7 @@ function TaskDetail({
 }: {
   snapshot: Snapshot;
   task: Task;
+  events: PipelineEvent[];
   busy: boolean;
   onBack: () => void;
   onRefresh: () => void;
@@ -1546,7 +1630,6 @@ function TaskDetail({
   const [sending, setSending] = useState(false);
   const active = Boolean(current && LIVE_TURN.has(current.status));
   const closed = task.status === "closed";
-  const events = snapshot.events.filter((event) => event.taskId === task.id);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!message.trim() || active || closed) return;
@@ -1867,6 +1950,27 @@ function TurnConversation({
       : turn.codexFinal && typeof turn.codexFinal.summary === "string"
         ? turn.codexFinal.summary
         : null;
+  const finalSummary = result?.summary ?? finalText;
+  const progressByItem = new Map<
+    string,
+    { event: PipelineEvent; text: string }
+  >();
+  for (const event of events) {
+    if (event.type !== "codex.agent_message") continue;
+    const text = readableCodexMessage(event.message);
+    if (!text || text === finalSummary?.trim()) continue;
+    const itemId =
+      typeof event.data?.itemId === "string"
+        ? event.data.itemId
+        : String(event.id);
+    progressByItem.set(itemId, { event, text });
+  }
+  const progressMessages = [...progressByItem.values()].sort((a, b) =>
+    compareEvents(a.event, b.event),
+  );
+  const latestStatusEvent = [...events]
+    .reverse()
+    .find((event) => event.type !== "codex.agent_message");
   return (
     <article className="turn-thread">
       <div className="timeline-node">
@@ -1881,15 +1985,36 @@ function TurnConversation({
         </div>
         <p>{turn.userMessage}</p>
       </div>
+      {progressMessages.map(({ event, text }) => (
+        <div
+          className="codex-progress-message"
+          key={event.id}
+          aria-label="Codex 进度消息"
+        >
+          <div className="message-head">
+            <span className="bot-avatar">
+              <Bot size={16} />
+            </span>
+            <strong>Codex</strong>
+            <span className="message-kind">进度</span>
+            <time>{relativeTime(event.createdAt)}</time>
+          </div>
+          <p>{text}</p>
+        </div>
+      ))}
       {LIVE_TURN.has(turn.status) && (
-        <div className="codex-running-message">
+        <div className="codex-running-message" role="status" aria-live="polite">
           <span className="bot-avatar">
             <Bot size={16} />
           </span>
           <div>
-            <strong>Codex 正在处理</strong>
+            <strong>
+              {progressMessages.length
+                ? "Codex 正在继续处理"
+                : "Codex 正在处理"}
+            </strong>
             <p>
-              {events.at(-1)?.message ??
+              {latestStatusEvent?.message ??
                 phaseLabel[turn.phase ?? ""] ??
                 "等待下一步事件"}
             </p>
@@ -1899,7 +2024,7 @@ function TurnConversation({
           </div>
         </div>
       )}
-      {(finalText || result?.summary) && (
+      {finalSummary && (
         <div className="codex-message">
           <div className="message-head">
             <span className="bot-avatar">
@@ -1908,7 +2033,7 @@ function TurnConversation({
             <strong>Codex</strong>
             <time>{relativeTime(turn.finishedAt)}</time>
           </div>
-          <p>{result?.summary ?? finalText}</p>
+          <p>{finalSummary}</p>
           {result?.changedFiles && result.changedFiles.length > 0 && (
             <div className="changed-files">
               {result.changedFiles.slice(0, 6).map((file) => (
@@ -2143,7 +2268,7 @@ function WorkersPage({
             <EmptyState
               icon={Server}
               title="工位池还是空的"
-              description="添加第一台 Hyper-V 虚拟机，并绑定 PROJECT_READY 检查点。"
+              description="添加第一台真实 Hyper-V 虚拟机，并配置 PowerShell Direct 与 SMB。"
               action={
                 <button className="primary-action" onClick={onCreate}>
                   <Plus size={16} />
@@ -2237,7 +2362,11 @@ function WorkerInspector({
         </div>
         <div>
           <dt>检查点</dt>
-          <dd>{worker.checkpointName ?? "PROJECT_READY"}</dd>
+          <dd>
+            {snapshot.server.runtime?.checkpointsEnabled
+              ? (worker.checkpointName ?? "PROJECT_READY")
+              : "暂未启用"}
+          </dd>
         </div>
         <div>
           <dt>SMB</dt>
@@ -2328,7 +2457,15 @@ function WorkerInspector({
           危险操作
         </summary>
         <p>仅在现场已经确认可丢弃或需要解除隔离时使用。</p>
-        <button onClick={() => onAction(worker, "restore")}>
+        <button
+          onClick={() => onAction(worker, "restore")}
+          disabled={!snapshot.server.runtime?.checkpointsEnabled}
+          title={
+            snapshot.server.runtime?.checkpointsEnabled
+              ? undefined
+              : "检查点管理尚未启用"
+          }
+        >
           <RotateCcw size={15} />
           恢复检查点
         </button>
@@ -2613,24 +2750,11 @@ function SettingsPage({
         </section>
         <aside className="settings-status">
           <span className="section-kicker">当前运行方式</span>
-          <div
-            className={cx(
-              "mode-orb",
-              snapshot.server.mode === "hyperv" ? "live" : "mock",
-            )}
-          >
+          <div className={cx("mode-orb", "live")}>
             <Cpu size={28} />
           </div>
-          <h2>
-            {snapshot.server.mode === "hyperv"
-              ? "Hyper-V 真实适配器"
-              : "Mock 安全适配器"}
-          </h2>
-          <p>
-            {snapshot.server.mode === "hyperv"
-              ? "会执行白名单 PowerShell、来宾 Git 与宿主机 Codex。"
-              : "所有阶段均为可重复模拟，不会触碰 Hyper-V、Git 远端或 Codex。"}
-          </p>
+          <h2>Hyper-V 真实适配器</h2>
+          <p>会执行白名单 PowerShell、来宾 Git 与宿主机 Codex CLI。</p>
           <dl>
             <div>
               <dt>服务版本</dt>
@@ -2647,6 +2771,30 @@ function SettingsPage({
             <div>
               <dt>认证</dt>
               <dd>{snapshot.server.requiresAuth ? "已启用" : "开发模式"}</dd>
+            </div>
+            <div>
+              <dt>Hyper-V 权限</dt>
+              <dd>
+                {snapshot.server.runtime?.hyperv.canManage
+                  ? `可用 · ${snapshot.server.runtime.hyperv.vmCount} 台 VM`
+                  : "不可用"}
+              </dd>
+            </div>
+            <div>
+              <dt>Codex CLI</dt>
+              <dd>
+                {snapshot.server.runtime?.codex.authenticated
+                  ? snapshot.server.runtime.codex.version
+                  : "未登录或不可用"}
+              </dd>
+            </div>
+            <div>
+              <dt>检查点</dt>
+              <dd>
+                {snapshot.server.runtime?.checkpointsEnabled
+                  ? "已启用"
+                  : "暂未启用"}
+              </dd>
             </div>
             <div>
               <dt>API</dt>
@@ -2677,7 +2825,7 @@ function SettingsPage({
           <div className="safety-note">
             <ShieldCheck size={17} />
             <span>
-              切换真实模式需要显式设置环境变量和管理令牌；默认永远是 Mock。
+              生产路径只使用真实 Hyper-V 与 Codex CLI；检查点恢复可在准备完成后单独启用。
             </span>
           </div>
         </aside>
@@ -2744,7 +2892,7 @@ function CreateTaskModal({
   onSubmit: (payload: Record<string, unknown>, files: File[]) => Promise<void>;
 }) {
   const dialogRef = useDialogFocusTrap(onClose);
-  const idempotencyKey = useRef(crypto.randomUUID());
+  const [idempotencyKey] = useState(createIdempotencyKey);
   const [requirement, setRequirement] = useState("");
   const [priority, setPriority] = useState(0);
   const [autoRelease, setAutoRelease] = useState(true);
@@ -2800,7 +2948,7 @@ function CreateTaskModal({
         baseBranch: project.defaultBranch,
         priority,
         autoRelease,
-        idempotencyKey: idempotencyKey.current,
+        idempotencyKey,
       },
       files,
     );
@@ -3155,26 +3303,36 @@ function ProjectEditor({
 function WorkerEditor({
   worker,
   projects,
+  virtualMachines,
   busy,
   onClose,
   onSave,
 }: {
   worker: Worker | null;
   projects: Project[];
+  virtualMachines: HostVirtualMachine[];
   busy: boolean;
   onClose: () => void;
   onSave: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const dialogRef = useDialogFocusTrap(onClose);
+  const discoveredVm = virtualMachines.find(
+    (virtualMachine) =>
+      !worker || virtualMachine.name === worker.vmName,
+  );
   const [form, setForm] = useState({
-    name: worker?.name ?? "lin-worker-01",
-    vmName: worker?.vmName ?? "lin-worker-01",
-    internalIp: worker?.internalIp ?? "172.30.240.11",
+    name: worker?.name ?? discoveredVm?.name ?? "",
+    vmName: worker?.vmName ?? discoveredVm?.name ?? "",
+    internalIp:
+      worker?.internalIp ??
+      discoveredVm?.ipAddresses?.find((address) => address.includes(".")) ??
+      "",
     corporateIp: worker?.corporateIp ?? "",
     sharePath:
       worker?.sharePath ??
       worker?.smbPath ??
-      "\\\\172.30.240.11\\Work\\Project",
+      projects[0]?.smbPath ??
+      "",
     checkpointName: worker?.checkpointName ?? "PROJECT_READY",
     credentialPath: worker?.credentialPath ?? "",
     enabled: worker?.enabled ?? true,
@@ -3202,7 +3360,7 @@ function WorkerEditor({
             <span className="eyebrow">HYPER-V WORKER</span>
             <h2 id="worker-editor-title">{worker ? "编辑工位" : "添加工位"}</h2>
             <p id="worker-editor-description">
-              虚拟机名和检查点必须与 Hyper-V 中的精确对象匹配。
+              虚拟机名必须与 Hyper-V 中的真实对象精确匹配；检查点可稍后启用。
             </p>
           </div>
           <IconButton label="关闭" type="button" onClick={onClose}>
@@ -3222,9 +3380,24 @@ function WorkerEditor({
             <span>Hyper-V VM 名称</span>
             <input
               required
+              list="hyperv-vm-options"
               value={form.vmName}
               onChange={(event) => set("vmName", event.target.value)}
             />
+            <datalist id="hyperv-vm-options">
+              {virtualMachines.map((virtualMachine) => (
+                <option
+                  key={virtualMachine.id}
+                  value={virtualMachine.name}
+                  label={`${virtualMachine.state} · ${virtualMachine.status}`}
+                />
+              ))}
+            </datalist>
+            <small>
+              {virtualMachines.length
+                ? `已从当前宿主机发现 ${virtualMachines.length} 台虚拟机。`
+                : "尚未读取到 VM 清单，请先检查系统页中的 Hyper-V 权限。"}
+            </small>
           </label>
           <label className="form-field">
             <span>内部 IP</span>

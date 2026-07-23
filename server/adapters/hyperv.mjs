@@ -22,9 +22,16 @@ function required(value, label) {
 }
 
 export class HyperVAdapter {
-  constructor(config) {
+  constructor(
+    config,
+    { processRunner = runProcess, codex = new CodexRunner(config) } = {},
+  ) {
     this.config = config;
-    this.codex = new CodexRunner(config);
+    this.processRunner = processRunner;
+    this.codex = codex;
+    this.runtime = null;
+    this.runtimeCheckedAt = 0;
+    this.runtimePromise = null;
   }
 
   async powershell(
@@ -45,20 +52,88 @@ export class HyperVAdapter {
       if (value == null || value === "") continue;
       args.push(`-${name}`, String(value));
     }
-    const result = await runProcess(this.config.powershellCommand, args, {
-      signal,
-      timeoutMs,
-    });
+    let result;
+    try {
+      result = await this.processRunner(this.config.powershellCommand, args, {
+        signal,
+        timeoutMs,
+      });
+    } catch (error) {
+      error.operation = scriptName;
+      error.code =
+        error.code === "PROCESS_START_FAILED"
+          ? "POWERSHELL_NOT_AVAILABLE"
+          : "HYPERV_COMMAND_FAILED";
+      throw error;
+    }
     const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
     const parsed = parseJson(lines.at(-1), null);
     return parsed || { stdout: result.stdout.trim() };
   }
 
-  commonWorkerArguments(worker) {
-    return {
+  workerArguments(worker, { requireCredential = true } = {}) {
+    const result = {
       VMName: required(worker.vmName, "worker.vmName"),
-      CredentialPath: required(worker.credentialPath, "worker.credentialPath"),
     };
+    if (requireCredential) {
+      result.CredentialPath = required(
+        worker.credentialPath,
+        "worker.credentialPath",
+      );
+    } else if (worker.credentialPath) {
+      result.CredentialPath = worker.credentialPath;
+    }
+    return result;
+  }
+
+  async initialize() {
+    return this.inspectRuntime({ force: true });
+  }
+
+  runtimeStatus() {
+    return this.runtime;
+  }
+
+  async inspectRuntime({ force = false } = {}) {
+    const fresh =
+      this.runtime && Date.now() - this.runtimeCheckedAt < 10_000;
+    if (!force && fresh) return this.runtime;
+    if (this.runtimePromise) return this.runtimePromise;
+    this.runtimePromise = (async () => {
+      const [hyperv, codex] = await Promise.all([
+        this.powershell("Get-HostStatus.ps1", {}, { timeoutMs: 45_000 }).catch(
+          (error) => ({
+            moduleAvailable: false,
+            canManage: false,
+            vmCount: 0,
+            virtualMachines: [],
+            error: error.message,
+          }),
+        ),
+        this.codex.inspect(),
+      ]);
+      hyperv.checkpointsEnabled = this.config.checkpointsEnabled;
+      const runtime = {
+        ready: Boolean(
+          hyperv.moduleAvailable &&
+            hyperv.canManage &&
+            codex.available &&
+            codex.authenticated,
+        ),
+        checkedAt: new Date().toISOString(),
+        checkpointsEnabled: this.config.checkpointsEnabled,
+        hyperv,
+        codex,
+      };
+      this.runtime = runtime;
+      this.runtimeCheckedAt = Date.now();
+      return runtime;
+    })();
+    try {
+      return await this.runtimePromise;
+    } finally {
+      this.runtimePromise = null;
+    }
   }
 
   async probeWorker(worker) {
@@ -66,14 +141,15 @@ export class HyperVAdapter {
       return await this.powershell(
         "Get-WorkerHealth.ps1",
         {
-          ...this.commonWorkerArguments(worker),
+          ...this.workerArguments(worker, { requireCredential: false }),
           SharePath: worker.sharePath,
           HealthUrl: resolveWorkerTemplate(
             worker.project?.unityHealthUrl || worker.project?.unitySkillUrl,
             worker,
           ),
+          TimeoutSeconds: 60,
         },
-        { timeoutMs: 45_000 },
+        { timeoutMs: 90_000 },
       );
     } catch (error) {
       return {
@@ -89,21 +165,33 @@ export class HyperVAdapter {
   }
 
   async prepare(context, { signal, onProgress }) {
-    onProgress?.(
-      "restore",
-      `Restoring ${context.worker.checkpointName || context.project.checkpointName}`,
-    );
-    await this.powershell(
-      "Restore-Worker.ps1",
-      {
-        ...this.commonWorkerArguments(context.worker),
-        CheckpointName:
-          context.worker.checkpointName ||
-          context.project.checkpointName ||
-          "PROJECT_READY",
-      },
-      { signal },
-    );
+    if (this.config.checkpointsEnabled) {
+      onProgress?.(
+        "restore",
+        `Restoring ${context.worker.checkpointName || context.project.checkpointName}`,
+      );
+      await this.powershell(
+        "Restore-Worker.ps1",
+        {
+          ...this.workerArguments(context.worker),
+          CheckpointName:
+            context.worker.checkpointName ||
+            context.project.checkpointName ||
+            "PROJECT_READY",
+        },
+        { signal },
+      );
+    } else {
+      onProgress?.(
+        "vm-ready",
+        `Ensuring ${context.worker.vmName} and PowerShell Direct are ready`,
+      );
+      await this.powershell(
+        "Ensure-WorkerReady.ps1",
+        this.workerArguments(context.worker),
+        { signal },
+      );
+    }
     onProgress?.(
       "workspace",
       `Preparing ${context.task.branchName} inside ${context.worker.vmName}`,
@@ -111,7 +199,7 @@ export class HyperVAdapter {
     const result = await this.powershell(
       "Prepare-Workspace.ps1",
       {
-        ...this.commonWorkerArguments(context.worker),
+        ...this.workerArguments(context.worker),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
@@ -120,6 +208,10 @@ export class HyperVAdapter {
         BaseBranch: required(context.task.baseBranch, "task.baseBranch"),
         TaskBranch: required(context.task.branchName, "task.branchName"),
         Mode: context.task.codexThreadId ? "resume" : "new",
+        GitAuthorName:
+          this.config.gitAuthorName || "Relay Unity Orchestrator",
+        GitAuthorEmail:
+          this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
         SharePath: context.worker.sharePath || context.project.smbPath,
         UnityHealthUrl: resolveWorkerTemplate(
           context.project.unityHealthUrl || context.project.unitySkillUrl,
@@ -159,7 +251,7 @@ export class HyperVAdapter {
       await this.powershell(
         "Save-UnityProject.ps1",
         {
-          ...this.commonWorkerArguments(context.worker),
+          ...this.workerArguments(context.worker),
           UnitySaveUrl: unitySaveUrl,
         },
         { signal, timeoutMs: 120_000 },
@@ -173,19 +265,33 @@ export class HyperVAdapter {
     return this.powershell(
       "Finalize-Workspace.ps1",
       {
-        ...this.commonWorkerArguments(context.worker),
+        ...this.workerArguments(context.worker),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
         ),
         TaskBranch: required(context.task.branchName, "task.branchName"),
         CommitMessage: `task #${context.task.number} turn ${context.turn.sequence}: ${context.task.title}`,
+        GitAuthorName:
+          this.config.gitAuthorName || "Relay Unity Orchestrator",
+        GitAuthorEmail:
+          this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
       },
       { signal },
     );
   }
 
   async release(context, { signal, onProgress }) {
+    if (!this.config.checkpointsEnabled) {
+      onProgress?.(
+        "release",
+        "Checkpoint restore is disabled; leaving the delivered workspace in place",
+      );
+      return {
+        ready: true,
+        checkpointRestored: false,
+      };
+    }
     onProgress?.(
       "release",
       `Restoring ${context.worker.checkpointName || context.project.checkpointName}`,
@@ -193,7 +299,7 @@ export class HyperVAdapter {
     return this.powershell(
       "Restore-Worker.ps1",
       {
-        ...this.commonWorkerArguments(context.worker),
+        ...this.workerArguments(context.worker),
         CheckpointName:
           context.worker.checkpointName ||
           context.project.checkpointName ||
@@ -204,16 +310,35 @@ export class HyperVAdapter {
   }
 
   async controlWorker(worker, action) {
+    if (action === "restore" && !this.config.checkpointsEnabled) {
+      throw Object.assign(
+        new Error(
+          "Checkpoint operations are disabled until PIPELINE_CHECKPOINTS_ENABLED=true",
+        ),
+        { code: "CHECKPOINTS_DISABLED" },
+      );
+    }
+    if (action === "release" && !this.config.checkpointsEnabled) {
+      return { action, checkpointRestored: false };
+    }
     if (action === "restore" || action === "release") {
       return this.powershell("Restore-Worker.ps1", {
-        ...this.commonWorkerArguments(worker),
+        ...this.workerArguments(worker),
         CheckpointName: worker.checkpointName || "PROJECT_READY",
       });
     }
     if (action === "probe") return this.probeWorker(worker);
-    return this.powershell("Control-Worker.ps1", {
+    const result = await this.powershell("Control-Worker.ps1", {
       VMName: required(worker.vmName, "worker.vmName"),
       Action: action,
     });
+    if (["start", "restart"].includes(action)) {
+      await this.powershell(
+        "Ensure-WorkerReady.ps1",
+        this.workerArguments(worker),
+        { timeoutMs: 270_000 },
+      );
+    }
+    return result;
   }
 }

@@ -9,6 +9,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 $resolvedDestination = [System.IO.Path]::GetFullPath($Destination)
 $parent = Split-Path -Parent $resolvedDestination

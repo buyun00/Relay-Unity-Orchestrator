@@ -8,6 +8,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 Import-Module Hyper-V -ErrorAction Stop
 
 $vm = Get-VM -Name $VMName -ErrorAction Stop
