@@ -113,6 +113,164 @@ const TASK_PRIORITY_OPTIONS = [
   { value: 0, label: "普通", detail: "按当前队列顺序" },
 ] as const;
 
+const CODEX_MODEL_OPTIONS = [
+  {
+    value: "gpt-5.6-sol",
+    label: "GPT-5.6 Sol",
+    detail: "最强能力，适合复杂编码与长任务",
+    efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+  },
+  {
+    value: "gpt-5.6-terra",
+    label: "GPT-5.6 Terra",
+    detail: "能力与成本平衡",
+    efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+  },
+  {
+    value: "gpt-5.6-luna",
+    label: "GPT-5.6 Luna",
+    detail: "轻量快速，适合高吞吐任务",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    value: "gpt-5.5",
+    label: "GPT-5.5",
+    detail: "复杂编码与通用工作",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    value: "gpt-5.4",
+    label: "GPT-5.4",
+    detail: "日常编码任务",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    value: "gpt-5.4-mini",
+    label: "GPT-5.4 Mini",
+    detail: "更低成本的简单任务",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    value: "gpt-5.3-codex-spark",
+    label: "GPT-5.3 Codex Spark",
+    detail: "近实时快速编码迭代",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+] as const;
+
+const CODEX_REASONING_OPTIONS = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra High" },
+  { value: "max", label: "Max" },
+  { value: "ultra", label: "Ultra" },
+] as const;
+
+function codexModelLabel(value: string) {
+  return (
+    CODEX_MODEL_OPTIONS.find((option) => option.value === value)?.label ?? value
+  );
+}
+
+function codexReasoningLabel(value: string) {
+  return (
+    CODEX_REASONING_OPTIONS.find((option) => option.value === value)?.label ??
+    value
+  );
+}
+
+function StyledSelect({
+  label,
+  value,
+  options,
+  onChange,
+  description,
+}: {
+  label: string;
+  value: string;
+  options: ReadonlyArray<{ value: string; label: string; detail?: string }>;
+  onChange: (value: string) => void;
+  description?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const selected =
+    options.find((option) => option.value === value) ?? options[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: MouseEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div className="form-field">
+      <span>{label}</span>
+      <div className="styled-select" ref={containerRef}>
+        <button
+          type="button"
+          className="styled-select-trigger"
+          aria-label={label}
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+          onKeyDown={(event) => {
+            if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+              event.preventDefault();
+              setOpen(true);
+            }
+          }}
+        >
+          <span>{selected?.label ?? value}</span>
+          <ChevronDown className={open ? "rotated" : ""} size={16} />
+        </button>
+        {open && (
+          <div
+            className="styled-select-menu"
+            role="listbox"
+            aria-label={`${label}选项`}
+          >
+            {options.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="option"
+                aria-selected={option.value === value}
+                className={cx(
+                  "styled-select-option",
+                  option.value === value && "selected",
+                )}
+                onClick={() => {
+                  onChange(option.value);
+                  setOpen(false);
+                }}
+              >
+                <span>
+                  <strong>{option.label}</strong>
+                  {option.detail && <small>{option.detail}</small>}
+                </span>
+                {option.value === value && <Check size={15} />}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {description && <small>{description}</small>}
+    </div>
+  );
+}
+
 function taskTitleFromContent(content: string) {
   const normalized = content.replace(/\s+/g, " ").trim();
   const firstSentence = normalized.split(/[。！？!?；;]/, 1)[0]?.trim();
@@ -288,10 +446,7 @@ function compareEvents(a: PipelineEvent, b: PipelineEvent) {
   return a.createdAt.localeCompare(b.createdAt);
 }
 
-function mergePipelineEvent(
-  events: PipelineEvent[],
-  incoming: PipelineEvent,
-) {
+function mergePipelineEvent(events: PipelineEvent[], incoming: PipelineEvent) {
   if (events.some((event) => String(event.id) === String(incoming.id)))
     return events;
   return [...events, incoming].sort(compareEvents);
@@ -1884,6 +2039,18 @@ function TaskDetail({
                   </code>
                 </dd>
               </div>
+              <div>
+                <dt>Codex 模型</dt>
+                <dd>{codexModelLabel(task.codexModel)}</dd>
+              </div>
+              <div>
+                <dt>思考深度</dt>
+                <dd>{codexReasoningLabel(task.codexReasoningEffort)}</dd>
+              </div>
+              <div>
+                <dt>Fast 模式</dt>
+                <dd>{task.codexFastMode ? "已开启" : "普通速度"}</dd>
+              </div>
             </dl>
             {current?.result && (
               <div className="change-summary">
@@ -2825,7 +2992,8 @@ function SettingsPage({
           <div className="safety-note">
             <ShieldCheck size={17} />
             <span>
-              生产路径只使用真实 Hyper-V 与 Codex CLI；检查点恢复可在准备完成后单独启用。
+              生产路径只使用真实 Hyper-V 与 Codex
+              CLI；检查点恢复可在准备完成后单独启用。
             </span>
           </div>
         </aside>
@@ -2896,8 +3064,17 @@ function CreateTaskModal({
   const [requirement, setRequirement] = useState("");
   const [priority, setPriority] = useState(0);
   const [autoRelease, setAutoRelease] = useState(true);
+  const [codexModel, setCodexModel] = useState("gpt-5.6-sol");
+  const [codexReasoningEffort, setCodexReasoningEffort] = useState("xhigh");
+  const [codexFastMode, setCodexFastMode] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const project = projects[0];
+  const selectedCodexModel =
+    CODEX_MODEL_OPTIONS.find((option) => option.value === codexModel) ??
+    CODEX_MODEL_OPTIONS[0];
+  const availableReasoningOptions = CODEX_REASONING_OPTIONS.filter((option) =>
+    selectedCodexModel.efforts.some((effort) => effort === option.value),
+  );
 
   const addFiles = (incoming: File[]) => {
     setFiles((current) => {
@@ -2948,6 +3125,9 @@ function CreateTaskModal({
         baseBranch: project.defaultBranch,
         priority,
         autoRelease,
+        codexModel,
+        codexReasoningEffort,
+        codexFastMode,
         idempotencyKey,
       },
       files,
@@ -3025,6 +3205,71 @@ function CreateTaskModal({
                 ))}
               </div>
             )}
+            <section
+              className="codex-task-settings"
+              aria-labelledby="codex-task-settings-title"
+            >
+              <div className="codex-task-settings-head">
+                <span className="codex-settings-icon">
+                  <Bot size={18} />
+                </span>
+                <div>
+                  <h3 id="codex-task-settings-title">Codex 配置</h3>
+                  <p>该任务后续追加轮次会继续使用这里的选择。</p>
+                </div>
+              </div>
+              <div className="codex-task-settings-grid">
+                <StyledSelect
+                  label="模型"
+                  value={codexModel}
+                  options={CODEX_MODEL_OPTIONS}
+                  description={selectedCodexModel.detail}
+                  onChange={(nextModel) => {
+                    const nextOption = CODEX_MODEL_OPTIONS.find(
+                      (option) => option.value === nextModel,
+                    );
+                    setCodexModel(nextModel);
+                    if (
+                      nextOption &&
+                      !nextOption.efforts.some(
+                        (effort) => effort === codexReasoningEffort,
+                      )
+                    ) {
+                      setCodexReasoningEffort(
+                        nextOption.efforts.includes("xhigh")
+                          ? "xhigh"
+                          : (nextOption.efforts.at(-1) ?? "high"),
+                      );
+                    }
+                  }}
+                />
+                <StyledSelect
+                  label="思考深度"
+                  value={codexReasoningEffort}
+                  options={availableReasoningOptions}
+                  description="Extra High 对应 Codex 的 xhigh"
+                  onChange={setCodexReasoningEffort}
+                />
+                <label className="task-release-toggle codex-fast-toggle">
+                  <input
+                    type="checkbox"
+                    checked={codexFastMode}
+                    onChange={(event) => setCodexFastMode(event.target.checked)}
+                  />
+                  <span>
+                    <strong>
+                      <Zap size={15} />
+                      Fast 模式
+                    </strong>
+                    <small>
+                      {codexFastMode
+                        ? "已开启优先速度模式"
+                        : "默认关闭，使用普通速度"}
+                    </small>
+                  </span>
+                </label>
+              </div>
+            </section>
             <fieldset className="priority-fieldset">
               <legend>预计开始</legend>
               <p>选择调度等级；时间会根据当前工位和队列动态估算。</p>
@@ -3317,8 +3562,7 @@ function WorkerEditor({
 }) {
   const dialogRef = useDialogFocusTrap(onClose);
   const discoveredVm = virtualMachines.find(
-    (virtualMachine) =>
-      !worker || virtualMachine.name === worker.vmName,
+    (virtualMachine) => !worker || virtualMachine.name === worker.vmName,
   );
   const [form, setForm] = useState({
     name: worker?.name ?? discoveredVm?.name ?? "",
@@ -3329,10 +3573,7 @@ function WorkerEditor({
       "",
     corporateIp: worker?.corporateIp ?? "",
     sharePath:
-      worker?.sharePath ??
-      worker?.smbPath ??
-      projects[0]?.smbPath ??
-      "",
+      worker?.sharePath ?? worker?.smbPath ?? projects[0]?.smbPath ?? "",
     checkpointName: worker?.checkpointName ?? "PROJECT_READY",
     credentialPath: worker?.credentialPath ?? "",
     enabled: worker?.enabled ?? true,

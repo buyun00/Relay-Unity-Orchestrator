@@ -9,6 +9,11 @@ import {
   slug,
   stringifyJson,
 } from "./util.mjs";
+import {
+  DEFAULT_CODEX_FAST_MODE,
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_REASONING_EFFORT,
+} from "./codex-settings.mjs";
 
 const ACTIVE_TURN_STATUSES = [
   "queued",
@@ -117,6 +122,9 @@ function taskFromRow(row) {
     latestCommitSha: row.latest_commit_sha,
     priority: row.priority,
     autoRelease: asBoolean(row.auto_release),
+    codexModel: row.codex_model,
+    codexReasoningEffort: row.codex_reasoning_effort,
+    codexFastMode: asBoolean(row.codex_fast_mode),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     closedAt: row.closed_at,
@@ -258,6 +266,9 @@ export class Store {
         latest_commit_sha TEXT,
         priority INTEGER NOT NULL DEFAULT 0,
         auto_release INTEGER NOT NULL DEFAULT 1,
+        codex_model TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_MODEL}',
+        codex_reasoning_effort TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_REASONING_EFFORT}',
+        codex_fast_mode INTEGER NOT NULL DEFAULT ${DEFAULT_CODEX_FAST_MODE ? 1 : 0},
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         closed_at TEXT
@@ -324,6 +335,23 @@ export class Store {
     const taskColumns = this.db.prepare("PRAGMA table_info(tasks)").all();
     if (!taskColumns.some((column) => column.name === "idempotency_key")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT");
+    }
+    if (!taskColumns.some((column) => column.name === "codex_model")) {
+      this.db.exec(
+        `ALTER TABLE tasks ADD COLUMN codex_model TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_MODEL}'`,
+      );
+    }
+    if (
+      !taskColumns.some((column) => column.name === "codex_reasoning_effort")
+    ) {
+      this.db.exec(
+        `ALTER TABLE tasks ADD COLUMN codex_reasoning_effort TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_REASONING_EFFORT}'`,
+      );
+    }
+    if (!taskColumns.some((column) => column.name === "codex_fast_mode")) {
+      this.db.exec(
+        `ALTER TABLE tasks ADD COLUMN codex_fast_mode INTEGER NOT NULL DEFAULT ${DEFAULT_CODEX_FAST_MODE ? 1 : 0}`,
+      );
     }
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_idx
@@ -776,13 +804,19 @@ export class Store {
         input.branchName ||
         `codex/task-${String(taskNumber).padStart(4, "0")}-${slug(input.title)}`;
       const priority = Number(input.priority || 0);
+      const codexModel = input.codexModel || DEFAULT_CODEX_MODEL;
+      const codexReasoningEffort =
+        input.codexReasoningEffort || DEFAULT_CODEX_REASONING_EFFORT;
+      const codexFastMode =
+        (input.codexFastMode ?? DEFAULT_CODEX_FAST_MODE) ? 1 : 0;
       this.db
         .prepare(
           `
         INSERT INTO tasks (
           id, task_number, idempotency_key, title, project_id, base_branch, branch_name, status,
-          priority, auto_release, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+          priority, auto_release, codex_model, codex_reasoning_effort, codex_fast_mode,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
       `,
         )
         .run(
@@ -795,6 +829,9 @@ export class Store {
           branchName,
           priority,
           input.autoRelease === false ? 0 : 1,
+          codexModel,
+          codexReasoningEffort,
+          codexFastMode,
           timestamp,
           timestamp,
         );

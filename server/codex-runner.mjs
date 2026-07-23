@@ -130,8 +130,24 @@ export class CodexRunner {
     });
     let threadId = context.task.codexThreadId || null;
     let lineBuffer = "";
+    const codexModel = context.task.codexModel || this.config.codexModel;
+    const codexReasoningEffort =
+      context.task.codexReasoningEffort || this.config.codexReasoningEffort;
+    const codexFastMode =
+      context.task.codexFastMode ?? this.config.codexServiceTier === "fast";
 
-    const args = ["-C", workspace];
+    const args = [
+      "-C",
+      workspace,
+      "--model",
+      codexModel,
+      "-c",
+      `model_reasoning_effort=${JSON.stringify(codexReasoningEffort)}`,
+      "-c",
+      `service_tier=${JSON.stringify(codexFastMode ? "fast" : "default")}`,
+      "-c",
+      `features.fast_mode=${codexFastMode}`,
+    ];
     const unitySkillUrl = resolveWorkerTemplate(
       context.project.unitySkillUrl,
       context.worker,

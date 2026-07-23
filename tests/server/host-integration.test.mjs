@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { HyperVAdapter } from "../../server/adapters/hyperv.mjs";
@@ -30,6 +32,9 @@ function config(overrides = {}) {
     powershellCommand: "powershell.exe",
     codexCommand: "codex",
     codexHome: "C:\\Relay\\codex-home",
+    codexModel: "gpt-5.6-sol",
+    codexReasoningEffort: "xhigh",
+    codexServiceTier: "default",
     gitAuthorName: "Relay Test Worker",
     gitAuthorEmail: "relay-test@localhost",
     checkpointsEnabled: false,
@@ -63,6 +68,7 @@ function context() {
       unitySaveUrl: null,
     },
     task: {
+      id: "task-real",
       number: 1,
       title: "Real host task",
       baseBranch: "main",
@@ -142,10 +148,7 @@ test("checkpoint-disabled preparation starts the real VM without restoring a sna
   await adapter.prepare(context(), {});
   const release = await adapter.release(context(), {});
 
-  assert.deepEqual(calls, [
-    "Ensure-WorkerReady.ps1",
-    "Prepare-Workspace.ps1",
-  ]);
+  assert.deepEqual(calls, ["Ensure-WorkerReady.ps1", "Prepare-Workspace.ps1"]);
   assert.equal(release.checkpointRestored, false);
   await assert.rejects(
     () => adapter.controlWorker(context().worker, "restore"),
@@ -258,4 +261,71 @@ test("Codex preflight uses the configured executable and persistent CODEX_HOME",
       (call) => call.options.env.CODEX_HOME === "C:\\Relay\\codex-home",
     ),
   );
+});
+
+test("Codex turns pin the Relay model, reasoning effort, and standard speed", async (t) => {
+  const logDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runner-"),
+  );
+  t.after(() => fs.rmSync(logDirectory, { recursive: true, force: true }));
+  const calls = [];
+  const runner = new CodexRunner(config({ logDirectory }), {
+    processRunner: async (command, args, options) => {
+      calls.push({ command, args, options });
+      options.onStdout?.(
+        `${JSON.stringify({
+          type: "thread.started",
+          thread_id: "thread-model-defaults",
+        })}\n`,
+      );
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await runner.run(context(), {});
+
+  assert.equal(result.threadId, "thread-model-defaults");
+  assert.equal(calls.length, 1);
+  const [{ args }] = calls;
+  const execIndex = args.indexOf("exec");
+  assert.ok(execIndex > 0);
+  assert.ok(args.indexOf("--model") < execIndex);
+  assert.equal(args[args.indexOf("--model") + 1], "gpt-5.6-sol");
+  assert.ok(args.indexOf('model_reasoning_effort="xhigh"') < execIndex);
+  assert.ok(args.indexOf('service_tier="default"') < execIndex);
+  assert.ok(args.indexOf("features.fast_mode=false") < execIndex);
+});
+
+test("Codex turns use task-level model, reasoning, and Fast overrides", async (t) => {
+  const logDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runner-fast-"),
+  );
+  t.after(() => fs.rmSync(logDirectory, { recursive: true, force: true }));
+  const calls = [];
+  const runner = new CodexRunner(config({ logDirectory }), {
+    processRunner: async (command, args, options) => {
+      calls.push({ command, args, options });
+      options.onStdout?.(
+        `${JSON.stringify({
+          type: "thread.started",
+          thread_id: "thread-task-codex-settings",
+        })}\n`,
+      );
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  const taskContext = context();
+  taskContext.task.codexModel = "gpt-5.6-terra";
+  taskContext.task.codexReasoningEffort = "max";
+  taskContext.task.codexFastMode = true;
+
+  const result = await runner.run(taskContext, {});
+
+  assert.equal(result.threadId, "thread-task-codex-settings");
+  const [{ args }] = calls;
+  const execIndex = args.indexOf("exec");
+  assert.equal(args[args.indexOf("--model") + 1], "gpt-5.6-terra");
+  assert.ok(args.indexOf('model_reasoning_effort="max"') < execIndex);
+  assert.ok(args.indexOf('service_tier="fast"') < execIndex);
+  assert.ok(args.indexOf("features.fast_mode=true") < execIndex);
 });

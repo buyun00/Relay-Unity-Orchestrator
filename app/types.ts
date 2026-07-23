@@ -123,6 +123,9 @@ export interface Task {
   latestCommitSha?: string | null;
   priority?: number;
   autoRelease?: boolean;
+  codexModel: string;
+  codexReasoningEffort: string;
+  codexFastMode: boolean;
   createdAt: string;
   updatedAt: string;
   closedAt?: string | null;

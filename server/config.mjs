@@ -1,5 +1,9 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_REASONING_EFFORT,
+} from "./codex-settings.mjs";
 
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(serverDirectory, "..");
@@ -65,19 +69,21 @@ export const config = Object.freeze({
     1_500,
   ),
   healthIntervalMs: integer(process.env.PIPELINE_HEALTH_INTERVAL_MS, 30_000),
-  checkpointsEnabled: boolean(
-    process.env.PIPELINE_CHECKPOINTS_ENABLED,
-    false,
-  ),
+  checkpointsEnabled: boolean(process.env.PIPELINE_CHECKPOINTS_ENABLED, false),
   allowUnitySaveSkip: boolean(
     process.env.PIPELINE_ALLOW_UNITY_SAVE_SKIP,
     false,
   ),
   codexCommand: process.env.PIPELINE_CODEX_COMMAND || "codex",
   codexHome: process.env.CODEX_HOME?.trim() || null,
+  codexModel: process.env.PIPELINE_CODEX_MODEL?.trim() || DEFAULT_CODEX_MODEL,
+  codexReasoningEffort:
+    process.env.PIPELINE_CODEX_REASONING_EFFORT?.trim() ||
+    DEFAULT_CODEX_REASONING_EFFORT,
+  codexServiceTier:
+    process.env.PIPELINE_CODEX_SERVICE_TIER?.trim() || "default",
   gitAuthorName:
-    process.env.PIPELINE_GIT_AUTHOR_NAME?.trim() ||
-    "Relay Unity Orchestrator",
+    process.env.PIPELINE_GIT_AUTHOR_NAME?.trim() || "Relay Unity Orchestrator",
   gitAuthorEmail:
     process.env.PIPELINE_GIT_AUTHOR_EMAIL?.trim() ||
     "relay-unity-orchestrator@localhost",

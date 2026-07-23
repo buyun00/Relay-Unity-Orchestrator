@@ -68,6 +68,9 @@ function createTask(store, projectId, options = {}) {
     message: options.message || "Perform the requested Unity change",
     priority: options.priority ?? 0,
     autoRelease: options.autoRelease ?? true,
+    codexModel: options.codexModel,
+    codexReasoningEffort: options.codexReasoningEffort,
+    codexFastMode: options.codexFastMode,
   });
 }
 
@@ -422,6 +425,9 @@ test("SQLite restart preserves project URLs, task conversation, branch, and hist
   const created = createTask(store, project.id, {
     title: "Durable history",
     message: "Persist this completed turn",
+    codexModel: "gpt-5.6-terra",
+    codexReasoningEffort: "max",
+    codexFastMode: true,
   });
   await new Promise((resolve) => setImmediate(resolve));
   const context = store.claimNextTurn();
@@ -458,6 +464,9 @@ test("SQLite restart preserves project URLs, task conversation, branch, and hist
   assert.equal(persistedTask.branchName, originalBranchName);
   assert.equal(persistedTask.latestCommitSha, "abc1234");
   assert.equal(persistedTask.status, "waiting_user");
+  assert.equal(persistedTask.codexModel, "gpt-5.6-terra");
+  assert.equal(persistedTask.codexReasoningEffort, "max");
+  assert.equal(persistedTask.codexFastMode, true);
   assert.equal(persistedTurn.status, "success");
   assert.equal(persistedTurn.userMessage, "Persist this completed turn");
   assert.equal(persistedTurn.codexFinal.summary, "Persisted result");
@@ -521,12 +530,18 @@ test("browser preflight accepts the task idempotency header", async (t) => {
       projectId: project.id,
       title: "Browser task",
       message: "Verify browser task creation",
+      codexModel: "gpt-5.6-luna",
+      codexReasoningEffort: "max",
+      codexFastMode: true,
     }),
   });
   assert.equal(response.status, 201);
   assert.equal(response.headers.get("access-control-allow-origin"), origin);
   const firstPayload = await response.json();
   assert.equal(firstPayload.task.title, "Browser task");
+  assert.equal(firstPayload.task.codexModel, "gpt-5.6-luna");
+  assert.equal(firstPayload.task.codexReasoningEffort, "max");
+  assert.equal(firstPayload.task.codexFastMode, true);
 
   const repeated = await fetch(`${base}/api/tasks`, {
     method: "POST",
@@ -546,6 +561,26 @@ test("browser preflight accepts the task idempotency header", async (t) => {
   assert.equal(repeatedPayload.task.id, firstPayload.task.id);
   assert.equal(repeatedPayload.turn.id, firstPayload.turn.id);
   assert.equal(repeatedPayload.duplicate, true);
+  assert.equal(store.listTasks().length, 1);
+
+  const invalidSettings = await fetch(`${base}/api/tasks`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "browser-invalid-codex-settings",
+    },
+    body: JSON.stringify({
+      projectId: project.id,
+      title: "Invalid Codex settings",
+      message: "This task must be rejected",
+      codexModel: "gpt-5.6-luna",
+      codexReasoningEffort: "ultra",
+    }),
+  });
+  const invalidPayload = await invalidSettings.json();
+  assert.equal(invalidSettings.status, 400);
+  assert.equal(invalidPayload.error.code, "VALIDATION_ERROR");
   assert.equal(store.listTasks().length, 1);
 
   store.emit({

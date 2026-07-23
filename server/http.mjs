@@ -10,6 +10,7 @@ import {
   requiredString,
   safeFilename,
 } from "./util.mjs";
+import { codexTaskSettings } from "./codex-settings.mjs";
 
 function json(response, status, payload, headers = {}) {
   const body = JSON.stringify(payload);
@@ -624,6 +625,11 @@ export class PipelineHttpServer {
           "message",
           { max: 100_000 },
         );
+        const taskCodexSettings = codexTaskSettings(body, {
+          codexModel: this.config.codexModel,
+          codexReasoningEffort: this.config.codexReasoningEffort,
+          codexFastMode: this.config.codexServiceTier === "fast",
+        });
         const result = this.store.createTask({
           title: requiredString(body.title, "title", { max: 200 }),
           projectId: requiredString(body.projectId, "projectId", { max: 200 }),
@@ -638,6 +644,7 @@ export class PipelineHttpServer {
               : gitRef(body.branchName, "branchName"),
           priority: integer(body.priority, 0, -100, 100),
           autoRelease: body.autoRelease !== false,
+          ...taskCodexSettings,
           attachments: body.attachments || body.attachmentIds,
           idempotencyKey: idempotencyKey || null,
         });
