@@ -1,0 +1,182 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { runProcess } from "./process.mjs";
+import { parseJson, resolveWorkerTemplate } from "./util.mjs";
+
+const schemaPath = fileURLToPath(
+  new URL("./codex-output.schema.json", import.meta.url),
+);
+
+function eventThreadId(event) {
+  if (event?.type !== "thread.started") return null;
+  return event.thread_id || event.threadId || event.thread?.id || null;
+}
+
+function attachmentPrompt(attachment) {
+  const extension = path.extname(attachment.filename || "").toLowerCase();
+  const isText =
+    attachment.contentType?.startsWith("text/") ||
+    [".txt", ".log", ".md", ".json", ".xml", ".yaml", ".yml"].includes(
+      extension,
+    );
+  if (!isText) return `- ${attachment.filename}: ${attachment.path}`;
+  try {
+    const content = fs.readFileSync(attachment.path, "utf8");
+    const limit = 200_000;
+    const excerpt = content.slice(0, limit);
+    const truncated = content.length > limit ? "\n[attachment truncated]" : "";
+    return [
+      `- ${attachment.filename} (${attachment.path})`,
+      "<attachment>",
+      excerpt,
+      truncated,
+      "</attachment>",
+    ].join("\n");
+  } catch (error) {
+    return `- ${attachment.filename}: ${attachment.path} (could not inline: ${error.message})`;
+  }
+}
+
+function buildPrompt(context) {
+  const attachmentNote = context.attachments.length
+    ? `\nAttachments supplied by the user for this turn:\n${context.attachments.map(attachmentPrompt).join("\n")}`
+    : "";
+  return [
+    `You are executing turn ${context.turn.sequence} for persistent task #${context.task.number}: ${context.task.title}.`,
+    `Work only on branch ${context.task.branchName}. The workspace is managed externally; do not switch branches or push.`,
+    "Use the configured Unity Skill whenever the task requires inspecting or editing scenes, prefabs, or serialized Unity assets.",
+    "Complete the requested change, validate proportionally, and return the required structured result.",
+    "",
+    context.turn.userMessage,
+    attachmentNote,
+  ].join("\n");
+}
+
+export class CodexRunner {
+  constructor(config) {
+    this.config = config;
+  }
+
+  async run(context, { signal, onEvent }) {
+    const workspace = context.worker.sharePath || context.project.smbPath;
+    if (!workspace) {
+      throw Object.assign(
+        new Error("Worker SMB workspace path is not configured"),
+        { code: "SMB_PATH_MISSING" },
+      );
+    }
+    const turnLogDirectory = path.join(
+      this.config.logDirectory,
+      context.task.id,
+    );
+    fs.mkdirSync(turnLogDirectory, { recursive: true });
+    const jsonlPath = path.join(
+      turnLogDirectory,
+      `${context.turn.sequence}-${context.turn.id}.jsonl`,
+    );
+    const finalPath = path.join(
+      turnLogDirectory,
+      `${context.turn.sequence}-${context.turn.id}.final.json`,
+    );
+    const logStream = fs.createWriteStream(jsonlPath, {
+      flags: "a",
+      encoding: "utf8",
+    });
+    let threadId = context.task.codexThreadId || null;
+    let lineBuffer = "";
+
+    const args = ["-C", workspace];
+    const unitySkillUrl = resolveWorkerTemplate(
+      context.project.unitySkillUrl,
+      context.worker,
+    );
+    if (unitySkillUrl) {
+      args.push(
+        "-c",
+        `mcp_servers.unity.url=${JSON.stringify(unitySkillUrl)}`,
+        "-c",
+        "mcp_servers.unity.required=true",
+      );
+    }
+    args.push(
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "never",
+      "exec",
+    );
+    if (threadId) args.push("resume");
+    args.push(
+      "--json",
+      "--output-schema",
+      schemaPath,
+      "--output-last-message",
+      finalPath,
+    );
+    const prompt = buildPrompt(context);
+    for (const attachment of context.attachments) {
+      if (attachment.contentType?.startsWith("image/"))
+        args.push("--image", attachment.path);
+    }
+    if (threadId) args.push(threadId, prompt);
+    else args.push(prompt);
+
+    const consumeLines = (text) => {
+      logStream.write(text);
+      lineBuffer += text;
+      const lines = lineBuffer.split(/\r?\n/);
+      lineBuffer = lines.pop() || "";
+      for (const line of lines) {
+        const event = parseJson(line, null);
+        if (!event) continue;
+        threadId ||= eventThreadId(event);
+        onEvent?.(event);
+      }
+    };
+
+    try {
+      await runProcess(this.config.codexCommand, args, {
+        cwd: workspace,
+        signal,
+        timeoutMs: this.config.codexTimeoutMs,
+        onStdout: consumeLines,
+        onStderr: (text) =>
+          onEvent?.({ type: "codex.stderr", message: text.trim() }),
+      });
+      if (lineBuffer.trim()) {
+        const event = parseJson(lineBuffer, null);
+        if (event) {
+          threadId ||= eventThreadId(event);
+          onEvent?.(event);
+        }
+      }
+    } finally {
+      await new Promise((resolve) => logStream.end(resolve));
+    }
+
+    if (!threadId) {
+      throw Object.assign(
+        new Error(
+          "Codex did not emit thread.started; persistent session cannot be guaranteed",
+        ),
+        {
+          code: "CODEX_THREAD_ID_MISSING",
+        },
+      );
+    }
+    const rawFinal = fs.existsSync(finalPath)
+      ? fs.readFileSync(finalPath, "utf8").trim()
+      : "";
+    const final = parseJson(rawFinal, {
+      status: "completed",
+      summary:
+        rawFinal || "Codex completed without a structured final message.",
+      changedFiles: [],
+      validation: [],
+      risks: ["Structured output was unavailable."],
+      question: null,
+    });
+    return { threadId, final, jsonlPath, finalPath };
+  }
+}

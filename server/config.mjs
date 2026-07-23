@@ -1,0 +1,72 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(serverDirectory, "..");
+
+function integer(value, fallback) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function boolean(value, fallback = false) {
+  if (value == null || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+const adapter = (process.env.PIPELINE_ADAPTER || "mock").toLowerCase();
+if (!["mock", "hyperv"].includes(adapter)) {
+  throw new Error(`Unsupported PIPELINE_ADAPTER: ${adapter}`);
+}
+
+const adminToken = process.env.PIPELINE_ADMIN_TOKEN?.trim() || "";
+if (adapter === "hyperv" && !adminToken) {
+  throw new Error(
+    "PIPELINE_ADMIN_TOKEN is required when PIPELINE_ADAPTER=hyperv",
+  );
+}
+
+const dataDirectory = path.resolve(
+  process.env.PIPELINE_DATA_DIR || path.join(projectRoot, ".pipeline-data"),
+);
+
+export const config = Object.freeze({
+  version: "0.1.0",
+  projectRoot,
+  serverDirectory,
+  dataDirectory,
+  databasePath: path.join(dataDirectory, "pipeline.sqlite"),
+  uploadDirectory: path.join(dataDirectory, "uploads"),
+  logDirectory: path.join(dataDirectory, "logs"),
+  host: process.env.PIPELINE_HOST || "127.0.0.1",
+  port: integer(process.env.PIPELINE_PORT, 4317),
+  adapter,
+  adminToken,
+  authRequired: Boolean(adminToken),
+  allowedOrigins: (process.env.PIPELINE_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+  sessionTtlMs:
+    integer(process.env.PIPELINE_SESSION_TTL_HOURS, 12) * 60 * 60 * 1000,
+  requestBodyLimitBytes:
+    integer(process.env.PIPELINE_BODY_LIMIT_MB, 2) * 1024 * 1024,
+  uploadLimitBytes:
+    integer(process.env.PIPELINE_UPLOAD_LIMIT_MB, 25) * 1024 * 1024,
+  schedulerIntervalMs: integer(
+    process.env.PIPELINE_SCHEDULER_INTERVAL_MS,
+    1_500,
+  ),
+  healthIntervalMs: integer(process.env.PIPELINE_HEALTH_INTERVAL_MS, 30_000),
+  mockPhaseMs: integer(process.env.PIPELINE_MOCK_PHASE_MS, 650),
+  seedMockData: boolean(process.env.PIPELINE_SEED_MOCK_DATA, true),
+  allowUnitySaveSkip: boolean(
+    process.env.PIPELINE_ALLOW_UNITY_SAVE_SKIP,
+    false,
+  ),
+  codexCommand: process.env.PIPELINE_CODEX_COMMAND || "codex",
+  codexTimeoutMs:
+    integer(process.env.PIPELINE_CODEX_TIMEOUT_MINUTES, 90) * 60 * 1000,
+  powershellCommand:
+    process.env.PIPELINE_POWERSHELL_COMMAND || "powershell.exe",
+});

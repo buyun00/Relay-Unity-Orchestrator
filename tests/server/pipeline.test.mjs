@@ -1,0 +1,518 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { MockAdapter } from "../../server/adapters/mock.mjs";
+import { Store } from "../../server/db.mjs";
+import { PipelineHttpServer } from "../../server/http.mjs";
+import { Scheduler } from "../../server/scheduler.mjs";
+
+function createConfig() {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-pipeline-test-"),
+  );
+  return {
+    version: "test",
+    dataDirectory,
+    databasePath: path.join(dataDirectory, "pipeline.sqlite"),
+    uploadDirectory: path.join(dataDirectory, "uploads"),
+    logDirectory: path.join(dataDirectory, "logs"),
+    adapter: "mock",
+    host: "127.0.0.1",
+    port: 0,
+    adminToken: "",
+    authRequired: false,
+    allowedOrigins: [],
+    sessionTtlMs: 60_000,
+    requestBodyLimitBytes: 2 * 1024 * 1024,
+    uploadLimitBytes: 25 * 1024 * 1024,
+    seedMockData: false,
+    schedulerIntervalMs: 5,
+    healthIntervalMs: 60_000,
+    mockPhaseMs: 1,
+  };
+}
+
+function seedProjectAndWorker(store, { workerStatus = "ready" } = {}) {
+  const project = store.createProject({
+    id: "project-test",
+    name: "Test Unity Project",
+    repoUrl: "https://example.invalid/test-unity.git",
+    defaultBranch: "main",
+    guestProjectPath: "D:\\Work\\test-unity",
+    smbPath: "\\\\172.30.240.11\\Work\\test-unity",
+    unityVersion: "2022.3 LTS",
+    unitySkillUrl: "http://{internalIp}:8090/mcp",
+    unityHealthUrl: "http://{internalIp}:8090/health",
+    unitySaveUrl: "http://{internalIp}:8090/api/save",
+    checkpointName: "PROJECT_READY",
+  });
+  const worker = store.createWorker({
+    id: "worker-test",
+    name: "lin-worker-test",
+    vmName: "lin-worker-test",
+    projectId: project.id,
+    checkpointName: "PROJECT_READY",
+    internalIp: "172.30.240.11",
+    sharePath: project.smbPath,
+    status: workerStatus,
+  });
+  return { project, worker };
+}
+
+function createTask(store, projectId, options = {}) {
+  return store.createTask({
+    projectId,
+    title: options.title || "Test task",
+    message: options.message || "Perform the requested Unity change",
+    priority: options.priority ?? 0,
+    autoRelease: options.autoRelease ?? true,
+  });
+}
+
+function createHarness(t, options = {}) {
+  const config = createConfig();
+  const store = new Store(config);
+  const seeded = seedProjectAndWorker(store, options);
+  const adapter = options.adapter || new MockAdapter(config);
+  const scheduler = new Scheduler({ config, store, adapter });
+  t.after(async () => {
+    scheduler.stop();
+    await waitUntil(
+      () => scheduler.controllers.size === 0 && scheduler.pumping === false,
+      "scheduler cleanup",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+  return { config, store, adapter, scheduler, ...seeded };
+}
+
+async function waitUntil(predicate, description, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const value = predicate();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  if (lastError) throw lastError;
+  assert.fail(`Timed out waiting for ${description}`);
+}
+
+async function nextTimestamp() {
+  await new Promise((resolve) => setTimeout(resolve, 3));
+}
+
+class TrackingMockAdapter extends MockAdapter {
+  releaseCalls = 0;
+
+  async release(...args) {
+    this.releaseCalls += 1;
+    return super.release(...args);
+  }
+}
+
+test("priority/FIFO queue waits without a free worker, then dispatches in order", async (t) => {
+  const { store, scheduler, project, worker } = createHarness(t, {
+    workerStatus: "stopped",
+  });
+  const deliveredTaskIds = [];
+  store.onEvent((event) => {
+    if (event.type === "turn.delivered") deliveredTaskIds.push(event.taskId);
+  });
+
+  scheduler.start();
+  const lowFirst = createTask(store, project.id, {
+    title: "Low first",
+    message: "First low-priority task",
+    priority: 1,
+  });
+  await nextTimestamp();
+  const lowSecond = createTask(store, project.id, {
+    title: "Low second",
+    message: "Second low-priority task",
+    priority: 1,
+  });
+  await nextTimestamp();
+  const high = createTask(store, project.id, {
+    title: "High priority",
+    message: "High-priority task",
+    priority: 9,
+  });
+  scheduler.notifyQueueChanged();
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(
+    [lowFirst.turn, lowSecond.turn, high.turn].map(
+      (turn) => store.getTurn(turn.id).status,
+    ),
+    ["queued", "queued", "queued"],
+    "turns must remain queued while no worker is ready",
+  );
+  assert.deepEqual(
+    store.snapshot().queue.map((turn) => turn.id),
+    [high.turn.id, lowFirst.turn.id, lowSecond.turn.id],
+    "queue view must sort by priority and then FIFO creation time",
+  );
+
+  store.setWorkerState(worker.id, "ready", {
+    currentTurnId: null,
+    error: null,
+  });
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      [lowFirst.turn, lowSecond.turn, high.turn].every(
+        (turn) => store.getTurn(turn.id).status === "success",
+      ) &&
+      store.getWorker(worker.id).status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "all queued turns to complete",
+  );
+
+  assert.deepEqual(deliveredTaskIds, [
+    high.task.id,
+    lowFirst.task.id,
+    lowSecond.task.id,
+  ]);
+  assert.equal(store.getWorker(worker.id).status, "ready");
+});
+
+test("a second turn keeps the Codex thread and branch, and blocks another active turn", async (t) => {
+  const { store, scheduler, project } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Persistent conversation",
+    message: "Create the first implementation",
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      store.getWorker("worker-test").status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "the first turn to complete",
+  );
+
+  const afterFirst = store.getTask(created.task.id);
+  assert.match(afterFirst.codexThreadId, /^mock-thread-/);
+  const originalThreadId = afterFirst.codexThreadId;
+  const originalBranchName = afterFirst.branchName;
+
+  scheduler.setPaused(true);
+  const second = store.appendTurn(created.task.id, {
+    message: "Fine-tune the same implementation",
+  });
+  assert.throws(
+    () =>
+      store.appendTurn(created.task.id, {
+        message: "This concurrent follow-up must be rejected",
+      }),
+    (error) => error?.status === 409 && error?.code === "TURN_ALREADY_PENDING",
+  );
+
+  assert.equal(store.getTask(created.task.id).codexThreadId, originalThreadId);
+  assert.equal(store.getTask(created.task.id).branchName, originalBranchName);
+  scheduler.setPaused(false);
+  await waitUntil(
+    () =>
+      store.getTurn(second.id).status === "success" &&
+      store.getWorker("worker-test").status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "the second turn to complete",
+  );
+
+  const afterSecond = store.getTask(created.task.id);
+  assert.equal(afterSecond.codexThreadId, originalThreadId);
+  assert.equal(afterSecond.branchName, originalBranchName);
+  assert.deepEqual(
+    store.listTaskTurns(created.task.id).map((turn) => turn.sequence),
+    [1, 2],
+  );
+  assert.ok(
+    store
+      .listEvents({ limit: 500 })
+      .some(
+        (event) =>
+          event.turnId === second.id &&
+          event.type === "turn.codex" &&
+          event.message.includes(
+            `Resuming Codex conversation ${originalThreadId}`,
+          ),
+      ),
+    "the second turn should explicitly resume the stored Codex conversation",
+  );
+});
+
+test("push failure preserves the worker in attention and never releases it", async (t) => {
+  const config = createConfig();
+  const adapter = new TrackingMockAdapter(config);
+  const store = new Store(config);
+  const { project, worker } = seedProjectAndWorker(store);
+  const scheduler = new Scheduler({ config, store, adapter });
+  t.after(async () => {
+    scheduler.stop();
+    await waitUntil(
+      () => scheduler.controllers.size === 0 && scheduler.pumping === false,
+      "scheduler cleanup",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  const created = createTask(store, project.id, {
+    title: "Push failure",
+    message: "Change a prefab [mock:fail=push]",
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention" &&
+      scheduler.status().activeTurns === 0,
+    "the simulated push failure",
+  );
+
+  const failedTurn = store.getTurn(created.turn.id);
+  assert.equal(failedTurn.errorCode, "GIT_PUSH_FAILED");
+  assert.equal(store.getTask(created.task.id).status, "failed");
+  assert.equal(store.getWorker(worker.id).status, "attention");
+  assert.equal(store.getWorker(worker.id).currentTurnId, null);
+  assert.equal(adapter.releaseCalls, 0);
+  assert.throws(
+    () => store.retryTask(created.task.id),
+    (error) =>
+      error?.status === 409 && error?.code === "WORKSPACE_REQUIRES_ATTENTION",
+    "a preserved failed workspace must not be retried on another worker",
+  );
+  assert.throws(
+    () =>
+      store.appendTurn(created.task.id, {
+        message: "Do not reassign while the failed workspace is preserved",
+      }),
+    (error) =>
+      error?.status === 409 && error?.code === "WORKSPACE_REQUIRES_ATTENTION",
+  );
+  assert.equal(
+    store
+      .listEvents({ limit: 500 })
+      .some(
+        (event) =>
+          event.turnId === created.turn.id &&
+          ["turn.release", "turn.released"].includes(event.type),
+      ),
+    false,
+  );
+});
+
+test("autoRelease=false leaves a successful worker reserved", async (t) => {
+  const config = createConfig();
+  const adapter = new TrackingMockAdapter(config);
+  const store = new Store(config);
+  const { project, worker } = seedProjectAndWorker(store);
+  const scheduler = new Scheduler({ config, store, adapter });
+  t.after(async () => {
+    scheduler.stop();
+    await waitUntil(
+      () => scheduler.controllers.size === 0 && scheduler.pumping === false,
+      "scheduler cleanup",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  const created = createTask(store, project.id, {
+    title: "Reserved workspace",
+    message: "Keep this workspace for manual inspection",
+    autoRelease: false,
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getWorker(worker.id).status === "reserved" &&
+      scheduler.status().activeTurns === 0,
+    "the worker to become reserved",
+  );
+
+  assert.equal(store.getTurn(created.turn.id).status, "success");
+  assert.equal(store.getTask(created.task.id).status, "waiting_user");
+  assert.equal(store.getWorker(worker.id).currentTurnId, null);
+  assert.equal(adapter.releaseCalls, 0);
+  assert.ok(
+    store
+      .listEvents({ limit: 500 })
+      .some(
+        (event) =>
+          event.turnId === created.turn.id && event.type === "turn.reserved",
+      ),
+  );
+});
+
+test("pausing the scheduler preserves queued work and resuming dispatches it", async (t) => {
+  const { store, scheduler, project, worker } = createHarness(t);
+  scheduler.start();
+  scheduler.setPaused(true);
+  const created = createTask(store, project.id, {
+    title: "Paused queue",
+    message: "Wait until dispatch is resumed",
+  });
+  scheduler.notifyQueueChanged();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(store.getTurn(created.turn.id).status, "queued");
+  assert.equal(store.getWorker(worker.id).status, "ready");
+
+  scheduler.setPaused(false);
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "paused work to dispatch after resume",
+  );
+});
+
+test("SQLite restart preserves project URLs, task conversation, branch, and history", async (t) => {
+  const config = createConfig();
+  let store = new Store(config);
+  const { project, worker } = seedProjectAndWorker(store);
+  const created = createTask(store, project.id, {
+    title: "Durable history",
+    message: "Persist this completed turn",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const context = store.claimNextTurn();
+  assert.equal(context.turn.id, created.turn.id);
+  store.setTurnPhase(created.turn.id, "running");
+  store.setTaskThread(created.task.id, "thread-persisted-001");
+  store.completeTurn(created.turn.id, {
+    codexFinal: { status: "completed", summary: "Persisted result" },
+    commitSha: "abc1234",
+  });
+  store.releaseWorkerAfterSuccess(worker.id);
+  const originalBranchName = store.getTask(created.task.id).branchName;
+  store.close();
+
+  store = new Store(config);
+  t.after(() => {
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+  const persistedProject = store.getProject(project.id);
+  const persistedTask = store.getTask(created.task.id);
+  const persistedTurn = store.getTurn(created.turn.id);
+
+  assert.equal(
+    persistedProject.unityHealthUrl,
+    "http://{internalIp}:8090/health",
+  );
+  assert.equal(persistedProject.unitySkillUrl, "http://{internalIp}:8090/mcp");
+  assert.equal(
+    persistedProject.unitySaveUrl,
+    "http://{internalIp}:8090/api/save",
+  );
+  assert.equal(persistedTask.codexThreadId, "thread-persisted-001");
+  assert.equal(persistedTask.branchName, originalBranchName);
+  assert.equal(persistedTask.latestCommitSha, "abc1234");
+  assert.equal(persistedTask.status, "waiting_user");
+  assert.equal(persistedTurn.status, "success");
+  assert.equal(persistedTurn.userMessage, "Persist this completed turn");
+  assert.equal(persistedTurn.codexFinal.summary, "Persisted result");
+  assert.equal(store.getWorker(worker.id).status, "ready");
+  assert.equal(
+    store.db.prepare("PRAGMA integrity_check").get().integrity_check,
+    "ok",
+  );
+});
+
+test("browser preflight accepts the task idempotency header", async (t) => {
+  const config = createConfig();
+  const store = new Store(config);
+  const { project } = seedProjectAndWorker(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new MockAdapter(config),
+  });
+  const api = new PipelineHttpServer({ config, store, scheduler });
+  const address = await api.listen();
+  t.after(async () => {
+    await api.close();
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+  const base = `http://127.0.0.1:${address.port}`;
+  const origin = "http://localhost:3000";
+  const servicePage = await fetch(`${base}/`);
+  assert.equal(servicePage.status, 200);
+  assert.match(servicePage.headers.get("content-type") || "", /text\/html/);
+  assert.match(await servicePage.text(), /控制服务在线/);
+
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).ok, true);
+
+  const preflight = await fetch(`${base}/api/tasks`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: origin,
+      "Access-Control-Request-Method": "POST",
+      "Access-Control-Request-Headers": "content-type,idempotency-key",
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+  assert.match(
+    preflight.headers.get("access-control-allow-headers") || "",
+    /Idempotency-Key/i,
+  );
+
+  const response = await fetch(`${base}/api/tasks`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "browser-create-task-test",
+    },
+    body: JSON.stringify({
+      projectId: project.id,
+      title: "Browser task",
+      message: "Verify browser task creation",
+    }),
+  });
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get("access-control-allow-origin"), origin);
+  const firstPayload = await response.json();
+  assert.equal(firstPayload.task.title, "Browser task");
+
+  const repeated = await fetch(`${base}/api/tasks`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "browser-create-task-test",
+    },
+    body: JSON.stringify({
+      projectId: project.id,
+      title: "Browser task repeated by the transport",
+      message: "This must resolve to the first request",
+    }),
+  });
+  const repeatedPayload = await repeated.json();
+  assert.equal(repeated.status, 201);
+  assert.equal(repeatedPayload.task.id, firstPayload.task.id);
+  assert.equal(repeatedPayload.turn.id, firstPayload.turn.id);
+  assert.equal(repeatedPayload.duplicate, true);
+  assert.equal(store.listTasks().length, 1);
+});
