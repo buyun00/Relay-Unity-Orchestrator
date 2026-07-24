@@ -291,6 +291,9 @@ kbd {
 .connection-pill.offline > svg {
   color: var(--danger);
 }
+.connection-pill.connecting > svg {
+  color: var(--blue);
+}
 .connection-pill div,
 .profile-row div {
   min-width: 0;

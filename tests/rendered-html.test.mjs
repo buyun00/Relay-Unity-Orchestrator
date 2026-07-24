@@ -29,12 +29,13 @@ test("server renders the Relay control desk", async () => {
 });
 
 test("starter preview is removed and the product shell is durable", async () => {
-  const [page, layout, controlDesk, apiClient, css, packageJson] =
+  const [page, layout, controlDesk, apiClient, webServer, css, packageJson] =
     await Promise.all([
       readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
       readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
       readFile(new URL("../app/control-desk.tsx", import.meta.url), "utf8"),
       readFile(new URL("../app/api.ts", import.meta.url), "utf8"),
+      readFile(new URL("../server/web.mjs", import.meta.url), "utf8"),
       readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
       readFile(new URL("../package.json", import.meta.url), "utf8"),
     ]);
@@ -51,12 +52,20 @@ test("starter preview is removed and the product shell is durable", async () => 
   assert.match(controlDesk, /Fast 模式/);
   assert.match(controlDesk, /输入使用者名称/);
   assert.match(controlDesk, /identityReady && identityOpen/);
+  assert.match(controlDesk, /connectionChecked && !connected/);
+  assert.match(controlDesk, /正在连接/);
+  assert.match(controlDesk, /refreshInFlight\.current/);
+  assert.match(controlDesk, /fetchSnapshot\(controller\.signal\)/);
   assert.doesNotMatch(controlDesk, /管理令牌/);
   assert.match(apiClient, /X-Pipeline-User/);
   assert.match(
     apiClient,
-    /window\.location\.protocol === "https:"\) return window\.location\.origin/,
+    /window\.location\.origin\}\$\{HTTPS_API_PREFIX\}/,
   );
+  assert.match(apiClient, /HTTPS_API_PREFIX = "\/relay-control"/);
+  assert.match(apiClient, /!\["GET", "HEAD", "OPTIONS"\]\.includes\(method\)/);
+  assert.match(webServer, /controlProxyPrefix = "\/relay-control"/);
+  assert.match(webServer, /"x-relay-control-proxy"/);
   assert.doesNotMatch(apiClient, /relay-admin-token|Authorization/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
   assert.match(css, /--signal:\s*#72e0b2/);

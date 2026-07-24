@@ -19,6 +19,9 @@ const internalPort = Number.parseInt(
 );
 const publicHost = process.env.HOST || "0.0.0.0";
 const internalHost = "127.0.0.1";
+const controlHost = process.env.RELAY_CONTROL_HOST || "127.0.0.1";
+const controlPort = Number.parseInt(process.env.PIPELINE_PORT || "4317", 10);
+const controlProxyPrefix = "/relay-control";
 let server;
 let shuttingDown = false;
 
@@ -78,19 +81,34 @@ function serveStatic(request, response, filePath) {
   else fs.createReadStream(filePath).pipe(response);
 }
 
-function proxyRequest(request, response) {
+function proxyRequest(
+  request,
+  response,
+  {
+    upstreamHost = internalHost,
+    upstreamPort = internalPort,
+    upstreamPath = request.url,
+    proxyHeader = "x-relay-web-proxy",
+    preserveHost = false,
+  } = {},
+) {
   const upstream = http.request(
     {
-      host: internalHost,
-      port: internalPort,
-      path: request.url,
+      host: upstreamHost,
+      port: upstreamPort,
+      path: upstreamPath,
       method: request.method,
-      headers: { ...request.headers, host: `${internalHost}:${internalPort}` },
+      headers: {
+        ...request.headers,
+        host: preserveHost
+          ? request.headers.host
+          : `${upstreamHost}:${upstreamPort}`,
+      },
     },
     (upstreamResponse) => {
       response.writeHead(upstreamResponse.statusCode || 502, {
         ...upstreamResponse.headers,
-        "x-relay-web-proxy": "1",
+        [proxyHeader]: "1",
       });
       upstreamResponse.pipe(response);
     },
@@ -163,11 +181,26 @@ renderer.once("exit", (code, signal) => {
 await waitForRenderer();
 
 server = http.createServer((request, response) => {
+  const rawUrl = request.url || "/";
+  const pathname = new URL(rawUrl, "http://localhost").pathname;
+  if (
+    pathname === `${controlProxyPrefix}/api` ||
+    pathname.startsWith(`${controlProxyPrefix}/api/`)
+  ) {
+    proxyRequest(request, response, {
+      upstreamHost: controlHost,
+      upstreamPort: controlPort,
+      upstreamPath: rawUrl.slice(controlProxyPrefix.length),
+      proxyHeader: "x-relay-control-proxy",
+      preserveHost: true,
+    });
+    return;
+  }
   if (!["GET", "HEAD"].includes(request.method || "GET")) {
     proxyRequest(request, response);
     return;
   }
-  const staticFile = resolveStaticFile(request.url || "/");
+  const staticFile = resolveStaticFile(rawUrl);
   if (staticFile) serveStatic(request, response, staticFile);
   else proxyRequest(request, response);
 });

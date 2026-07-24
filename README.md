@@ -26,7 +26,7 @@ Unity 保存 → 来宾 commit / push → 远程 SHA 核验
 
 ### 1. 连接控制服务
 
-打开 `http://localhost:3000`；从其他局域网设备访问时，将 `localhost` 换成宿主机 IP。网页默认连接同一主机的 `4317` 端口。首次进入只需填写使用者名称，不需要访问令牌或密码；名称保存在当前浏览器中，并记录到任务发起人、每轮消息作者和人工操作事件里，方便多人共用时区分使用者。
+打开 `http://localhost:3000`；从其他局域网设备访问时，将 `localhost` 换成宿主机 IP。局域网 HTTP 网页默认连接同一主机的 `4317` 端口；HTTPS/Cloudflare 页面通过网页生产服务的同源 `/relay-control/api` 代理连接，避免浏览器混合内容和单独 API 隧道的传输延迟。首次进入只需填写使用者名称，不需要访问令牌或密码；名称保存在当前浏览器中，并记录到任务发起人、每轮消息作者和人工操作事件里，方便多人共用时区分使用者。
 
 首次使用前应在“项目”页添加项目环境，并在“工位”页添加和启用至少一个兼容的 Hyper-V 工位。系统页应显示控制服务实时连接正常、Codex 已登录且调度器未暂停。
 
@@ -84,6 +84,8 @@ npm run typecheck    # TypeScript
 npm test             # 后端状态机测试 + 生产构建 + HTML 冒烟测试
 npm run build        # 生产构建
 npm start            # 启动生产构建与控制服务
+powershell -ExecutionPolicy Bypass -File .\scripts\Restart-RelayWeb.ps1
+# 仅重启网页服务，并确保 3000 端口运行生产构建而不是 vinext dev
 ```
 
 ## 真实宿主机配置

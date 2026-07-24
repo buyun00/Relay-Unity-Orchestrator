@@ -634,6 +634,7 @@ export default function ControlDesk() {
     Record<string, PipelineEvent[]>
   >({});
   const [connected, setConnected] = useState(false);
+  const [connectionChecked, setConnectionChecked] = useState(false);
   const [lastConnectedAt, setLastConnectedAt] = useState<string | null>(null);
   const [userName, setCurrentUserName] = useState("");
   const [identityReady, setIdentityReady] = useState(false);
@@ -653,6 +654,7 @@ export default function ControlDesk() {
   const [busy, setBusy] = useState(false);
   const toastId = useRef(0);
   const lastNotifiedEvent = useRef<number | string | null>(null);
+  const refreshInFlight = useRef(false);
 
   const notify = useCallback(
     (message: string, kind: Toast["kind"] = "success") => {
@@ -668,8 +670,12 @@ export default function ControlDesk() {
 
   const refresh = useCallback(
     async (silent = false) => {
+      if (refreshInFlight.current) return;
+      refreshInFlight.current = true;
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 15_000);
       try {
-        const next = await fetchSnapshot();
+        const next = await fetchSnapshot(controller.signal);
         setSnapshot({ ...next, server: { ...next.server, connected: true } });
         setConnected(true);
         setLastConnectedAt(new Date().toISOString());
@@ -700,10 +706,18 @@ export default function ControlDesk() {
         setConnected(false);
         if (!silent) {
           notify(
-            error instanceof Error ? error.message : "无法连接调度服务",
+            error instanceof Error
+              ? error.name === "AbortError"
+                ? "连接调度服务超时"
+                : error.message
+              : "无法连接调度服务",
             "error",
           );
         }
+      } finally {
+        window.clearTimeout(timeout);
+        refreshInFlight.current = false;
+        setConnectionChecked(true);
       }
     },
     [notify],
@@ -967,11 +981,30 @@ export default function ControlDesk() {
 
         <div className="sidebar-foot">
           <div
-            className={cx("connection-pill", connected ? "online" : "offline")}
+            className={cx(
+              "connection-pill",
+              connected
+                ? "online"
+                : connectionChecked
+                  ? "offline"
+                  : "connecting",
+            )}
           >
-            {connected ? <Wifi size={15} /> : <WifiOff size={15} />}
+            {connected ? (
+              <Wifi size={15} />
+            ) : connectionChecked ? (
+              <WifiOff size={15} />
+            ) : (
+              <LoaderCircle className="spin" size={15} />
+            )}
             <div>
-              <strong>{connected ? "调度服务正常" : "服务已断开"}</strong>
+              <strong>
+                {connected
+                  ? "调度服务正常"
+                  : connectionChecked
+                    ? "服务已断开"
+                    : "正在连接"}
+              </strong>
               <span>真实 Hyper-V</span>
             </div>
           </div>
@@ -992,7 +1025,7 @@ export default function ControlDesk() {
       </aside>
 
       <main className="main-stage">
-        {!connected && (
+        {connectionChecked && !connected && (
           <div className="service-banner" role="alert">
             <WifiOff size={17} />
             <span>
@@ -1213,6 +1246,7 @@ export default function ControlDesk() {
             <SettingsPage
               snapshot={snapshot}
               connected={connected}
+              connectionChecked={connectionChecked}
               onSaved={() => void refresh()}
               notify={notify}
             />
@@ -2799,11 +2833,13 @@ function ProjectsPage({
 function SettingsPage({
   snapshot,
   connected,
+  connectionChecked,
   onSaved,
   notify,
 }: {
   snapshot: Snapshot;
   connected: boolean;
+  connectionChecked: boolean;
   onSaved: () => void;
   notify: (message: string, kind?: Toast["kind"]) => void;
 }) {
@@ -2854,8 +2890,14 @@ function SettingsPage({
           <p>网页只管理结构化任务和白名单操作，不提供任意 PowerShell 入口。</p>
         </div>
         <StatusBadge
-          status={connected ? "ready" : "offline"}
-          label={connected ? "实时连接正常" : "服务已断开"}
+          status={connected ? "ready" : connectionChecked ? "offline" : "preparing"}
+          label={
+            connected
+              ? "实时连接正常"
+              : connectionChecked
+                ? "服务已断开"
+                : "正在连接"
+          }
         />
       </section>
       <div className="settings-layout">

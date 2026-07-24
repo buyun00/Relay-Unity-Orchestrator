@@ -2,13 +2,15 @@ import type { PipelineEvent, Snapshot } from "./types";
 
 const API_KEY = "relay-api-base";
 const USER_NAME_KEY = "relay-user-name";
+const HTTPS_API_PREFIX = "/relay-control";
 
 export function getApiBase(): string {
   if (typeof window === "undefined") return "http://127.0.0.1:4317";
   // HTTPS deployments (for example a Cloudflare Tunnel) must use the
   // same-origin /api route. A previously saved LAN HTTP address would be
   // blocked by the browser as mixed content.
-  if (window.location.protocol === "https:") return window.location.origin;
+  if (window.location.protocol === "https:")
+    return `${window.location.origin}${HTTPS_API_PREFIX}`;
   const saved = window.localStorage.getItem(API_KEY);
   if (saved) return saved.replace(/\/$/, "");
   return `http://${window.location.hostname}:4317`;
@@ -17,7 +19,7 @@ export function getApiBase(): string {
 export function setApiBase(value: string) {
   const effectiveValue =
     window.location.protocol === "https:"
-      ? window.location.origin
+      ? `${window.location.origin}${HTTPS_API_PREFIX}`
       : value.replace(/\/$/, "");
   window.localStorage.setItem(API_KEY, effectiveValue);
   return effectiveValue;
@@ -53,10 +55,11 @@ export class ApiError extends Error {
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
+  const method = String(init.method || "GET").toUpperCase();
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  addUserHeader(headers);
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) addUserHeader(headers);
   const response = await fetch(`${getApiBase()}${path}`, {
     ...init,
     headers,
@@ -82,7 +85,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return payload as T;
 }
 
-export function fetchSnapshot() {
+export function fetchSnapshot(signal?: AbortSignal) {
   return api<
     Snapshot & {
       server: Snapshot["server"] & {
@@ -90,7 +93,7 @@ export function fetchSnapshot() {
         queuePaused?: boolean;
       };
     }
-  >("/api/snapshot").then((snapshot) => {
+  >("/api/snapshot", { signal }).then((snapshot) => {
     const events = snapshot.events ?? [];
     const latestPhaseByTurn = new Map<string, string>();
     for (const event of events) {
