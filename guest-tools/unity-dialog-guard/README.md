@@ -1,0 +1,113 @@
+# Unity Dialog Guard
+
+Unity Dialog Guard 是 Relay 子机内部的独立桌面守护程序。它只在子机的
+Unity 自动登录账户中运行，不依赖宿主机、PowerShell Direct 或 Relay
+控制服务来发现和点击窗口。
+
+## 行为
+
+- 每 400 ms 扫描由 `Unity.exe` 创建的顶层窗口。
+- 首批 `config.json` 规则会自动处理：
+  - 外部修改的 UI Document、资源或脚本：选择 `Reload` / `Recompile`；
+  - API Updater 同意窗口：选择备份确认、`Update` 或 `Yes`；
+  - `Enter Safe Mode?`：默认选择 `Ignore`；
+  - 兼容的项目版本升级提示：选择 `Continue` / `Open`。
+- 点击优先使用 Windows UI Automation `InvokePattern`，无法使用时才对
+  原生按钮发送 `BM_CLICK`；不使用屏幕坐标。
+- 未匹配的模态窗口会立即写入 `logs\unknown-dialogs.jsonl`，并尽量保存
+  局部截图。
+- `autoLearn=true` 时，用户第一次在未知弹窗中点击按钮，守护程序会记录
+  弹窗的规范化指纹和按钮名称到 `learned-rules.json`。同类弹窗再次出现
+  时自动执行同一按钮。
+
+`learned-rules.json` 是完整、独立、可复制的同步文件。复制前停止目标机上
+的守护进程，覆盖目标文件，再启动计划任务即可。路径、GUID、版本号以及
+常见 Unity 资源文件名会在指纹中规范化，因此同一类弹窗包含不同项目路径
+或文件编号时仍可复用。
+
+## 构建
+
+在 Windows PowerShell 5.1 中运行：
+
+```powershell
+.\Build-UnityDialogGuard.ps1
+```
+
+脚本使用 Windows 自带的 .NET Framework 4.x C# 编译器，生成
+`bin\UnityDialogGuard.exe`，不要求安装 .NET SDK。
+
+## 安装和自启动
+
+必须在子机的 Unity 自动登录账户中打开“管理员 PowerShell”，然后运行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\Install-UnityDialogGuard.ps1
+```
+
+安装器执行以下操作：
+
+1. 构建程序并复制到 `C:\ProgramData\Relay\UnityDialogGuard`；
+2. 首次安装时复制 `config.json` 和空的 `learned-rules.json`；
+3. 注册 `\Relay\UnityDialogGuard` 登录触发计划任务；
+4. 使用 `Interactive` 登录类型和当前登录用户，确保能看到 Unity 桌面；
+5. 立即启动并返回任务状态和进程 ID。
+
+重复安装会保留实际 `config.json`、`learned-rules.json` 和日志，同时将仓库
+最新默认规则写到 `config.defaults.json`。需要强制换成仓库默认配置时：
+
+```powershell
+.\Install-UnityDialogGuard.ps1 -ReplaceConfig
+```
+
+制作 `PROJECT_READY` 检查点前，应确认计划任务为 `Running`，并确保守护
+程序进程已经在 Unity 所在的用户会话中。
+
+## 配置和学习文件
+
+- `config.json`：手工维护的默认规则和运行参数。
+- `learned-rules.json`：用户首次处理未知弹窗后自动生成的规则。
+- `logs\actions.jsonl`：启动、自动点击、学习和失败记录。
+- `logs\unknown-dialogs.jsonl`：未知弹窗的标题、正文、按钮和指纹。
+- `logs\screenshots\`：能够从交互桌面捕获时保存的未知窗口截图。
+- `logs\errors.log`：守护程序内部错误。
+
+已知规则按文件顺序匹配。每条规则必须同时满足其中填写的
+`titleRegex`、`textRegex` 和 `buttonRegex`，然后按 `targetButtonNames`
+顺序选择按钮。规则默认每个弹窗实例只尝试一次，防止错误窗口形成点击
+循环。
+
+Unity 官方说明 Safe Mode 不运行项目或包中的托管代码。为保证子机的
+Unity Skill 仍有机会加载，默认规则选择 `Ignore`。如果某个项目的 Skill
+不依赖项目托管代码，并且团队更重视安全导入，可把该规则目标改为
+`Enter Safe Mode`。
+
+首批规则依据 Unity 官方资料整理：
+
+- [Safe Mode](https://docs.unity3d.com/cn/current/Manual/SafeMode.html)
+- [Unity Editor 命令行参数与 API Updater](https://docs.unity3d.com/cn/current/Manual/EditorCommandLineArguments.html)
+- [UI Document 外部修改弹窗 UUM-107642](https://issuetracker.unity3d.com/issues/ui-document-was-modified-externally-pop-up-appears-when-reimporting-assets)
+- [API Update Required 按钮文本](https://issuetracker.unity3d.com/issues/unity-obsolete-api-updater-leaves-a-semicolon-when-removing-mesh-dot-optimize-method-out-of-the-scripts)
+
+## 验证
+
+集成测试会打开真实 WPF 模态窗口，验证已知规则自动点击、未知窗口
+记录、第一次人工操作学习、规则落盘，以及下一次自动点击：
+
+```powershell
+.\Test-UnityDialogGuard.ps1
+```
+
+## 卸载
+
+默认删除计划任务和可执行文件，保留配置、学习文件及日志：
+
+```powershell
+.\Uninstall-UnityDialogGuard.ps1
+```
+
+需要同时删除全部数据时显式执行：
+
+```powershell
+.\Uninstall-UnityDialogGuard.ps1 -RemoveData
+```

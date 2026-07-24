@@ -114,7 +114,19 @@ async function nextTimestamp() {
 }
 
 class TrackingFakeAdapter extends FakeAdapter {
+  prepareCalls = 0;
+  resumeCalls = 0;
   releaseCalls = 0;
+
+  async prepare(...args) {
+    this.prepareCalls += 1;
+    return super.prepare(...args);
+  }
+
+  async resumePreserved(...args) {
+    this.resumeCalls += 1;
+    return super.resumePreserved(...args);
+  }
 
   async release(...args) {
     this.releaseCalls += 1;
@@ -122,9 +134,23 @@ class TrackingFakeAdapter extends FakeAdapter {
   }
 }
 
+class StartFailingFakeAdapter extends FakeAdapter {
+  startCalls = 0;
+
+  async controlWorker(worker, action) {
+    if (action === "start") {
+      this.startCalls += 1;
+      throw Object.assign(new Error("Fake worker startup failed"), {
+        code: "WORKER_START_FAILED",
+      });
+    }
+    return super.controlWorker(worker, action);
+  }
+}
+
 test("priority/FIFO queue waits without a free worker, then dispatches in order", async (t) => {
   const { store, scheduler, project, worker } = createHarness(t, {
-    workerStatus: "stopped",
+    workerStatus: "attention",
   });
   const deliveredTaskIds = [];
   store.onEvent((event) => {
@@ -188,7 +214,80 @@ test("priority/FIFO queue waits without a free worker, then dispatches in order"
   assert.equal(store.getWorker(worker.id).status, "ready");
 });
 
-test("a second turn keeps the Codex thread and branch, and blocks another active turn", async (t) => {
+test("a queued turn automatically starts a stopped compatible worker", async (t) => {
+  const { store, scheduler, project, worker } = createHarness(t, {
+    workerStatus: "stopped",
+  });
+  const created = createTask(store, project.id, {
+    title: "Wake a stopped worker",
+    message: "Start the worker and execute this turn",
+  });
+
+  await scheduler.start();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "the stopped worker to start and execute the queued turn",
+  );
+
+  const events = store.listEvents({ limit: 500 });
+  assert.ok(
+    events.some(
+      (event) =>
+        event.workerId === worker.id &&
+        event.type === "worker.action.started" &&
+        event.data?.action === "start",
+    ),
+  );
+  assert.ok(
+    events.some(
+      (event) =>
+        event.workerId === worker.id &&
+        event.type === "worker.action.completed" &&
+        event.data?.action === "start",
+    ),
+  );
+});
+
+test("a failed automatic worker start is surfaced once as attention", async (t) => {
+  const adapter = new StartFailingFakeAdapter({ phaseMs: 1 });
+  const { store, scheduler, project, worker } = createHarness(t, {
+    workerStatus: "stopped",
+    adapter,
+  });
+  const created = createTask(store, project.id, {
+    title: "Failed automatic startup",
+    message: "Do not spin forever when startup fails",
+  });
+
+  await scheduler.start();
+  await waitUntil(
+    () => store.getWorker(worker.id).status === "attention",
+    "the startup failure to require attention",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(store.getTurn(created.turn.id).status, "queued");
+  assert.equal(adapter.startCalls, 1);
+  assert.match(
+    store.getWorker(worker.id).lastError,
+    /Fake worker startup failed/,
+  );
+  assert.ok(
+    store
+      .listEvents({ limit: 500 })
+      .some(
+        (event) =>
+          event.workerId === worker.id &&
+          event.type === "worker.action.failed" &&
+          event.data?.action === "start",
+      ),
+  );
+});
+
+test("follow-up messages are always accepted and execute serially on the same thread and branch", async (t) => {
   const { store, scheduler, project } = createHarness(t);
   const created = createTask(store, project.id, {
     title: "Persistent conversation",
@@ -213,13 +312,9 @@ test("a second turn keeps the Codex thread and branch, and blocks another active
   const second = store.appendTurn(created.task.id, {
     message: "Fine-tune the same implementation",
   });
-  assert.throws(
-    () =>
-      store.appendTurn(created.task.id, {
-        message: "This concurrent follow-up must be rejected",
-      }),
-    (error) => error?.status === 409 && error?.code === "TURN_ALREADY_PENDING",
-  );
+  const third = store.appendTurn(created.task.id, {
+    message: "Queue one more adjustment",
+  });
 
   assert.equal(store.getTask(created.task.id).codexThreadId, originalThreadId);
   assert.equal(store.getTask(created.task.id).branchName, originalBranchName);
@@ -227,9 +322,10 @@ test("a second turn keeps the Codex thread and branch, and blocks another active
   await waitUntil(
     () =>
       store.getTurn(second.id).status === "success" &&
+      store.getTurn(third.id).status === "success" &&
       store.getWorker("worker-test").status === "ready" &&
       scheduler.status().activeTurns === 0,
-    "the second turn to complete",
+    "the queued follow-up turns to complete",
   );
 
   const afterSecond = store.getTask(created.task.id);
@@ -237,7 +333,7 @@ test("a second turn keeps the Codex thread and branch, and blocks another active
   assert.equal(afterSecond.branchName, originalBranchName);
   assert.deepEqual(
     store.listTaskTurns(created.task.id).map((turn) => turn.sequence),
-    [1, 2],
+    [1, 2, 3],
   );
   assert.ok(
     store
@@ -252,6 +348,46 @@ test("a second turn keeps the Codex thread and branch, and blocks another active
       ),
     "the second turn should explicitly resume the stored Codex conversation",
   );
+});
+
+test("messages queue during execution and automatically reopen a closed task", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Always accepting conversation",
+    message: "Start the implementation",
+  });
+  const firstContext = store.claimNextTurn();
+  assert.equal(firstContext.turn.id, created.turn.id);
+
+  const queued = store.appendTurn(created.task.id, {
+    message: "Add this while the first turn is still running",
+  });
+  assert.equal(store.getTurn(queued.id).status, "queued");
+  assert.equal(store.getTask(created.task.id).status, "running");
+
+  store.completeTurn(created.turn.id, {
+    codexFinal: { status: "completed", summary: "First turn complete" },
+    commitSha: "first-sha",
+  });
+  store.releaseWorkerAfterSuccess(worker.id);
+  assert.equal(store.getTask(created.task.id).status, "queued");
+
+  const secondContext = store.claimNextTurn();
+  assert.equal(secondContext.turn.id, queued.id);
+  store.completeTurn(queued.id, {
+    codexFinal: { status: "completed", summary: "Queued turn complete" },
+    commitSha: "second-sha",
+  });
+  store.releaseWorkerAfterSuccess(worker.id);
+  store.closeTask(created.task.id);
+  assert.equal(store.getTask(created.task.id).status, "closed");
+
+  const reopened = store.appendTurn(created.task.id, {
+    message: "Continue even though the task was closed",
+  });
+  assert.equal(reopened.status, "queued");
+  assert.equal(store.getTask(created.task.id).status, "queued");
+  assert.equal(store.getTask(created.task.id).closedAt, null);
 });
 
 test("Codex progress messages are stored as durable conversation events", async (t) => {
@@ -287,7 +423,7 @@ test("Codex progress messages are stored as durable conversation events", async 
   );
 });
 
-test("push failure preserves the worker in attention and never releases it", async (t) => {
+test("a message after delivery failure resumes the preserved worker without preparing again", async (t) => {
   const config = createConfig();
   const adapter = new TrackingFakeAdapter(config);
   const store = new Store(config);
@@ -324,20 +460,7 @@ test("push failure preserves the worker in attention and never releases it", asy
   assert.equal(store.getWorker(worker.id).status, "attention");
   assert.equal(store.getWorker(worker.id).currentTurnId, null);
   assert.equal(adapter.releaseCalls, 0);
-  assert.throws(
-    () => store.retryTask(created.task.id),
-    (error) =>
-      error?.status === 409 && error?.code === "WORKSPACE_REQUIRES_ATTENTION",
-    "a preserved failed workspace must not be retried on another worker",
-  );
-  assert.throws(
-    () =>
-      store.appendTurn(created.task.id, {
-        message: "Do not reassign while the failed workspace is preserved",
-      }),
-    (error) =>
-      error?.status === 409 && error?.code === "WORKSPACE_REQUIRES_ATTENTION",
-  );
+  assert.equal(adapter.prepareCalls, 1);
   assert.equal(
     store
       .listEvents({ limit: 500 })
@@ -348,6 +471,58 @@ test("push failure preserves the worker in attention and never releases it", asy
       ),
     false,
   );
+
+  const continued = store.appendTurn(created.task.id, {
+    message: "Continue after the Unity dialog was dismissed",
+  });
+  assert.equal(continued.workerId, worker.id);
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(continued.id).status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "the preserved workspace follow-up to complete",
+  );
+  assert.equal(adapter.prepareCalls, 1);
+  assert.equal(adapter.resumeCalls, 1);
+  assert.equal(adapter.releaseCalls, 1);
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some(
+        (event) =>
+          event.turnId === continued.id &&
+          event.type === "turn.resume" &&
+          event.message.includes("without checkpoint restore or Git reset"),
+      ),
+  );
+});
+
+test("claiming preserved work atomically marks its attention worker busy", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Preserved atomic claim",
+    message: "Fail after preparing the workspace",
+  });
+  const first = store.claimNextTurn();
+  assert.equal(first.turn.id, created.turn.id);
+  store.failTurn(
+    created.turn.id,
+    Object.assign(new Error("Preserve this workspace"), {
+      code: "PRESERVED_FAILURE",
+    }),
+  );
+  const continued = store.appendTurn(created.task.id, {
+    message: "Continue on the preserved worker",
+  });
+
+  const resumed = store.claimNextTurn();
+  assert.equal(resumed.turn.id, continued.id);
+  assert.equal(resumed.resumePreservedWorkspace, true);
+  assert.equal(resumed.worker.status, "busy");
+  assert.equal(store.getWorker(worker.id).status, "busy");
+  assert.equal(store.getWorker(worker.id).currentTurnId, continued.id);
 });
 
 test("autoRelease=false leaves a successful worker reserved", async (t) => {

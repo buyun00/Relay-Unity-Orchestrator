@@ -22,6 +22,12 @@ const ACTIVE_TURN_STATUSES = [
   "saving",
   "cancel_requested",
 ];
+const EXECUTING_TURN_STATUSES = [
+  "preparing",
+  "running",
+  "saving",
+  "cancel_requested",
+];
 
 const PROJECT_FIELDS = {
   name: "name",
@@ -387,10 +393,22 @@ export class Store {
         `,
           )
           .run(timestamp, turn.id);
+        const queued = this.db
+          .prepare(
+            "SELECT id FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence LIMIT 1",
+          )
+          .get(turn.task_id);
         this.db
-          .prepare(`UPDATE tasks SET status='failed', updated_at=? WHERE id=?`)
-          .run(timestamp, turn.task_id);
+          .prepare(`UPDATE tasks SET status=?, updated_at=? WHERE id=?`)
+          .run(queued ? "queued" : "failed", timestamp, turn.task_id);
         if (turn.worker_id) {
+          if (queued) {
+            this.db
+              .prepare(
+                "UPDATE turns SET worker_id=? WHERE id=? AND worker_id IS NULL",
+              )
+              .run(turn.worker_id, queued.id);
+          }
           this.db
             .prepare(
               `
@@ -906,53 +924,43 @@ export class Store {
     );
   }
 
-  assertNoPreservedWorkspace(taskId) {
-    const latest = this.db
-      .prepare(
-        `
-      SELECT turns.worker_id, turns.status AS turn_status, workers.status AS worker_status
-      FROM turns
-      LEFT JOIN workers ON workers.id=turns.worker_id
-      WHERE turns.task_id=?
-      ORDER BY turns.sequence DESC
-      LIMIT 1
-    `,
-      )
-      .get(taskId);
-    if (
-      latest &&
-      ["failed", "cancelled", "interrupted"].includes(latest.turn_status) &&
-      latest.worker_status === "attention"
-    ) {
-      throw new HttpError(
-        409,
-        "WORKSPACE_REQUIRES_ATTENTION",
-        "The previous worker still contains a preserved workspace. Inspect and durably resolve it before releasing the worker and queuing another turn.",
-      );
-    }
-  }
-
   appendTurn(taskId, input) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
-    if (["closed", "cancelled"].includes(task.status)) {
-      throw new HttpError(
-        409,
-        "TASK_CLOSED",
-        "Closed task cannot accept a new turn",
-      );
-    }
-    if (this.hasActiveTurn(taskId)) {
-      throw new HttpError(
-        409,
-        "TURN_ALREADY_PENDING",
-        "This task already has an active or queued turn",
-      );
-    }
-    this.assertNoPreservedWorkspace(taskId);
     const timestamp = now();
     const turnId = id("turn-");
     return this.transaction(() => {
+      const executingPlaceholders = EXECUTING_TURN_STATUSES.map(() => "?").join(
+        ",",
+      );
+      const executing = this.db
+        .prepare(
+          `SELECT 1 FROM turns WHERE task_id=? AND status IN (${executingPlaceholders}) LIMIT 1`,
+        )
+        .get(taskId, ...EXECUTING_TURN_STATUSES);
+      const queued = this.db
+        .prepare(
+          "SELECT 1 FROM turns WHERE task_id=? AND status='queued' LIMIT 1",
+        )
+        .get(taskId);
+      let preservedWorkerId = null;
+      if (!executing && !queued) {
+        const preserved = this.db
+          .prepare(
+            `
+            SELECT turns.worker_id
+            FROM turns
+            JOIN workers ON workers.id=turns.worker_id
+            WHERE turns.task_id=?
+              AND turns.status IN ('failed','cancelled','interrupted')
+              AND workers.status='attention'
+            ORDER BY turns.sequence DESC
+            LIMIT 1
+          `,
+          )
+          .get(taskId);
+        preservedWorkerId = preserved?.worker_id || null;
+      }
       const sequence = Number(
         this.db
           .prepare(
@@ -964,16 +972,26 @@ export class Store {
       this.db
         .prepare(
           `
-        INSERT INTO turns (id, task_id, sequence, user_message, status, priority, created_at)
-        VALUES (?, ?, ?, ?, 'queued', ?, ?)
+        INSERT INTO turns (
+          id, task_id, sequence, user_message, status, priority, worker_id, created_at
+        )
+        VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
       `,
         )
-        .run(turnId, taskId, sequence, input.message, priority, timestamp);
+        .run(
+          turnId,
+          taskId,
+          sequence,
+          input.message,
+          priority,
+          preservedWorkerId,
+          timestamp,
+        );
       this.db
         .prepare(
-          `UPDATE tasks SET status='queued', priority=?, updated_at=? WHERE id=?`,
+          `UPDATE tasks SET status=?, priority=?, closed_at=NULL, updated_at=? WHERE id=?`,
         )
-        .run(priority, timestamp, taskId);
+        .run(executing ? "running" : "queued", priority, timestamp, taskId);
       this.attachUploads(input.attachments, taskId, turnId);
       const turn = this.getTurn(turnId);
       queueMicrotask(() =>
@@ -983,7 +1001,10 @@ export class Store {
           type: "turn.queued",
           phase: "queue",
           message: `Turn ${sequence} entered the execution queue`,
-          data: { position: this.queuePosition(turnId) },
+          data: {
+            position: this.queuePosition(turnId),
+            preservedWorkspace: Boolean(preservedWorkerId),
+          },
         }),
       );
       return turn;
@@ -1053,6 +1074,40 @@ export class Store {
     return index < 0 ? null : index + 1;
   }
 
+  reserveStoppedWorkerForQueuedTurn() {
+    return this.transaction(() => {
+      const workerRow = this.db
+        .prepare(
+          `
+        SELECT workers.*
+        FROM turns
+        JOIN tasks ON tasks.id=turns.task_id
+        JOIN workers
+          ON (workers.project_id=tasks.project_id OR workers.project_id IS NULL)
+         AND (turns.worker_id IS NULL OR turns.worker_id=workers.id)
+        WHERE turns.status='queued' AND tasks.status='queued'
+          AND workers.enabled=1 AND workers.status='stopped'
+          AND workers.current_turn_id IS NULL
+        ORDER BY turns.priority DESC, turns.created_at ASC,
+          CASE WHEN workers.project_id=tasks.project_id THEN 0 ELSE 1 END,
+          workers.name
+        LIMIT 1
+      `,
+        )
+        .get();
+      if (!workerRow) return null;
+      const reserved = this.db
+        .prepare(
+          `
+        UPDATE workers SET status='preparing', last_error=NULL, updated_at=?
+        WHERE id=? AND enabled=1 AND status='stopped' AND current_turn_id IS NULL
+      `,
+        )
+        .run(now(), workerRow.id);
+      return reserved.changes ? this.getWorker(workerRow.id) : null;
+    });
+  }
+
   claimNextTurn() {
     return this.transaction(() => {
       const candidates = this.db
@@ -1066,17 +1121,30 @@ export class Store {
         )
         .all();
       for (const candidate of candidates) {
-        const workerRow = this.db
-          .prepare(
-            `
-          SELECT * FROM workers
-          WHERE enabled=1 AND status='ready' AND current_turn_id IS NULL
-            AND (project_id=? OR project_id IS NULL)
-          ORDER BY CASE WHEN project_id=? THEN 0 ELSE 1 END, name
-          LIMIT 1
-        `,
-          )
-          .get(candidate.project_id, candidate.project_id);
+        const resumesPreservedWorkspace = Boolean(candidate.worker_id);
+        const workerRow = resumesPreservedWorkspace
+          ? this.db
+              .prepare(
+                `
+                SELECT * FROM workers
+                WHERE id=? AND enabled=1 AND current_turn_id IS NULL
+                  AND status IN ('attention','ready','reserved')
+                  AND (project_id=? OR project_id IS NULL)
+                LIMIT 1
+              `,
+              )
+              .get(candidate.worker_id, candidate.project_id)
+          : this.db
+              .prepare(
+                `
+                SELECT * FROM workers
+                WHERE enabled=1 AND status='ready' AND current_turn_id IS NULL
+                  AND (project_id=? OR project_id IS NULL)
+                ORDER BY CASE WHEN project_id=? THEN 0 ELSE 1 END, name
+                LIMIT 1
+              `,
+              )
+              .get(candidate.project_id, candidate.project_id);
         if (!workerRow) continue;
         const timestamp = now();
         const turnUpdate = this.db
@@ -1091,14 +1159,18 @@ export class Store {
           .prepare(
             `
           UPDATE workers SET status='busy', current_turn_id=?, last_error=NULL, updated_at=?
-          WHERE id=? AND status='ready' AND current_turn_id IS NULL
+          WHERE id=? AND status IN ('attention','ready','reserved')
+            AND current_turn_id IS NULL
         `,
           )
           .run(candidate.id, timestamp, workerRow.id);
         this.db
           .prepare(`UPDATE tasks SET status='running', updated_at=? WHERE id=?`)
           .run(timestamp, candidate.task_id);
-        return this.getExecutionContext(candidate.id);
+        return {
+          ...this.getExecutionContext(candidate.id),
+          resumePreservedWorkspace: resumesPreservedWorkspace,
+        };
       }
       return null;
     });
@@ -1148,14 +1220,26 @@ export class Store {
       `,
         )
         .run(stringifyJson(codexFinal), commitSha || null, timestamp, turnId);
+      const hasQueuedTurn = Boolean(
+        this.db
+          .prepare(
+            "SELECT 1 FROM turns WHERE task_id=? AND status='queued' LIMIT 1",
+          )
+          .get(turn.taskId),
+      );
       this.db
         .prepare(
           `
-        UPDATE tasks SET status='waiting_user', latest_commit_sha=COALESCE(?, latest_commit_sha), updated_at=?
+        UPDATE tasks SET status=?, latest_commit_sha=COALESCE(?, latest_commit_sha), updated_at=?
         WHERE id=?
       `,
         )
-        .run(commitSha || null, timestamp, turn.taskId);
+        .run(
+          hasQueuedTurn ? "queued" : "waiting_user",
+          commitSha || null,
+          timestamp,
+          turn.taskId,
+        );
     });
     return this.getTurn(turnId);
   }
@@ -1177,10 +1261,22 @@ export class Store {
           timestamp,
           turnId,
         );
+      const queued = this.db
+        .prepare(
+          "SELECT id FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence LIMIT 1",
+        )
+        .get(turn.taskId);
       this.db
-        .prepare(`UPDATE tasks SET status='failed', updated_at=? WHERE id=?`)
-        .run(timestamp, turn.taskId);
+        .prepare(`UPDATE tasks SET status=?, updated_at=? WHERE id=?`)
+        .run(queued ? "queued" : "failed", timestamp, turn.taskId);
       if (turn.workerId) {
+        if (queued && preserveWorker) {
+          this.db
+            .prepare(
+              "UPDATE turns SET worker_id=? WHERE id=? AND worker_id IS NULL",
+            )
+            .run(turn.workerId, queued.id);
+        }
         this.db
           .prepare(
             `
@@ -1209,6 +1305,20 @@ export class Store {
       .run(now(), workerId);
   }
 
+  assignNextQueuedTurn(taskId, workerId) {
+    if (!taskId || !workerId) return null;
+    const queued = this.db
+      .prepare(
+        "SELECT id FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence LIMIT 1",
+      )
+      .get(taskId);
+    if (!queued) return null;
+    this.db
+      .prepare("UPDATE turns SET worker_id=? WHERE id=? AND worker_id IS NULL")
+      .run(workerId, queued.id);
+    return this.getTurn(queued.id);
+  }
+
   cancelCurrentTurn(taskId) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
@@ -1216,7 +1326,7 @@ export class Store {
       .prepare(
         `
       SELECT * FROM turns WHERE task_id=? AND status IN ('queued','preparing','running','saving','cancel_requested')
-      ORDER BY sequence DESC LIMIT 1
+      ORDER BY CASE WHEN status='queued' THEN 1 ELSE 0 END, sequence DESC LIMIT 1
     `,
       )
       .get(taskId);
@@ -1238,12 +1348,34 @@ export class Store {
       `,
         )
         .run(timestamp, turn.id);
-      this.db
+      const executingPlaceholders = EXECUTING_TURN_STATUSES.map(() => "?").join(
+        ",",
+      );
+      const executing = this.db
         .prepare(
-          `UPDATE tasks SET status='waiting_user', updated_at=? WHERE id=?`,
+          `SELECT 1 FROM turns WHERE task_id=? AND status IN (${executingPlaceholders}) LIMIT 1`,
         )
-        .run(timestamp, taskId);
+        .get(taskId, ...EXECUTING_TURN_STATUSES);
+      const queued = this.db
+        .prepare(
+          "SELECT id FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence LIMIT 1",
+        )
+        .get(taskId);
+      this.db
+        .prepare(`UPDATE tasks SET status=?, updated_at=? WHERE id=?`)
+        .run(
+          executing ? "running" : queued ? "queued" : "waiting_user",
+          timestamp,
+          taskId,
+        );
       if (turn.workerId && !wasQueued) {
+        if (queued) {
+          this.db
+            .prepare(
+              "UPDATE turns SET worker_id=? WHERE id=? AND worker_id IS NULL",
+            )
+            .run(turn.workerId, queued.id);
+        }
         this.db
           .prepare(
             `
@@ -1277,7 +1409,6 @@ export class Store {
         "TURN_ALREADY_PENDING",
         "Task already has an active turn",
       );
-    this.assertNoPreservedWorkspace(taskId);
     const latest = this.db
       .prepare(
         "SELECT * FROM turns WHERE task_id=? ORDER BY sequence DESC LIMIT 1",

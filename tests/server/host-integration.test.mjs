@@ -156,6 +156,59 @@ test("checkpoint-disabled preparation starts the real VM without restoring a sna
   );
 });
 
+test("preserved workspace continuation verifies readiness without restore or Git reset", async () => {
+  const calls = [];
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push({ name, args });
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify(
+        name === "Get-WorkerHealth.ps1"
+          ? {
+              ready: true,
+              vm: true,
+              heartbeat: true,
+              smb: true,
+              unity: true,
+              skill: true,
+            }
+          : { ready: true, branch: context().task.branchName, preserved: true },
+      ),
+      stderr: "",
+    };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  const result = await adapter.resumePreserved(context(), {});
+
+  assert.equal(result.preserved, true);
+  assert.deepEqual(
+    calls.map((call) => call.name),
+    [
+      "Ensure-WorkerReady.ps1",
+      "Verify-PreservedWorkspace.ps1",
+      "Get-WorkerHealth.ps1",
+    ],
+  );
+  assert.equal(
+    calls.some((call) =>
+      ["Restore-Worker.ps1", "Prepare-Workspace.ps1"].includes(call.name),
+    ),
+    false,
+  );
+  const verification = calls.find(
+    (call) => call.name === "Verify-PreservedWorkspace.ps1",
+  );
+  assert.equal(
+    verification.args[verification.args.indexOf("-TaskBranch") + 1],
+    context().task.branchName,
+  );
+});
+
 test("worker start and restart wait for PowerShell Direct before health probing", async () => {
   const calls = [];
   const processRunner = async (command, args) => {
@@ -328,4 +381,44 @@ test("Codex turns use task-level model, reasoning, and Fast overrides", async (t
   assert.ok(args.indexOf('model_reasoning_effort="max"') < execIndex);
   assert.ok(args.indexOf('service_tier="fast"') < execIndex);
   assert.ok(args.indexOf("features.fast_mode=true") < execIndex);
+});
+
+test("Codex image arguments cannot consume the positional prompt", async (t) => {
+  const logDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runner-image-"),
+  );
+  t.after(() => fs.rmSync(logDirectory, { recursive: true, force: true }));
+  const calls = [];
+  const runner = new CodexRunner(config({ logDirectory }), {
+    processRunner: async (command, args, options) => {
+      calls.push({ command, args, options });
+      options.onStdout?.(
+        `${JSON.stringify({
+          type: "thread.started",
+          thread_id: "thread-image-prompt",
+        })}\n`,
+      );
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  const imageContext = context();
+  imageContext.attachments = [
+    {
+      filename: "reference.png",
+      path: "C:\\Relay\\uploads\\reference.png",
+      contentType: "image/png",
+    },
+  ];
+
+  await runner.run(imageContext, {});
+
+  const [{ args }] = calls;
+  const imageIndex = args.indexOf("--image");
+  const delimiterIndex = args.indexOf("--");
+  assert.ok(imageIndex > args.indexOf("exec"));
+  assert.equal(args[imageIndex + 1], imageContext.attachments[0].path);
+  assert.ok(delimiterIndex > imageIndex);
+  assert.equal(args.length, delimiterIndex + 2);
+  assert.match(args[delimiterIndex + 1], /Perform a real integration test/);
+  assert.match(args[delimiterIndex + 1], /reference\.png/);
 });

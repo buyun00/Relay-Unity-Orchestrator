@@ -141,7 +141,19 @@ export class Scheduler {
     try {
       while (this.running && !this.paused) {
         const context = this.store.claimNextTurn();
-        if (!context) break;
+        if (!context) {
+          const stoppedWorker =
+            this.store.reserveStoppedWorkerForQueuedTurn?.();
+          if (!stoppedWorker) break;
+          try {
+            await this.controlWorker(stoppedWorker.id, "start");
+          } catch {
+            // controlWorker already records the failure and moves the worker
+            // to attention. Continue so another compatible stopped worker can
+            // be tried without leaving the queue silently blocked.
+          }
+          continue;
+        }
         const controller = new AbortController();
         this.controllers.set(context.turn.id, controller);
         const execution = this.execute(context, controller);
@@ -172,17 +184,30 @@ export class Scheduler {
 
   async execute(context, controller) {
     const signal = controller.signal;
-    this.emitProgress(
-      context,
-      "prepare",
-      `Worker ${context.worker.name} reserved for turn ${context.turn.sequence}`,
-    );
     try {
-      await this.adapter.prepare(context, {
-        signal,
-        onProgress: (phase, message) =>
-          this.emitProgress(context, phase, message),
-      });
+      if (context.resumePreservedWorkspace) {
+        this.emitProgress(
+          context,
+          "resume",
+          `Continuing preserved workspace on ${context.worker.name} without checkpoint restore or Git reset`,
+        );
+        await this.adapter.resumePreserved?.(context, {
+          signal,
+          onProgress: (phase, message) =>
+            this.emitProgress(context, phase, message),
+        });
+      } else {
+        this.emitProgress(
+          context,
+          "prepare",
+          `Worker ${context.worker.name} reserved for turn ${context.turn.sequence}`,
+        );
+        await this.adapter.prepare(context, {
+          signal,
+          onProgress: (phase, message) =>
+            this.emitProgress(context, phase, message),
+        });
+      }
       if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
 
       this.store.setTurnPhase(context.turn.id, "running");
@@ -263,6 +288,7 @@ export class Scheduler {
       );
 
       if (!context.task.autoRelease) {
+        this.store.assignNextQueuedTurn(context.task.id, context.worker.id);
         this.store.setWorkerState(context.worker.id, "reserved", {
           currentTurnId: null,
           error: null,
@@ -290,6 +316,7 @@ export class Scheduler {
         );
       } catch (releaseError) {
         const error = errorWithCode(releaseError, "WORKER_RELEASE_FAILED");
+        this.store.assignNextQueuedTurn(context.task.id, context.worker.id);
         this.store.setWorkerState(context.worker.id, "attention", {
           currentTurnId: null,
           error: error.message,

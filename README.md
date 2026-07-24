@@ -49,7 +49,7 @@ Unity 保存 → 来宾 commit / push → 远程 SHA 核验
 
 ### 3. 查看进度与继续任务
 
-任务进入队列后，可以在任务详情中查看队列位置、当前阶段、Codex 输出、附件、Git 分支和每一轮历史。执行完成后点击“追加一轮”即可继续提出修改；系统会恢复同一个 Codex 对话和任务分支，不需要重新描述全部上下文。
+任务进入队列后，可以在任务详情中查看队列位置、当前阶段、Codex 输出、附件、Git 分支和每一轮历史。任务处于排队、执行、失败现场保留或关闭状态时都可以继续发送消息；系统会按顺序执行，不会并发修改同一分支。失败现场上的下一轮固定续用原工位并跳过检查点还原和 Git 重置；其他后续轮次会恢复同一个 Codex 对话和任务分支，不需要重新描述全部上下文。
 
 常见状态：
 
@@ -105,6 +105,7 @@ PIPELINE_CHECKPOINTS_ENABLED=false
 - `app/`：现代化管理网页，包括任务、队列、对话、工位、项目和系统设置。
 - `server/`：SQLite 持久化、调度状态机、SSE、认证、Codex 与适配器边界。
 - `scripts/hyperv/`：固定参数的 Hyper-V / PowerShell Direct 操作脚本。
+- `guest-tools/unity-dialog-guard/`：安装在子机交互桌面的 Unity 弹窗守护程序、规则、自学习和登录自启动脚本。
 - `tests/server/`：不触碰真实基础设施的状态机与安全回归测试。
 - `.pipeline-data/`：本地 SQLite、附件和 Codex JSONL 日志（已被 Git 忽略）。
 

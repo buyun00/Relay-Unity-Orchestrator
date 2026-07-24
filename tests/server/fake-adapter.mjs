@@ -49,6 +49,21 @@ export class FakeAdapter {
     };
   }
 
+  async resumePreserved(context, { signal, onProgress }) {
+    onProgress?.(
+      "workspace",
+      `Verifying preserved ${context.task.branchName} workspace`,
+    );
+    await sleep(this.config.phaseMs, signal);
+    onProgress?.("unity", "Preserved workspace and Unity are ready");
+    await sleep(this.config.phaseMs, signal);
+    return {
+      workspace: context.worker.sharePath,
+      resumed: true,
+      preserved: true,
+    };
+  }
+
   async runCodex(context, { signal, onEvent }) {
     const steps = [
       { type: "turn.started", message: "Codex accepted the turn" },

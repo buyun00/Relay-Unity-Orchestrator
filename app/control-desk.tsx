@@ -104,7 +104,19 @@ type ConfirmState = {
   action: () => Promise<void>;
 };
 
-const LIVE_TURN = new Set(["queued", "preparing", "running", "saving"]);
+const LIVE_TURN = new Set([
+  "queued",
+  "preparing",
+  "running",
+  "saving",
+  "cancel_requested",
+]);
+const EXECUTING_TURN = new Set([
+  "preparing",
+  "running",
+  "saving",
+  "cancel_requested",
+]);
 const LIVE_TASK = new Set(["queued", "running"]);
 
 const TASK_PRIORITY_OPTIONS = [
@@ -889,6 +901,8 @@ export default function ControlDesk() {
     });
   };
 
+  const waitingForToken = authRequired && !getToken();
+
   return (
     <div className={cx("app-shell", sidebarCompact && "sidebar-compact")}>
       <aside className={cx("sidebar", mobileNav && "mobile-open")}>
@@ -946,9 +960,21 @@ export default function ControlDesk() {
           <div
             className={cx("connection-pill", connected ? "online" : "offline")}
           >
-            {connected ? <Wifi size={15} /> : <WifiOff size={15} />}
+            {connected ? (
+              <Wifi size={15} />
+            ) : waitingForToken ? (
+              <LockKeyhole size={15} />
+            ) : (
+              <WifiOff size={15} />
+            )}
             <div>
-              <strong>{connected ? "调度服务正常" : "服务已断开"}</strong>
+              <strong>
+                {connected
+                  ? "调度服务正常"
+                  : waitingForToken
+                    ? "等待管理令牌"
+                    : "服务已断开"}
+              </strong>
               <span>真实 Hyper-V</span>
             </div>
           </div>
@@ -964,7 +990,7 @@ export default function ControlDesk() {
       </aside>
 
       <main className="main-stage">
-        {!connected && (
+        {!connected && !waitingForToken && (
           <div className="service-banner" role="alert">
             <WifiOff size={17} />
             <span>
@@ -975,7 +1001,7 @@ export default function ControlDesk() {
             <button onClick={() => void refresh()}>重新连接</button>
           </div>
         )}
-        {authRequired && !getToken() && (
+        {waitingForToken && (
           <div className="service-banner warning" role="alert">
             <LockKeyhole size={17} />
             <span>
@@ -1193,6 +1219,7 @@ export default function ControlDesk() {
             <SettingsPage
               snapshot={snapshot}
               connected={connected}
+              waitingForToken={waitingForToken}
               onSaved={() => void refresh()}
               notify={notify}
             />
@@ -1777,17 +1804,19 @@ function TaskDetail({
   const turns = snapshot.turns
     .filter((turn) => turn.taskId === task.id)
     .sort((a, b) => a.sequence - b.sequence);
-  const current = turns.at(-1);
+  const latest = turns.at(-1);
+  const current =
+    turns.findLast((turn) => EXECUTING_TURN.has(turn.status)) ?? latest;
   const project = projectById(snapshot, task.projectId);
   const worker = snapshot.workers.find((item) => item.id === current?.workerId);
   const [message, setMessage] = useState("");
   const [logsOpen, setLogsOpen] = useState(false);
   const [sending, setSending] = useState(false);
-  const active = Boolean(current && LIVE_TURN.has(current.status));
+  const active = turns.some((turn) => LIVE_TURN.has(turn.status));
   const closed = task.status === "closed";
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!message.trim() || active || closed) return;
+    if (!message.trim() || sending) return;
     setSending(true);
     const ok = await onMessage(message.trim());
     if (ok) setMessage("");
@@ -1886,69 +1915,46 @@ function TaskDetail({
               />
             )}
           </div>
-          <form
-            className={cx(
-              "message-composer",
-              (active || closed) && "composer-disabled",
-            )}
-            onSubmit={submit}
-          >
+          <form className="message-composer" onSubmit={submit}>
             <div className="composer-label">
               <MessageSquareText size={15} />
               <strong>
                 {closed
-                  ? "任务已经关闭"
+                  ? "发送消息将重新打开任务"
                   : active
-                    ? "本轮仍在执行"
+                    ? "本轮执行中，可继续排队"
                     : "继续在这条任务中微调"}
               </strong>
               <span>
                 {closed
-                  ? "重新打开后可追加"
+                  ? `将创建第 ${(latest?.sequence ?? 0) + 1} 轮`
                   : active
-                    ? "完成后即可追加"
-                    : `将创建第 ${(current?.sequence ?? 0) + 1} 轮`}
+                    ? "新消息会按顺序执行，不会并发修改分支"
+                    : `将创建第 ${(latest?.sequence ?? 0) + 1} 轮`}
               </span>
             </div>
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
-              disabled={active || closed || sending}
-              placeholder={
-                closed
-                  ? "完整历史仍然保留；点击“重新打开”即可继续…"
-                  : active
-                    ? "当前轮次结束后可继续输入微调需求…"
-                    : "例如：按钮再向左移动 8px，其他布局不要变…"
-              }
+              disabled={sending}
+              placeholder="例如：继续处理当前现场，或补充新的微调要求…"
             />
             <div className="composer-foot">
               <span>
                 <GitBranch size={13} />
                 沿用 {task.branchName} 与原 Codex 对话
               </span>
-              {closed ? (
-                <button
-                  type="button"
-                  className="primary-action"
-                  onClick={onReopen}
-                >
-                  <RotateCcw size={16} />
-                  重新打开
-                </button>
-              ) : (
-                <button
-                  className="primary-action"
-                  disabled={active || sending || !message.trim()}
-                >
-                  {sending ? (
-                    <LoaderCircle className="spin" size={16} />
-                  ) : (
-                    <ArrowRight size={16} />
-                  )}
-                  追加一轮
-                </button>
-              )}
+              <button
+                className="primary-action"
+                disabled={sending || !message.trim()}
+              >
+                {sending ? (
+                  <LoaderCircle className="spin" size={16} />
+                ) : (
+                  <ArrowRight size={16} />
+                )}
+                {active ? "加入队列" : "追加一轮"}
+              </button>
             </div>
           </form>
         </section>
@@ -2773,11 +2779,13 @@ function ProjectsPage({
 function SettingsPage({
   snapshot,
   connected,
+  waitingForToken,
   onSaved,
   notify,
 }: {
   snapshot: Snapshot;
   connected: boolean;
+  waitingForToken: boolean;
   onSaved: () => void;
   notify: (message: string, kind?: Toast["kind"]) => void;
 }) {
@@ -2830,8 +2838,16 @@ function SettingsPage({
           <p>网页只管理结构化任务和白名单操作，不提供任意 PowerShell 入口。</p>
         </div>
         <StatusBadge
-          status={connected ? "ready" : "offline"}
-          label={connected ? "实时连接正常" : "服务已断开"}
+          status={
+            connected ? "ready" : waitingForToken ? "attention" : "offline"
+          }
+          label={
+            connected
+              ? "实时连接正常"
+              : waitingForToken
+                ? "等待管理令牌"
+                : "服务已断开"
+          }
         />
       </section>
       <div className="settings-layout">
@@ -2841,7 +2857,10 @@ function SettingsPage({
               <Network size={18} />
               <div>
                 <h2>控制服务连接</h2>
-                <p>远程浏览器默认连接当前主机名的 4317 端口。</p>
+                <p>
+                  HTTPS 通过当前站点的 /api 路由连接；局域网 HTTP
+                  默认连接当前主机名的 4317 端口。
+                </p>
               </div>
             </div>
             <label className="form-field">

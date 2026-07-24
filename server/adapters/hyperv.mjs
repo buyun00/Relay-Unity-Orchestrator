@@ -95,8 +95,7 @@ export class HyperVAdapter {
   }
 
   async inspectRuntime({ force = false } = {}) {
-    const fresh =
-      this.runtime && Date.now() - this.runtimeCheckedAt < 10_000;
+    const fresh = this.runtime && Date.now() - this.runtimeCheckedAt < 10_000;
     if (!force && fresh) return this.runtime;
     if (this.runtimePromise) return this.runtimePromise;
     this.runtimePromise = (async () => {
@@ -116,9 +115,9 @@ export class HyperVAdapter {
       const runtime = {
         ready: Boolean(
           hyperv.moduleAvailable &&
-            hyperv.canManage &&
-            codex.available &&
-            codex.authenticated,
+          hyperv.canManage &&
+          codex.available &&
+          codex.authenticated,
         ),
         checkedAt: new Date().toISOString(),
         checkpointsEnabled: this.config.checkpointsEnabled,
@@ -208,8 +207,7 @@ export class HyperVAdapter {
         BaseBranch: required(context.task.baseBranch, "task.baseBranch"),
         TaskBranch: required(context.task.branchName, "task.branchName"),
         Mode: context.task.codexThreadId ? "resume" : "new",
-        GitAuthorName:
-          this.config.gitAuthorName || "Relay Unity Orchestrator",
+        GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
         GitAuthorEmail:
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
         SharePath: context.worker.sharePath || context.project.smbPath,
@@ -225,6 +223,51 @@ export class HyperVAdapter {
       "Guest Git branch, Unity, SMB, and Unity Skill are ready",
     );
     return result;
+  }
+
+  async resumePreserved(context, { signal, onProgress }) {
+    onProgress?.(
+      "vm-ready",
+      `Ensuring ${context.worker.vmName} and PowerShell Direct are ready`,
+    );
+    await this.powershell(
+      "Ensure-WorkerReady.ps1",
+      this.workerArguments(context.worker),
+      { signal },
+    );
+    onProgress?.(
+      "workspace",
+      `Verifying preserved ${context.task.branchName} workspace without resetting it`,
+    );
+    const result = await this.powershell(
+      "Verify-PreservedWorkspace.ps1",
+      {
+        ...this.workerArguments(context.worker),
+        GuestProjectPath: required(
+          context.project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+        TaskBranch: required(context.task.branchName, "task.branchName"),
+      },
+      { signal },
+    );
+    const health = await this.probeWorker({
+      ...context.worker,
+      project: context.project,
+    });
+    if (!health.ready) {
+      throw Object.assign(
+        new Error(
+          `Preserved workspace is intact, but the worker is not ready: ${health.error || "Unity or Unity Skill is unavailable"}`,
+        ),
+        { code: "PRESERVED_WORKSPACE_NOT_READY" },
+      );
+    }
+    onProgress?.(
+      "unity",
+      "Preserved Git branch, Unity, SMB, and Unity Skill are ready",
+    );
+    return { ...result, preserved: true };
   }
 
   runCodex(context, options) {
@@ -272,8 +315,7 @@ export class HyperVAdapter {
         ),
         TaskBranch: required(context.task.branchName, "task.branchName"),
         CommitMessage: `task #${context.task.number} turn ${context.turn.sequence}: ${context.task.title}`,
-        GitAuthorName:
-          this.config.gitAuthorName || "Relay Unity Orchestrator",
+        GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
         GitAuthorEmail:
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
       },

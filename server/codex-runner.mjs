@@ -180,6 +180,9 @@ export class CodexRunner {
       if (attachment.contentType?.startsWith("image/"))
         args.push("--image", attachment.path);
     }
+    // `--image` accepts one or more paths, so terminate option parsing before
+    // appending the positional session id and prompt.
+    args.push("--");
     if (threadId) args.push(threadId, prompt);
     else args.push(prompt);
 

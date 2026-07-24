@@ -7,8 +7,8 @@ export function getApiBase(): string {
   if (typeof window === "undefined") return "http://127.0.0.1:4317";
   const saved = window.localStorage.getItem(API_KEY);
   if (saved) return saved.replace(/\/$/, "");
-  const scheme = window.location.protocol === "https:" ? "https:" : "http:";
-  return `${scheme}//${window.location.hostname}:4317`;
+  if (window.location.protocol === "https:") return window.location.origin;
+  return `http://${window.location.hostname}:4317`;
 }
 
 export function setApiBase(value: string) {

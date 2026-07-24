@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "pollIntervalMs": 400,
+  "initialActionDelayMs": 600,
+  "autoLearn": true,
+  "captureUnknownDialogScreenshots": true,
+  "unityProcessNames": [
+    "Unity"
+  ],
+  "rules": [
+    {
+      "id": "reload-ui-document-modified-externally",
+      "enabled": true,
+      "titleRegex": "(UI Document was modified externally|Unity)",
+      "textRegex": "(UI Document was modified externally|UI (Document|文档).*(modified externally|外部.*修改))",
+      "buttonRegex": "(Reload|重新加载|重载)",
+      "targetButtonNames": [
+        "Reload",
+        "重新加载",
+        "重载"
+      ],
+      "targetButtonRegex": "^(Reload|重新加载|重载)$",
+      "delayMs": 600,
+      "maxAttemptsPerDialog": 1,
+      "source": "Unity Issue Tracker UUM-107642",
+      "note": "Reload the UI document after Unity reports that it was modified externally."
+    },
+    {
+      "id": "reload-assets-or-scripts-changed-on-disk",
+      "enabled": true,
+      "titleRegex": "(Unity|Reload|Assets?|Scripts?|Assemblies)",
+      "textRegex": "(changed on disk|modified externally|modified outside (of )?Unity|Reload Script Assemblies|scripts?.*(changed|modified).*(reload|recompile)|磁盘.*(更改|修改)|外部.*(更改|修改)|重新加载.*脚本|重载.*脚本)",
+      "buttonRegex": "(Reload|Recompile|重新加载|重载|重新编译)",
+      "targetButtonNames": [
+        "Reload",
+        "Recompile",
+        "重新加载",
+        "重载",
+        "重新编译"
+      ],
+      "targetButtonRegex": "^(Reload|Recompile|重新加载|重载|重新编译)$",
+      "delayMs": 600,
+      "maxAttemptsPerDialog": 1,
+      "source": "Unity asset refresh and domain reload workflow",
+      "note": "Prefer the externally updated project files used by the automated worker."
+    },
+    {
+      "id": "accept-api-updater",
+      "enabled": true,
+      "titleRegex": "(API Update Required|API Updater|Consent Request|Unity)",
+      "textRegex": "(API Update Required|APIUpdater|API Updater|update.*obsolete.*API|更新.*API|API.*更新)",
+      "buttonRegex": "(I Made a Backup.*Go Ahead|Yes|Okay|OK|Update|Run API Updater|继续|确定|更新)",
+      "targetButtonNames": [
+        "I Made a Backup. Go Ahead!",
+        "Run API Updater",
+        "Update",
+        "Yes",
+        "Okay",
+        "OK",
+        "继续",
+        "更新",
+        "确定"
+      ],
+      "targetButtonRegex": "^(I Made a Backup.*Go Ahead!?|Run API Updater|Update|Yes|Okay|OK|继续|更新|确定)$",
+      "delayMs": 800,
+      "maxAttemptsPerDialog": 1,
+      "source": "Unity API Updater documentation and Issue Tracker 888747",
+      "note": "The worker branch is version controlled, so allow Unity's API Updater to migrate obsolete APIs."
+    },
+    {
+      "id": "ignore-enter-safe-mode",
+      "enabled": true,
+      "titleRegex": "(Enter Safe Mode\\?|Safe Mode|Unity|进入安全模式)",
+      "textRegex": "(Enter Safe Mode|compilation errors.*Safe Mode|进入安全模式|编译错误.*安全模式)",
+      "buttonRegex": "(Ignore|Ignore errors|忽略)",
+      "targetButtonNames": [
+        "Ignore",
+        "Ignore errors",
+        "忽略",
+        "忽略错误"
+      ],
+      "targetButtonRegex": "^(Ignore|Ignore errors|忽略|忽略错误)$",
+      "delayMs": 800,
+      "maxAttemptsPerDialog": 1,
+      "source": "Unity Safe Mode manual",
+      "note": "Ignore Safe Mode so project/package managed code, including the Unity Skill, can still load. Change this rule if the worker uses a different recovery policy."
+    },
+    {
+      "id": "continue-compatible-project-upgrade",
+      "enabled": true,
+      "titleRegex": "(Unity|Project.*Version|Editor.*Version|项目.*版本)",
+      "textRegex": "(different version of Unity|older version of Unity|upgrade.*project|项目.*(不同|旧).*Unity.*版本|升级.*项目)",
+      "buttonRegex": "(Continue|Open|继续|仍然打开|打开)",
+      "targetButtonNames": [
+        "Continue",
+        "Open",
+        "继续",
+        "仍然打开",
+        "打开"
+      ],
+      "targetButtonRegex": "^(Continue|Open|继续|仍然打开|打开)$",
+      "delayMs": 1000,
+      "maxAttemptsPerDialog": 1,
+      "source": "Unity Editor project version warning",
+      "note": "Continue only when the configured worker intentionally opens this project with its installed Unity version."
+    }
+  ]
+}
