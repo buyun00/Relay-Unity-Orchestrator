@@ -29,7 +29,6 @@ import {
   Layers3,
   LayoutDashboard,
   LoaderCircle,
-  LockKeyhole,
   Menu,
   MessageSquareText,
   MonitorCog,
@@ -65,14 +64,13 @@ import {
   useState,
 } from "react";
 import {
-  ApiError,
   api,
   fetchSnapshot,
   fetchTaskEvents,
   getApiBase,
-  getToken,
+  getUserName,
   setApiBase,
-  setToken,
+  setUserName,
   subscribeEvents,
   uploadFile,
 } from "./api";
@@ -431,6 +429,10 @@ function cx(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
 }
 
+function userInitial(name?: string | null) {
+  return name?.trim().charAt(0).toLocaleUpperCase() || "?";
+}
+
 function relativeTime(value?: string | null) {
   if (!value) return "—";
   const diff = Date.now() - new Date(value).getTime();
@@ -633,7 +635,9 @@ export default function ControlDesk() {
   >({});
   const [connected, setConnected] = useState(false);
   const [lastConnectedAt, setLastConnectedAt] = useState<string | null>(null);
-  const [authRequired, setAuthRequired] = useState(false);
+  const [userName, setCurrentUserName] = useState("");
+  const [identityReady, setIdentityReady] = useState(false);
+  const [identityOpen, setIdentityOpen] = useState(false);
   const [view, setView] = useState<ViewName>("dashboard");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
@@ -668,7 +672,6 @@ export default function ControlDesk() {
         const next = await fetchSnapshot();
         setSnapshot({ ...next, server: { ...next.server, connected: true } });
         setConnected(true);
-        setAuthRequired(Boolean(next.server.requiresAuth));
         setLastConnectedAt(new Date().toISOString());
         const newestEvent = next.events.at(-1);
         if (newestEvent) {
@@ -695,9 +698,7 @@ export default function ControlDesk() {
         }
       } catch (error) {
         setConnected(false);
-        if (error instanceof ApiError && error.status === 401)
-          setAuthRequired(true);
-        if (!silent && !(error instanceof ApiError && error.status === 401)) {
+        if (!silent) {
           notify(
             error instanceof Error ? error.message : "无法连接调度服务",
             "error",
@@ -707,6 +708,16 @@ export default function ControlDesk() {
     },
     [notify],
   );
+
+  useEffect(() => {
+    const initializeIdentity = window.setTimeout(() => {
+      const storedUserName = getUserName();
+      setCurrentUserName(storedUserName);
+      setIdentityOpen(!storedUserName);
+      setIdentityReady(true);
+    }, 0);
+    return () => window.clearTimeout(initializeIdentity);
+  }, []);
 
   useEffect(() => {
     const initialRefresh = window.setTimeout(() => void refresh(true), 0);
@@ -901,8 +912,6 @@ export default function ControlDesk() {
     });
   };
 
-  const waitingForToken = authRequired && !getToken();
-
   return (
     <div className={cx("app-shell", sidebarCompact && "sidebar-compact")}>
       <aside className={cx("sidebar", mobileNav && "mobile-open")}>
@@ -960,37 +969,30 @@ export default function ControlDesk() {
           <div
             className={cx("connection-pill", connected ? "online" : "offline")}
           >
-            {connected ? (
-              <Wifi size={15} />
-            ) : waitingForToken ? (
-              <LockKeyhole size={15} />
-            ) : (
-              <WifiOff size={15} />
-            )}
+            {connected ? <Wifi size={15} /> : <WifiOff size={15} />}
             <div>
-              <strong>
-                {connected
-                  ? "调度服务正常"
-                  : waitingForToken
-                    ? "等待管理令牌"
-                    : "服务已断开"}
-              </strong>
+              <strong>{connected ? "调度服务正常" : "服务已断开"}</strong>
               <span>真实 Hyper-V</span>
             </div>
           </div>
-          <div className="profile-row">
-            <span className="avatar">L</span>
+          <button
+            className="profile-row"
+            type="button"
+            onClick={() => setIdentityOpen(true)}
+            title="切换使用者"
+          >
+            <span className="avatar">{userInitial(userName)}</span>
             <div>
-              <strong>Lin</strong>
-              <span>管理员</span>
+              <strong>{userName || "选择使用者"}</strong>
+              <span>点击切换</span>
             </div>
             <ShieldCheck size={17} />
-          </div>
+          </button>
         </div>
       </aside>
 
       <main className="main-stage">
-        {!connected && !waitingForToken && (
+        {!connected && (
           <div className="service-banner" role="alert">
             <WifiOff size={17} />
             <span>
@@ -999,15 +1001,6 @@ export default function ControlDesk() {
               ，暂时无法发起或控制任务。
             </span>
             <button onClick={() => void refresh()}>重新连接</button>
-          </div>
-        )}
-        {waitingForToken && (
-          <div className="service-banner warning" role="alert">
-            <LockKeyhole size={17} />
-            <span>
-              宿主机已启用访问令牌。请在“系统”页面输入令牌后重新连接。
-            </span>
-            <button onClick={() => navigate("settings")}>前往设置</button>
           </div>
         )}
 
@@ -1061,6 +1054,7 @@ export default function ControlDesk() {
           {view === "dashboard" && (
             <Dashboard
               snapshot={snapshot}
+              currentUser={userName}
               onTask={(id) => navigate("task", id)}
               onWorker={(id) => {
                 setSelectedWorkerId(id);
@@ -1219,7 +1213,6 @@ export default function ControlDesk() {
             <SettingsPage
               snapshot={snapshot}
               connected={connected}
-              waitingForToken={waitingForToken}
               onSaved={() => void refresh()}
               notify={notify}
             />
@@ -1332,6 +1325,20 @@ export default function ControlDesk() {
         />
       )}
 
+      {identityReady && identityOpen && (
+        <IdentityDialog
+          currentName={userName}
+          canClose={identityReady && Boolean(userName)}
+          onClose={() => setIdentityOpen(false)}
+          onSave={(value) => {
+            const savedUserName = setUserName(value);
+            setCurrentUserName(savedUserName);
+            setIdentityReady(true);
+            setIdentityOpen(false);
+          }}
+        />
+      )}
+
       <div className="toast-stack" aria-live="polite">
         {toasts.map((toast) => (
           <div key={toast.id} className={cx("toast", toast.kind)}>
@@ -1352,11 +1359,13 @@ export default function ControlDesk() {
 
 function Dashboard({
   snapshot,
+  currentUser,
   onTask,
   onWorker,
   onCreate,
 }: {
   snapshot: Snapshot;
+  currentUser: string;
   onTask: (id: string) => void;
   onWorker: (id: string) => void;
   onCreate: () => void;
@@ -1403,7 +1412,7 @@ function Dashboard({
           <span className="eyebrow">
             <Activity size={14} /> LIVE ORCHESTRATION
           </span>
-          <h1>下午好，Lin。</h1>
+          <h1>下午好，{currentUser || "使用者"}。</h1>
           <p>
             当前 <strong>{ready} 个工位空闲</strong>，
             <strong>{queued} 个执行轮次排队中</strong>
@@ -1620,6 +1629,9 @@ function EventStream({
             <span className={cx("event-mark", event.level)} />
             <span className="event-message">
               {task && <strong>{task.number}</strong>}
+              {event.actorName && (
+                <span className="event-actor">{event.actorName}</span>
+              )}
               {event.message}
             </span>
             <span className="event-phase">
@@ -1657,7 +1669,7 @@ function TasksPage({
     if (filter !== "all" && task.status !== filter) return false;
     const project = projectById(snapshot, task.projectId);
     const haystack =
-      `${task.number} ${task.title} ${task.branchName} ${task.latestCommitSha ?? ""} ${project?.name ?? ""}`.toLowerCase();
+      `${task.number} ${task.title} ${task.createdBy} ${task.branchName} ${task.latestCommitSha ?? ""} ${project?.name ?? ""}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
   });
   return (
@@ -1731,6 +1743,8 @@ function TasksPage({
                 </div>
                 <div className="archive-meta">
                   <span>{project?.name ?? "未知项目"}</span>
+                  <i />
+                  <span>{task.createdBy}</span>
                   <i />
                   <code>{task.branchName}</code>
                   <i />
@@ -1836,6 +1850,12 @@ function TaskDetail({
           </div>
           <h1>{task.title}</h1>
           <div className="identity-meta">
+            <span>
+              <span className="avatar micro">
+                {userInitial(task.createdBy)}
+              </span>
+              {task.createdBy}
+            </span>
             <span>
               <FolderGit2 size={14} />
               {project?.name}
@@ -2151,8 +2171,8 @@ function TurnConversation({
       </div>
       <div className="user-message">
         <div className="message-head">
-          <span className="avatar small">L</span>
-          <strong>你</strong>
+          <span className="avatar small">{userInitial(turn.authorName)}</span>
+          <strong>{turn.authorName}</strong>
           <time>{relativeTime(turn.createdAt)}</time>
           <StatusBadge status={turn.status} label={`第 ${turn.sequence} 轮`} />
         </div>
@@ -2779,22 +2799,18 @@ function ProjectsPage({
 function SettingsPage({
   snapshot,
   connected,
-  waitingForToken,
   onSaved,
   notify,
 }: {
   snapshot: Snapshot;
   connected: boolean;
-  waitingForToken: boolean;
   onSaved: () => void;
   notify: (message: string, kind?: Toast["kind"]) => void;
 }) {
   const [base, setBase] = useState(() => getApiBase());
-  const [tokenValue, setTokenValue] = useState(() => getToken());
   const [changingScheduler, setChangingScheduler] = useState(false);
   const save = () => {
-    setApiBase(base);
-    setToken(tokenValue);
+    setBase(setApiBase(base));
     notify("连接设置已保存");
     onSaved();
   };
@@ -2838,16 +2854,8 @@ function SettingsPage({
           <p>网页只管理结构化任务和白名单操作，不提供任意 PowerShell 入口。</p>
         </div>
         <StatusBadge
-          status={
-            connected ? "ready" : waitingForToken ? "attention" : "offline"
-          }
-          label={
-            connected
-              ? "实时连接正常"
-              : waitingForToken
-                ? "等待管理令牌"
-                : "服务已断开"
-          }
+          status={connected ? "ready" : "offline"}
+          label={connected ? "实时连接正常" : "服务已断开"}
         />
       </section>
       <div className="settings-layout">
@@ -2870,16 +2878,6 @@ function SettingsPage({
                 onChange={(event) => setBase(event.target.value)}
                 placeholder="http://10.100.3.175:4317"
               />
-            </label>
-            <label className="form-field">
-              <span>管理令牌</span>
-              <input
-                type="password"
-                value={tokenValue}
-                onChange={(event) => setTokenValue(event.target.value)}
-                placeholder="仅保存在当前标签页"
-              />
-              <small>令牌保存在 sessionStorage，关闭浏览器标签后即清除。</small>
             </label>
             <button className="primary-action" onClick={save}>
               <Save size={16} />
@@ -2955,8 +2953,8 @@ function SettingsPage({
               </dd>
             </div>
             <div>
-              <dt>认证</dt>
-              <dd>{snapshot.server.requiresAuth ? "已启用" : "开发模式"}</dd>
+              <dt>网页访问</dt>
+              <dd>免令牌 · 记录用户名</dd>
             </div>
             <div>
               <dt>Hyper-V 权限</dt>
@@ -3741,6 +3739,75 @@ function WorkerEditor({
               <Save size={16} />
             )}
             保存工位
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function IdentityDialog({
+  currentName,
+  canClose,
+  onClose,
+  onSave,
+}: {
+  currentName: string;
+  canClose: boolean;
+  onClose: () => void;
+  onSave: (value: string) => void;
+}) {
+  const dialogRef = useDialogFocusTrap(canClose ? onClose : () => {});
+  const [name, setName] = useState(currentName);
+  const normalizedName = name.trim().replace(/\s+/gu, " ").slice(0, 80);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (normalizedName) onSave(normalizedName);
+  };
+  return (
+    <div className="modal-backdrop identity-backdrop">
+      <form
+        ref={dialogRef}
+        className="modal identity-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="identity-title"
+        aria-describedby="identity-description"
+        onSubmit={submit}
+      >
+        <span className="identity-mark">
+          <Layers3 size={24} />
+        </span>
+        <span className="eyebrow">RELAY USER</span>
+        <h2 id="identity-title">输入使用者名称</h2>
+        <p id="identity-description">
+          无需访问令牌或密码。这个名称只用于区分任务发起人、消息作者和审计操作。
+        </p>
+        <label className="form-field">
+          <span>你的名称</span>
+          <input
+            autoFocus
+            required
+            maxLength={80}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="例如：Lin、产品组小王"
+            autoComplete="name"
+          />
+        </label>
+        <div className="modal-actions">
+          <span>名称会保存在当前浏览器中，可随时切换。</span>
+          {canClose && (
+            <button
+              type="button"
+              className="secondary-action"
+              onClick={onClose}
+            >
+              返回
+            </button>
+          )}
+          <button className="primary-action" disabled={!normalizedName}>
+            进入调度台
           </button>
         </div>
       </form>

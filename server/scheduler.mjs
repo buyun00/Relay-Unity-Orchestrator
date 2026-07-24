@@ -100,9 +100,10 @@ export class Scheduler {
     });
   }
 
-  setPaused(paused) {
+  setPaused(paused, actorName = null) {
     this.paused = Boolean(paused);
     this.store.emit({
+      actorName,
       type: paused ? "scheduler.paused" : "scheduler.resumed",
       level: paused ? "warning" : "info",
       phase: "system",
@@ -351,8 +352,8 @@ export class Scheduler {
     }
   }
 
-  cancelTask(taskId) {
-    const result = this.store.cancelCurrentTurn(taskId);
+  cancelTask(taskId, actorName = null) {
+    const result = this.store.cancelCurrentTurn(taskId, actorName);
     const controller = this.controllers.get(result.turn.id);
     controller?.abort(
       Object.assign(new Error("Cancelled by user"), {
@@ -363,8 +364,8 @@ export class Scheduler {
     return result.turn;
   }
 
-  retryTask(taskId) {
-    const turn = this.store.retryTask(taskId);
+  retryTask(taskId, actorName = null) {
+    const turn = this.store.retryTask(taskId, actorName);
     this.notifyQueueChanged();
     return turn;
   }
@@ -395,7 +396,11 @@ export class Scheduler {
     void this.pump();
   }
 
-  async controlWorker(workerId, action, { force = false } = {}) {
+  async controlWorker(
+    workerId,
+    action,
+    { force = false, actorName = null } = {},
+  ) {
     const allowed = [
       "start",
       "shutdown",
@@ -423,7 +428,7 @@ export class Scheduler {
     }
     if (worker.currentTurnId && force) {
       const turn = this.store.getTurn(worker.currentTurnId);
-      if (turn) this.cancelTask(turn.taskId);
+      if (turn) this.cancelTask(turn.taskId, actorName);
       worker = this.store.getWorker(workerId);
     }
 
@@ -431,6 +436,7 @@ export class Scheduler {
       this.store.setWorkerState(workerId, "preparing", { error: null });
     this.store.emit({
       workerId,
+      actorName,
       type: "worker.action.started",
       phase: "worker-control",
       message: `${action} requested for ${worker.name}`,
@@ -454,6 +460,7 @@ export class Scheduler {
       const updated = this.store.updateWorkerHealth(workerId, health);
       this.store.emit({
         workerId,
+        actorName,
         type: "worker.action.completed",
         phase: "worker-control",
         message: `${action} completed for ${worker.name}`,
@@ -468,6 +475,7 @@ export class Scheduler {
       });
       this.store.emit({
         workerId,
+        actorName,
         type: "worker.action.failed",
         phase: "worker-control",
         level: "error",

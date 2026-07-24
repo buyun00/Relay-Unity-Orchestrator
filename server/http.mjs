@@ -171,6 +171,25 @@ function routeId(pathname, prefix) {
   return decodeURIComponent(rest);
 }
 
+function requestUserName(request) {
+  const value = request.headers["x-pipeline-user"];
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) return "未记录用户";
+  let decoded;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+  return (
+    decoded
+      .replace(/[\u0000-\u001f\u007f]/gu, "")
+      .trim()
+      .replace(/\s+/gu, " ")
+      .slice(0, 80) || "未记录用户"
+  );
+}
+
 function publicRuntimeStatus(runtime) {
   if (!runtime) return null;
   return {
@@ -197,7 +216,6 @@ export class PipelineHttpServer {
     this.config = config;
     this.store = store;
     this.scheduler = scheduler;
-    this.sessions = new Map();
     this.sseClients = new Set();
     this.unsubscribe = store.onEvent((event) => this.broadcast(event));
     this.server = http.createServer(
@@ -230,51 +248,12 @@ export class PipelineHttpServer {
       ? {
           "Access-Control-Allow-Origin": origin,
           "Access-Control-Allow-Headers":
-            "Authorization, Content-Type, Idempotency-Key, X-File-Name, X-Pipeline-Token",
+            "Content-Type, Idempotency-Key, X-File-Name, X-Pipeline-User",
           "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
           "Access-Control-Max-Age": "600",
           Vary: "Origin",
         }
       : {};
-  }
-
-  pruneSessions() {
-    const timestamp = Date.now();
-    for (const [token, session] of this.sessions) {
-      if (session.expiresAt <= timestamp) this.sessions.delete(token);
-    }
-  }
-
-  authorized(request, url = null) {
-    if (!this.config.authRequired) return true;
-    this.pruneSessions();
-    const authorization = request.headers.authorization || "";
-    const bearer = authorization.startsWith("Bearer ")
-      ? authorization.slice(7).trim()
-      : "";
-    const headerToken =
-      bearer || String(request.headers["x-pipeline-token"] || "");
-    const queryToken =
-      url?.searchParams.get("access_token") ||
-      url?.searchParams.get("token") ||
-      "";
-    const token = headerToken || queryToken;
-    const tokenBytes = Buffer.from(token);
-    const adminBytes = Buffer.from(this.config.adminToken);
-    if (
-      headerToken &&
-      tokenBytes.length === adminBytes.length &&
-      crypto.timingSafeEqual(tokenBytes, adminBytes)
-    )
-      return true;
-    return Boolean(token && this.sessions.get(token)?.expiresAt > Date.now());
-  }
-
-  createSession() {
-    const token = crypto.randomBytes(32).toString("base64url");
-    const expiresAt = Date.now() + this.config.sessionTtlMs;
-    this.sessions.set(token, { expiresAt });
-    return { token, expiresAt: new Date(expiresAt).toISOString() };
   }
 
   broadcast(event) {
@@ -339,6 +318,7 @@ export class PipelineHttpServer {
         `http://${request.headers.host || "localhost"}`,
       );
       const pathname = url.pathname.replace(/\/$/, "") || "/";
+      const actorName = requestUserName(request);
 
       if (request.method === "GET" && pathname === "/") {
         const dashboardUrl = new URL(url);
@@ -412,7 +392,6 @@ export class PipelineHttpServer {
             ok: true,
             version: this.config.version,
             adapter: this.config.adapter,
-            authRequired: this.config.authRequired,
             scheduler: this.scheduler.status(),
             runtime: publicRuntimeStatus(runtime),
             uptimeSeconds: Math.round(process.uptime()),
@@ -422,29 +401,6 @@ export class PipelineHttpServer {
         );
         return;
       }
-
-      if (request.method === "POST" && pathname === "/api/session") {
-        const body = await readJson(request, this.config.requestBodyLimitBytes);
-        if (
-          this.config.authRequired &&
-          body.adminToken !== this.config.adminToken
-        ) {
-          throw new HttpError(
-            401,
-            "INVALID_ADMIN_TOKEN",
-            "Admin token is invalid",
-          );
-        }
-        json(response, 201, { ok: true, ...this.createSession() }, cors);
-        return;
-      }
-
-      if (!this.authorized(request, url))
-        throw new HttpError(
-          401,
-          "AUTH_REQUIRED",
-          "A valid pipeline session token is required",
-        );
 
       if (request.method === "GET" && pathname === "/api/runtime") {
         const runtime = await this.scheduler.inspectRuntime({ force: true });
@@ -473,8 +429,6 @@ export class PipelineHttpServer {
               now: new Date().toISOString(),
               queuePaused: scheduler.paused,
               schedulerRunning: scheduler.running && !scheduler.paused,
-              authRequired: this.config.authRequired,
-              requiresAuth: this.config.authRequired,
               runtime,
             },
           },
@@ -515,7 +469,7 @@ export class PipelineHttpServer {
       }
       if (request.method === "POST" && pathname === "/api/projects") {
         const body = await readJson(request, this.config.requestBodyLimitBytes);
-        const project = this.store.createProject(projectInput(body));
+        const project = this.store.createProject(projectInput(body), actorName);
         json(response, 201, { ok: true, project }, cors);
         return;
       }
@@ -537,6 +491,7 @@ export class PipelineHttpServer {
             project: this.store.updateProject(
               projectId,
               projectInput(body, true),
+              actorName,
             ),
           },
           cors,
@@ -544,7 +499,7 @@ export class PipelineHttpServer {
         return;
       }
       if (projectId && request.method === "DELETE") {
-        this.store.deleteProject(projectId);
+        this.store.deleteProject(projectId, actorName);
         json(response, 200, { ok: true }, cors);
         return;
       }
@@ -560,7 +515,7 @@ export class PipelineHttpServer {
       }
       if (request.method === "POST" && pathname === "/api/workers") {
         const body = await readJson(request, this.config.requestBodyLimitBytes);
-        const worker = this.store.createWorker(workerInput(body));
+        const worker = this.store.createWorker(workerInput(body), actorName);
         json(response, 201, { ok: true, worker }, cors);
         void this.scheduler.probeAll();
         return;
@@ -571,7 +526,7 @@ export class PipelineHttpServer {
         const worker = await this.scheduler.controlWorker(
           decodeURIComponent(workerAction[1]),
           body.action,
-          { force: Boolean(body.force) },
+          { force: Boolean(body.force), actorName },
         );
         json(response, 200, { ok: true, worker }, cors);
         return;
@@ -591,14 +546,18 @@ export class PipelineHttpServer {
           200,
           {
             ok: true,
-            worker: this.store.updateWorker(workerId, workerInput(body, true)),
+            worker: this.store.updateWorker(
+              workerId,
+              workerInput(body, true),
+              actorName,
+            ),
           },
           cors,
         );
         return;
       }
       if (workerId && request.method === "DELETE") {
-        this.store.deleteWorker(workerId);
+        this.store.deleteWorker(workerId, actorName);
         json(response, 200, { ok: true }, cors);
         return;
       }
@@ -647,6 +606,7 @@ export class PipelineHttpServer {
           ...taskCodexSettings,
           attachments: body.attachments || body.attachmentIds,
           idempotencyKey: idempotencyKey || null,
+          userName: actorName,
         });
         this.scheduler.notifyQueueChanged();
         json(response, 201, { ok: true, ...result }, cors);
@@ -691,6 +651,7 @@ export class PipelineHttpServer {
                 ? undefined
                 : integer(body.priority, 0, -100, 100),
             attachments: body.attachments || body.attachmentIds,
+            userName: actorName,
           });
           this.scheduler.notifyQueueChanged();
           json(response, 201, { ok: true, turn }, cors);
@@ -700,7 +661,7 @@ export class PipelineHttpServer {
           json(
             response,
             200,
-            { ok: true, turn: this.scheduler.cancelTask(taskId) },
+            { ok: true, turn: this.scheduler.cancelTask(taskId, actorName) },
             cors,
           );
           return;
@@ -709,7 +670,7 @@ export class PipelineHttpServer {
           json(
             response,
             201,
-            { ok: true, turn: this.scheduler.retryTask(taskId) },
+            { ok: true, turn: this.scheduler.retryTask(taskId, actorName) },
             cors,
           );
           return;
@@ -718,7 +679,7 @@ export class PipelineHttpServer {
           json(
             response,
             200,
-            { ok: true, task: this.store.closeTask(taskId) },
+            { ok: true, task: this.store.closeTask(taskId, actorName) },
             cors,
           );
           return;
@@ -727,7 +688,7 @@ export class PipelineHttpServer {
           json(
             response,
             200,
-            { ok: true, task: this.store.reopenTask(taskId) },
+            { ok: true, task: this.store.reopenTask(taskId, actorName) },
             cors,
           );
           return;
@@ -738,7 +699,7 @@ export class PipelineHttpServer {
         json(
           response,
           200,
-          { ok: true, scheduler: this.scheduler.setPaused(true) },
+          { ok: true, scheduler: this.scheduler.setPaused(true, actorName) },
           cors,
         );
         return;
@@ -747,7 +708,7 @@ export class PipelineHttpServer {
         json(
           response,
           200,
-          { ok: true, scheduler: this.scheduler.setPaused(false) },
+          { ok: true, scheduler: this.scheduler.setPaused(false, actorName) },
           cors,
         );
         return;

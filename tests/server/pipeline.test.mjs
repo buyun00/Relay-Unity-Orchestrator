@@ -22,10 +22,7 @@ function createConfig() {
     adapter: "test",
     host: "127.0.0.1",
     port: 0,
-    adminToken: "",
-    authRequired: false,
     allowedOrigins: [],
-    sessionTtlMs: 60_000,
     requestBodyLimitBytes: 2 * 1024 * 1024,
     uploadLimitBytes: 25 * 1024 * 1024,
     schedulerIntervalMs: 5,
@@ -71,6 +68,7 @@ function createTask(store, projectId, options = {}) {
     codexModel: options.codexModel,
     codexReasoningEffort: options.codexReasoningEffort,
     codexFastMode: options.codexFastMode,
+    userName: options.userName,
   });
 }
 
@@ -603,6 +601,7 @@ test("SQLite restart preserves project URLs, task conversation, branch, and hist
     codexModel: "gpt-5.6-terra",
     codexReasoningEffort: "max",
     codexFastMode: true,
+    userName: "持久化用户",
   });
   await new Promise((resolve) => setImmediate(resolve));
   const context = store.claimNextTurn();
@@ -642,8 +641,10 @@ test("SQLite restart preserves project URLs, task conversation, branch, and hist
   assert.equal(persistedTask.codexModel, "gpt-5.6-terra");
   assert.equal(persistedTask.codexReasoningEffort, "max");
   assert.equal(persistedTask.codexFastMode, true);
+  assert.equal(persistedTask.createdBy, "持久化用户");
   assert.equal(persistedTurn.status, "success");
   assert.equal(persistedTurn.userMessage, "Persist this completed turn");
+  assert.equal(persistedTurn.authorName, "持久化用户");
   assert.equal(persistedTurn.codexFinal.summary, "Persisted result");
   assert.equal(store.getWorker(worker.id).status, "ready");
   assert.equal(
@@ -684,7 +685,8 @@ test("browser preflight accepts the task idempotency header", async (t) => {
     headers: {
       Origin: origin,
       "Access-Control-Request-Method": "POST",
-      "Access-Control-Request-Headers": "content-type,idempotency-key",
+      "Access-Control-Request-Headers":
+        "content-type,idempotency-key,x-pipeline-user",
     },
   });
   assert.equal(preflight.status, 204);
@@ -693,6 +695,10 @@ test("browser preflight accepts the task idempotency header", async (t) => {
     preflight.headers.get("access-control-allow-headers") || "",
     /Idempotency-Key/i,
   );
+  assert.match(
+    preflight.headers.get("access-control-allow-headers") || "",
+    /X-Pipeline-User/i,
+  );
 
   const response = await fetch(`${base}/api/tasks`, {
     method: "POST",
@@ -700,6 +706,7 @@ test("browser preflight accepts the task idempotency header", async (t) => {
       Origin: origin,
       "Content-Type": "application/json",
       "Idempotency-Key": "browser-create-task-test",
+      "X-Pipeline-User": encodeURIComponent("林"),
     },
     body: JSON.stringify({
       projectId: project.id,
@@ -714,6 +721,8 @@ test("browser preflight accepts the task idempotency header", async (t) => {
   assert.equal(response.headers.get("access-control-allow-origin"), origin);
   const firstPayload = await response.json();
   assert.equal(firstPayload.task.title, "Browser task");
+  assert.equal(firstPayload.task.createdBy, "林");
+  assert.equal(firstPayload.turn.authorName, "林");
   assert.equal(firstPayload.task.codexModel, "gpt-5.6-luna");
   assert.equal(firstPayload.task.codexReasoningEffort, "max");
   assert.equal(firstPayload.task.codexFastMode, true);
@@ -737,6 +746,35 @@ test("browser preflight accepts the task idempotency header", async (t) => {
   assert.equal(repeatedPayload.turn.id, firstPayload.turn.id);
   assert.equal(repeatedPayload.duplicate, true);
   assert.equal(store.listTasks().length, 1);
+
+  const followUp = await fetch(
+    `${base}/api/tasks/${encodeURIComponent(firstPayload.task.id)}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Origin: origin,
+        "Content-Type": "application/json",
+        "X-Pipeline-User": encodeURIComponent("产品组小王"),
+      },
+      body: JSON.stringify({ message: "Add a second user's refinement" }),
+    },
+  );
+  assert.equal(followUp.status, 201);
+  const followUpPayload = await followUp.json();
+  assert.equal(followUpPayload.turn.authorName, "产品组小王");
+  assert.ok(
+    store
+      .listTaskEvents(firstPayload.task.id)
+      .some(
+        (event) =>
+          event.type === "turn.queued" && event.actorName === "产品组小王",
+      ),
+  );
+
+  const removedSessionRoute = await fetch(`${base}/api/session`, {
+    method: "POST",
+  });
+  assert.equal(removedSessionRoute.status, 404);
 
   const invalidSettings = await fetch(`${base}/api/tasks`, {
     method: "POST",

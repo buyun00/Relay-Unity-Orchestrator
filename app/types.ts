@@ -96,6 +96,7 @@ export interface Turn {
   taskId: string;
   sequence: number;
   userMessage: string;
+  authorName: string;
   status: TurnStatus;
   phase?: string;
   workerId?: string | null;
@@ -115,6 +116,7 @@ export interface Task {
   id: string;
   number: string;
   title: string;
+  createdBy: string;
   projectId: string;
   baseBranch: string;
   branchName: string;
@@ -136,6 +138,7 @@ export interface PipelineEvent {
   taskId?: string | null;
   turnId?: string | null;
   workerId?: string | null;
+  actorName?: string | null;
   level: "info" | "success" | "warning" | "error";
   type: string;
   phase?: string | null;
@@ -189,7 +192,6 @@ export interface Snapshot {
     connected?: boolean;
     startedAt?: string;
     schedulerRunning?: boolean;
-    requiresAuth?: boolean;
     runtime?: HostRuntime | null;
   };
   projects: Project[];

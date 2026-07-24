@@ -266,12 +266,23 @@ kbd {
 }
 .connection-pill,
 .profile-row {
+  width: 100%;
+  border: 0;
   border-top: 1px solid var(--line);
   padding: 14px 7px 4px;
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+.profile-row {
+  cursor: pointer;
+}
+.profile-row:hover {
+  background: rgba(255, 255, 255, 0.025);
 }
 .connection-pill > svg {
   color: var(--signal);
@@ -316,6 +327,12 @@ kbd {
   height: 26px;
   border-radius: 8px;
   font-size: 13px;
+}
+.avatar.micro {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  font-size: 11px;
 }
 .sidebar-compact {
   grid-template-columns: 72px minmax(0, 1fr);
@@ -944,6 +961,14 @@ kbd {
 .event-message strong {
   color: var(--text);
   margin-right: 9px;
+}
+.event-actor {
+  margin-right: 9px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: rgba(116, 167, 255, 0.08);
+  color: var(--blue);
+  font-size: 12px;
 }
 .event-mark {
   width: 6px;
@@ -3123,6 +3148,42 @@ kbd {
 }
 .confirm-modal .form-field {
   text-align: left;
+}
+.identity-backdrop {
+  background:
+    radial-gradient(
+      circle at 50% 35%,
+      rgba(114, 224, 178, 0.1),
+      transparent 32%
+    ),
+    rgba(2, 4, 5, 0.84);
+}
+.identity-modal {
+  width: min(470px, 94vw);
+}
+.identity-mark {
+  width: 50px;
+  height: 50px;
+  margin-bottom: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: var(--signal-soft);
+  color: var(--signal);
+}
+.identity-modal h2 {
+  margin: 5px 0 7px;
+  font-size: 24px;
+}
+.identity-modal > p {
+  margin: 0 0 24px;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.identity-modal .form-field input {
+  height: 46px;
+  font-size: 15px;
 }
 .toast-stack {
   position: fixed;

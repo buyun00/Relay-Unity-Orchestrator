@@ -26,7 +26,7 @@ Unity 保存 → 来宾 commit / push → 远程 SHA 核验
 
 ### 1. 连接控制服务
 
-打开 `http://localhost:3000`；从其他局域网设备访问时，将 `localhost` 换成宿主机 IP。网页默认连接同一主机的 `4317` 端口。如果页面提示未授权，进入“系统”页，在“控制服务连接”中填写 `.env.local` 的 `PIPELINE_ADMIN_TOKEN`，再点击“保存并重新连接”。令牌只保存在当前浏览器标签的 `sessionStorage` 中。
+打开 `http://localhost:3000`；从其他局域网设备访问时，将 `localhost` 换成宿主机 IP。网页默认连接同一主机的 `4317` 端口。首次进入只需填写使用者名称，不需要访问令牌或密码；名称保存在当前浏览器中，并记录到任务发起人、每轮消息作者和人工操作事件里，方便多人共用时区分使用者。
 
 首次使用前应在“项目”页添加项目环境，并在“工位”页添加和启用至少一个兼容的 Hyper-V 工位。系统页应显示控制服务实时连接正常、Codex 已登录且调度器未暂停。
 
@@ -67,7 +67,7 @@ Unity 保存 → 来宾 commit / push → 远程 SHA 核验
 ```powershell
 npm install
 Copy-Item .env.example .env.local
-# 编辑 .env.local，至少设置强管理令牌、CODEX_HOME 和允许的网页 Origin
+# 编辑 .env.local，设置 CODEX_HOME 和允许的网页 Origin
 npm run dev
 ```
 
@@ -92,7 +92,6 @@ npm start            # 启动生产构建与控制服务
 
 ```text
 PIPELINE_ADAPTER=hyperv
-PIPELINE_ADMIN_TOKEN=<高强度随机令牌>
 PIPELINE_CHECKPOINTS_ENABLED=false
 ```
 
@@ -103,7 +102,7 @@ PIPELINE_CHECKPOINTS_ENABLED=false
 ## 主要目录
 
 - `app/`：现代化管理网页，包括任务、队列、对话、工位、项目和系统设置。
-- `server/`：SQLite 持久化、调度状态机、SSE、认证、Codex 与适配器边界。
+- `server/`：SQLite 持久化、调度状态机、SSE、用户归属记录、Codex 与适配器边界。
 - `scripts/hyperv/`：固定参数的 Hyper-V / PowerShell Direct 操作脚本。
 - `guest-tools/unity-dialog-guard/`：安装在子机交互桌面的 Unity 弹窗守护程序、规则、自学习和登录自启动脚本。
 - `tests/server/`：不触碰真实基础设施的状态机与安全回归测试。

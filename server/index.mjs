@@ -16,9 +16,7 @@ await scheduler.start({ paused: !runtime.ready });
 console.log(
   `Relay pipeline API listening on http://${config.host}:${config.port}`,
 );
-console.log(
-  `Adapter: ${config.adapter}; authentication: ${config.authRequired ? "required" : "disabled"}`,
-);
+console.log(`Adapter: ${config.adapter}; access tokens: disabled`);
 console.log(
   `Hyper-V access: ${runtime.hyperv.canManage ? "ready" : "unavailable"}; Codex: ${
     runtime.codex.authenticated

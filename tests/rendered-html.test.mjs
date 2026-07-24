@@ -29,13 +29,15 @@ test("server renders the Relay control desk", async () => {
 });
 
 test("starter preview is removed and the product shell is durable", async () => {
-  const [page, layout, controlDesk, css, packageJson] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/control-desk.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
-    readFile(new URL("../package.json", import.meta.url), "utf8"),
-  ]);
+  const [page, layout, controlDesk, apiClient, css, packageJson] =
+    await Promise.all([
+      readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+      readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+      readFile(new URL("../app/control-desk.tsx", import.meta.url), "utf8"),
+      readFile(new URL("../app/api.ts", import.meta.url), "utf8"),
+      readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+      readFile(new URL("../package.json", import.meta.url), "utf8"),
+    ]);
   assert.match(page, /<ControlDesk \/>/);
   assert.match(layout, /lang="zh-CN"/);
   assert.match(controlDesk, /追加一轮/);
@@ -47,6 +49,15 @@ test("starter preview is removed and the product shell is durable", async () => 
   assert.match(controlDesk, /GPT-5\.6 Sol/);
   assert.match(controlDesk, /Extra High/);
   assert.match(controlDesk, /Fast 模式/);
+  assert.match(controlDesk, /输入使用者名称/);
+  assert.match(controlDesk, /identityReady && identityOpen/);
+  assert.doesNotMatch(controlDesk, /管理令牌/);
+  assert.match(apiClient, /X-Pipeline-User/);
+  assert.match(
+    apiClient,
+    /window\.location\.protocol === "https:"\) return window\.location\.origin/,
+  );
+  assert.doesNotMatch(apiClient, /relay-admin-token|Authorization/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
   assert.match(css, /--signal:\s*#72e0b2/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

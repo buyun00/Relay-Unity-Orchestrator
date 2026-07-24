@@ -45,23 +45,25 @@ foreach ($line in Get-Content -LiteralPath $envFile) {
     if ($separator -lt 1) { continue }
     $settings[$line.Substring(0, $separator).Trim()] = $line.Substring($separator + 1).Trim()
 }
-$port = if ($settings.ContainsKey('PORT')) { [int]$settings.PORT } else { 4317 }
-$adminToken = if ($settings.ContainsKey('PIPELINE_ADMIN_TOKEN')) { $settings.PIPELINE_ADMIN_TOKEN } else { $null }
-if ([string]::IsNullOrWhiteSpace($adminToken)) {
-    throw 'PIPELINE_ADMIN_TOKEN is not configured in .env.local.'
+$port = if ($settings.ContainsKey('PIPELINE_PORT')) {
+    [int]$settings.PIPELINE_PORT
+} elseif ($settings.ContainsKey('PORT')) {
+    [int]$settings.PORT
+} else {
+    4317
 }
 
-$headers = @{ Authorization = "Bearer $adminToken" }
+$healthUrl = "http://127.0.0.1:$port/api/health"
 $runtimeUrl = "http://127.0.0.1:$port/api/runtime"
 $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
 if ($listener) {
     try {
-        $runtime = Invoke-RestMethod -Uri $runtimeUrl -Headers $headers -TimeoutSec 10
+        $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 10
     } catch {
         throw "Port $port is occupied, but it did not respond as the configured Relay API."
     }
-    if (-not $runtime.ok) {
-        throw "Port $port did not return a valid Relay runtime response."
+    if (-not $health.ok) {
+        throw "Port $port did not return a valid Relay health response."
     }
     $listenerProcessIds = @($listener | Select-Object -ExpandProperty OwningProcess -Unique)
     if ($listenerProcessIds.Count -ne 1) {
@@ -105,7 +107,7 @@ $runtime = $null
 do {
     Start-Sleep -Milliseconds 500
     try {
-        $runtime = Invoke-RestMethod -Uri $runtimeUrl -Headers $headers -TimeoutSec 3
+        $runtime = Invoke-RestMethod -Uri $runtimeUrl -TimeoutSec 3
     } catch {
         $runtime = $null
     }

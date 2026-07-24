@@ -120,6 +120,7 @@ function taskFromRow(row) {
     id: row.id,
     number: row.task_number,
     title: row.title,
+    createdBy: row.created_by,
     projectId: row.project_id,
     baseBranch: row.base_branch,
     branchName: row.branch_name,
@@ -145,6 +146,7 @@ function turnFromRow(row) {
     taskId: row.task_id,
     sequence: row.sequence,
     userMessage: row.user_message,
+    authorName: row.author_name,
     status: row.status,
     priority: row.priority,
     workerId: row.worker_id,
@@ -166,6 +168,7 @@ function eventFromRow(row) {
     taskId: row.task_id,
     turnId: row.turn_id,
     workerId: row.worker_id,
+    actorName: row.actor_name,
     level: row.level,
     type: row.type,
     phase: row.phase,
@@ -264,6 +267,7 @@ export class Store {
         task_number INTEGER NOT NULL UNIQUE,
         idempotency_key TEXT,
         title TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT '未记录用户',
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
         base_branch TEXT NOT NULL,
         branch_name TEXT NOT NULL UNIQUE,
@@ -285,6 +289,7 @@ export class Store {
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         sequence INTEGER NOT NULL,
         user_message TEXT NOT NULL,
+        author_name TEXT NOT NULL DEFAULT '未记录用户',
         status TEXT NOT NULL DEFAULT 'queued',
         priority INTEGER NOT NULL DEFAULT 0,
         worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
@@ -303,6 +308,7 @@ export class Store {
         task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
         turn_id TEXT REFERENCES turns(id) ON DELETE CASCADE,
         worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
+        actor_name TEXT,
         level TEXT NOT NULL DEFAULT 'info',
         type TEXT NOT NULL,
         phase TEXT,
@@ -342,6 +348,11 @@ export class Store {
     if (!taskColumns.some((column) => column.name === "idempotency_key")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT");
     }
+    if (!taskColumns.some((column) => column.name === "created_by")) {
+      this.db.exec(
+        "ALTER TABLE tasks ADD COLUMN created_by TEXT NOT NULL DEFAULT '未记录用户'",
+      );
+    }
     if (!taskColumns.some((column) => column.name === "codex_model")) {
       this.db.exec(
         `ALTER TABLE tasks ADD COLUMN codex_model TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_MODEL}'`,
@@ -358,6 +369,16 @@ export class Store {
       this.db.exec(
         `ALTER TABLE tasks ADD COLUMN codex_fast_mode INTEGER NOT NULL DEFAULT ${DEFAULT_CODEX_FAST_MODE ? 1 : 0}`,
       );
+    }
+    const turnColumns = this.db.prepare("PRAGMA table_info(turns)").all();
+    if (!turnColumns.some((column) => column.name === "author_name")) {
+      this.db.exec(
+        "ALTER TABLE turns ADD COLUMN author_name TEXT NOT NULL DEFAULT '未记录用户'",
+      );
+    }
+    const eventColumns = this.db.prepare("PRAGMA table_info(events)").all();
+    if (!eventColumns.some((column) => column.name === "actor_name")) {
+      this.db.exec("ALTER TABLE events ADD COLUMN actor_name TEXT");
     }
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_idx
@@ -432,6 +453,7 @@ export class Store {
     taskId = null,
     turnId = null,
     workerId = null,
+    actorName = null,
     level = "info",
     type,
     phase = null,
@@ -442,14 +464,17 @@ export class Store {
     const result = this.db
       .prepare(
         `
-      INSERT INTO events (task_id, turn_id, worker_id, level, type, phase, message, data_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO events (
+        task_id, turn_id, worker_id, actor_name, level, type, phase, message, data_json, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
       )
       .run(
         taskId,
         turnId,
         workerId,
+        actorName,
         level,
         type,
         phase,
@@ -462,6 +487,7 @@ export class Store {
       taskId,
       turnId,
       workerId,
+      actorName,
       level,
       type,
       phase,
@@ -515,7 +541,7 @@ export class Store {
     );
   }
 
-  createProject(input) {
+  createProject(input, actorName = null) {
     const projectId = input.id || id("project-");
     const timestamp = now();
     this.db
@@ -546,6 +572,7 @@ export class Store {
       );
     const project = this.getProject(projectId);
     this.emit({
+      actorName,
       type: "project.created",
       message: `Project ${project.name} created`,
       data: { projectId },
@@ -553,7 +580,7 @@ export class Store {
     return project;
   }
 
-  updateProject(projectId, changes) {
+  updateProject(projectId, changes, actorName = null) {
     if (!this.getProject(projectId))
       throw new HttpError(404, "PROJECT_NOT_FOUND", "Project not found");
     const entries = Object.entries(PROJECT_FIELDS).filter(([key]) =>
@@ -572,6 +599,7 @@ export class Store {
       .run(...values);
     const project = this.getProject(projectId);
     this.emit({
+      actorName,
       type: "project.updated",
       message: `Project ${project.name} updated`,
       data: { projectId },
@@ -579,7 +607,7 @@ export class Store {
     return project;
   }
 
-  deleteProject(projectId) {
+  deleteProject(projectId, actorName = null) {
     const project = this.getProject(projectId);
     if (!project)
       throw new HttpError(404, "PROJECT_NOT_FOUND", "Project not found");
@@ -599,6 +627,7 @@ export class Store {
       );
     this.db.prepare("DELETE FROM projects WHERE id=?").run(projectId);
     this.emit({
+      actorName,
       type: "project.deleted",
       message: `Project ${project.name} deleted`,
       data: { projectId },
@@ -618,7 +647,7 @@ export class Store {
     );
   }
 
-  createWorker(input) {
+  createWorker(input, actorName = null) {
     if (input.projectId && !this.getProject(input.projectId)) {
       throw new HttpError(
         400,
@@ -662,13 +691,14 @@ export class Store {
     const worker = this.getWorker(workerId);
     this.emit({
       workerId,
+      actorName,
       type: "worker.created",
       message: `Worker ${worker.name} created`,
     });
     return worker;
   }
 
-  updateWorker(workerId, changes) {
+  updateWorker(workerId, changes, actorName = null) {
     const existing = this.getWorker(workerId);
     if (!existing)
       throw new HttpError(404, "WORKER_NOT_FOUND", "Worker not found");
@@ -696,13 +726,14 @@ export class Store {
     const worker = this.getWorker(workerId);
     this.emit({
       workerId,
+      actorName,
       type: "worker.updated",
       message: `Worker ${worker.name} updated`,
     });
     return worker;
   }
 
-  deleteWorker(workerId) {
+  deleteWorker(workerId, actorName = null) {
     const worker = this.getWorker(workerId);
     if (!worker)
       throw new HttpError(404, "WORKER_NOT_FOUND", "Worker not found");
@@ -715,6 +746,7 @@ export class Store {
     }
     this.db.prepare("DELETE FROM workers WHERE id=?").run(workerId);
     this.emit({
+      actorName,
       type: "worker.deleted",
       message: `Worker ${worker.name} deleted`,
       data: { workerId },
@@ -831,10 +863,10 @@ export class Store {
         .prepare(
           `
         INSERT INTO tasks (
-          id, task_number, idempotency_key, title, project_id, base_branch, branch_name, status,
+          id, task_number, idempotency_key, title, created_by, project_id, base_branch, branch_name, status,
           priority, auto_release, codex_model, codex_reasoning_effort, codex_fast_mode,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
       `,
         )
         .run(
@@ -842,6 +874,7 @@ export class Store {
           taskNumber,
           idempotencyKey,
           input.title,
+          input.userName || "未记录用户",
           input.projectId,
           baseBranch,
           branchName,
@@ -856,11 +889,20 @@ export class Store {
       this.db
         .prepare(
           `
-        INSERT INTO turns (id, task_id, sequence, user_message, status, priority, created_at)
-        VALUES (?, ?, 1, ?, 'queued', ?, ?)
+        INSERT INTO turns (
+          id, task_id, sequence, user_message, author_name, status, priority, created_at
+        )
+        VALUES (?, ?, 1, ?, ?, 'queued', ?, ?)
       `,
         )
-        .run(turnId, taskId, input.message, priority, timestamp);
+        .run(
+          turnId,
+          taskId,
+          input.message,
+          input.userName || "未记录用户",
+          priority,
+          timestamp,
+        );
       this.attachUploads(input.attachments, taskId, turnId);
       const task = this.getTask(taskId);
       const turn = this.getTurn(turnId);
@@ -868,6 +910,7 @@ export class Store {
         this.emit({
           taskId,
           turnId,
+          actorName: input.userName || null,
           type: "turn.queued",
           phase: "queue",
           message: `Task #${taskNumber} entered the execution queue`,
@@ -973,9 +1016,9 @@ export class Store {
         .prepare(
           `
         INSERT INTO turns (
-          id, task_id, sequence, user_message, status, priority, worker_id, created_at
+          id, task_id, sequence, user_message, author_name, status, priority, worker_id, created_at
         )
-        VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
       `,
         )
         .run(
@@ -983,6 +1026,7 @@ export class Store {
           taskId,
           sequence,
           input.message,
+          input.userName || "未记录用户",
           priority,
           preservedWorkerId,
           timestamp,
@@ -998,6 +1042,7 @@ export class Store {
         this.emit({
           taskId,
           turnId,
+          actorName: input.userName || null,
           type: "turn.queued",
           phase: "queue",
           message: `Turn ${sequence} entered the execution queue`,
@@ -1319,7 +1364,7 @@ export class Store {
     return this.getTurn(queued.id);
   }
 
-  cancelCurrentTurn(taskId) {
+  cancelCurrentTurn(taskId, actorName = null) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
     const row = this.db
@@ -1390,6 +1435,7 @@ export class Store {
       taskId,
       turnId: turn.id,
       workerId: turn.workerId,
+      actorName,
       type: "turn.cancelled",
       level: "warning",
       phase: "cancelled",
@@ -1400,7 +1446,7 @@ export class Store {
     return { turn: this.getTurn(turn.id), preserveWorker: !wasQueued };
   }
 
-  retryTask(taskId) {
+  retryTask(taskId, actorName = null) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
     if (this.hasActiveTurn(taskId))
@@ -1427,10 +1473,11 @@ export class Store {
     return this.appendTurn(taskId, {
       message: latest.user_message,
       priority: latest.priority,
+      userName: actorName,
     });
   }
 
-  closeTask(taskId) {
+  closeTask(taskId, actorName = null) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
     if (this.hasActiveTurn(taskId))
@@ -1447,13 +1494,14 @@ export class Store {
       .run(timestamp, timestamp, taskId);
     this.emit({
       taskId,
+      actorName,
       type: "task.closed",
       message: `Task #${task.number} closed; conversation and branch remain available`,
     });
     return this.getTask(taskId);
   }
 
-  reopenTask(taskId) {
+  reopenTask(taskId, actorName = null) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
     if (task.status !== "closed")
@@ -1465,6 +1513,7 @@ export class Store {
       .run(now(), taskId);
     this.emit({
       taskId,
+      actorName,
       type: "task.reopened",
       message: `Task #${task.number} reopened`,
     });

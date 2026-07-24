@@ -1,28 +1,43 @@
 import type { PipelineEvent, Snapshot } from "./types";
 
-const TOKEN_KEY = "relay-admin-token";
 const API_KEY = "relay-api-base";
+const USER_NAME_KEY = "relay-user-name";
 
 export function getApiBase(): string {
   if (typeof window === "undefined") return "http://127.0.0.1:4317";
+  // HTTPS deployments (for example a Cloudflare Tunnel) must use the
+  // same-origin /api route. A previously saved LAN HTTP address would be
+  // blocked by the browser as mixed content.
+  if (window.location.protocol === "https:") return window.location.origin;
   const saved = window.localStorage.getItem(API_KEY);
   if (saved) return saved.replace(/\/$/, "");
-  if (window.location.protocol === "https:") return window.location.origin;
   return `http://${window.location.hostname}:4317`;
 }
 
 export function setApiBase(value: string) {
-  window.localStorage.setItem(API_KEY, value.replace(/\/$/, ""));
+  const effectiveValue =
+    window.location.protocol === "https:"
+      ? window.location.origin
+      : value.replace(/\/$/, "");
+  window.localStorage.setItem(API_KEY, effectiveValue);
+  return effectiveValue;
 }
 
-export function getToken(): string {
+export function getUserName(): string {
   if (typeof window === "undefined") return "";
-  return window.sessionStorage.getItem(TOKEN_KEY) ?? "";
+  return window.localStorage.getItem(USER_NAME_KEY)?.trim() ?? "";
 }
 
-export function setToken(value: string) {
-  if (value) window.sessionStorage.setItem(TOKEN_KEY, value);
-  else window.sessionStorage.removeItem(TOKEN_KEY);
+export function setUserName(value: string) {
+  const normalized = value.trim().replace(/\s+/gu, " ").slice(0, 80);
+  if (normalized) window.localStorage.setItem(USER_NAME_KEY, normalized);
+  else window.localStorage.removeItem(USER_NAME_KEY);
+  return normalized;
+}
+
+function addUserHeader(headers: Headers) {
+  const userName = getUserName();
+  if (userName) headers.set("X-Pipeline-User", encodeURIComponent(userName));
 }
 
 export class ApiError extends Error {
@@ -37,12 +52,11 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const token = getToken();
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  addUserHeader(headers);
   const response = await fetch(`${getApiBase()}${path}`, {
     ...init,
     headers,
@@ -73,7 +87,6 @@ export function fetchSnapshot() {
     Snapshot & {
       server: Snapshot["server"] & {
         adapter?: "hyperv";
-        authRequired?: boolean;
         queuePaused?: boolean;
       };
     }
@@ -145,8 +158,6 @@ export function fetchSnapshot() {
       server: {
         ...snapshot.server,
         mode: snapshot.server.mode ?? snapshot.server.adapter ?? "hyperv",
-        requiresAuth:
-          snapshot.server.requiresAuth ?? snapshot.server.authRequired ?? false,
         schedulerRunning:
           snapshot.server.schedulerRunning ?? !snapshot.server.queuePaused,
       },
@@ -181,12 +192,11 @@ export function fetchTaskEvents(taskId: string) {
 export async function uploadFile(
   file: File,
 ): Promise<{ id: string; filename: string }> {
-  const token = getToken();
   const headers = new Headers({
     "Content-Type": file.type || "application/octet-stream",
     "X-File-Name": encodeURIComponent(file.name),
   });
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  addUserHeader(headers);
   const response = await fetch(`${getApiBase()}/api/uploads`, {
     method: "POST",
     headers,
@@ -213,17 +223,7 @@ export async function subscribeEvents(
   onEvent: (event?: PipelineEvent) => void,
   onDisconnect: () => void,
 ): Promise<() => void> {
-  const adminToken = getToken();
-  let eventToken = "";
-  if (adminToken) {
-    const session = await api<{ token: string }>("/api/session", {
-      method: "POST",
-      body: JSON.stringify({ adminToken }),
-    });
-    eventToken = session.token;
-  }
-  const query = eventToken ? `?token=${encodeURIComponent(eventToken)}` : "";
-  const source = new EventSource(`${getApiBase()}/api/events${query}`);
+  const source = new EventSource(`${getApiBase()}/api/events`);
   const handleEvent = (event: MessageEvent<string>) => {
     try {
       onEvent(JSON.parse(event.data) as PipelineEvent);
