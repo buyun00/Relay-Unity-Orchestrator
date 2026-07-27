@@ -146,6 +146,27 @@ class StartFailingFakeAdapter extends FakeAdapter {
   }
 }
 
+class WorkspaceRefusingFakeAdapter extends FakeAdapter {
+  async prepare() {
+    const details = {
+      ready: false,
+      code: "WORKSPACE_UNSAFE_CHANGES",
+      blockedPaths: ["Assets/Removed.prefab", "secrets/signing.key"],
+      deletionPaths: ["Assets/Removed.prefab"],
+    };
+    throw Object.assign(
+      new Error(
+        "Workspace checkout refused: Assets/Removed.prefab, secrets/signing.key",
+      ),
+      {
+        code: details.code,
+        blockedPaths: details.blockedPaths,
+        details,
+      },
+    );
+  }
+}
+
 test("priority/FIFO queue waits without a free worker, then dispatches in order", async (t) => {
   const { store, scheduler, project, worker } = createHarness(t, {
     workerStatus: "attention",
@@ -247,6 +268,43 @@ test("a queued turn automatically starts a stopped compatible worker", async (t)
         event.data?.action === "start",
     ),
   );
+});
+
+test("unsafe workspace preparation keeps attention and reports every blocked path", async (t) => {
+  const adapter = new WorkspaceRefusingFakeAdapter({ phaseMs: 1 });
+  const { store, scheduler, project, worker } = createHarness(t, { adapter });
+  const created = createTask(store, project.id, {
+    title: "Unsafe guest workspace",
+    message: "Do not discard pre-existing guest changes",
+  });
+
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention" &&
+      scheduler.status().activeTurns === 0,
+    "unsafe workspace refusal to preserve the worker",
+  );
+
+  const failedTurn = store.getTurn(created.turn.id);
+  const preservedWorker = store.getWorker(worker.id);
+  assert.equal(failedTurn.errorCode, "WORKSPACE_UNSAFE_CHANGES");
+  assert.match(preservedWorker.lastError, /Assets\/Removed\.prefab/u);
+  assert.match(preservedWorker.lastError, /secrets\/signing\.key/u);
+  const failure = store
+    .listTaskEvents(created.task.id)
+    .find((event) => event.type === "turn.failed");
+  assert.deepEqual(failure.data.blockedPaths, [
+    "Assets/Removed.prefab",
+    "secrets/signing.key",
+  ]);
+  assert.deepEqual(failure.data.workspaceRefusal.deletionPaths, [
+    "Assets/Removed.prefab",
+  ]);
+  assert.equal(store.getTask(created.task.id).status, "failed");
+  assert.equal(preservedWorker.currentTurnId, null);
 });
 
 test("a failed automatic worker start is surfaced once as attention", async (t) => {

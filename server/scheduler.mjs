@@ -342,12 +342,17 @@ export class Scheduler {
       }
       const error = errorWithCode(caught, "TURN_EXECUTION_FAILED");
       this.store.failTurn(context.turn.id, error, { preserveWorker: true });
+      const failureData = { code: error.code };
+      if (Array.isArray(error.blockedPaths) && error.blockedPaths.length) {
+        failureData.blockedPaths = error.blockedPaths;
+      }
+      if (error.details) failureData.workspaceRefusal = error.details;
       this.emitProgress(
         context,
         "failed",
         `${error.message}. Worker workspace was preserved and was not reset.`,
         "error",
-        { code: error.code },
+        failureData,
       );
     }
   }

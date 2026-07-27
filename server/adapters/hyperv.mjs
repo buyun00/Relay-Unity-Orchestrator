@@ -21,6 +21,23 @@ function required(value, label) {
   return value;
 }
 
+const workspaceRefusalMarker = "RELAY_WORKSPACE_REFUSED:";
+
+function parseWorkspaceRefusal(error) {
+  for (const text of [error?.stderr, error?.stdout, error?.message]) {
+    if (!text) continue;
+    const markerIndex = text.lastIndexOf(workspaceRefusalMarker);
+    if (markerIndex < 0) continue;
+    const candidate = text
+      .slice(markerIndex + workspaceRefusalMarker.length)
+      .split(/\r?\n/u, 1)[0]
+      .trim();
+    const parsed = parseJson(candidate, null);
+    if (parsed && parsed.ready === false) return parsed;
+  }
+  return null;
+}
+
 export class HyperVAdapter {
   constructor(
     config,
@@ -59,6 +76,22 @@ export class HyperVAdapter {
         timeoutMs,
       });
     } catch (error) {
+      const refusal = parseWorkspaceRefusal(error);
+      if (refusal) {
+        const blockedPaths = Array.isArray(refusal.blockedPaths)
+          ? refusal.blockedPaths.map(String)
+          : [];
+        const fallbackMessage =
+          "Workspace preparation refused" +
+          (blockedPaths.length ? ": " + blockedPaths.join(", ") : "");
+        throw Object.assign(new Error(refusal.message || fallbackMessage), {
+          code: refusal.code || "WORKSPACE_PREPARATION_REFUSED",
+          operation: scriptName,
+          blockedPaths,
+          details: refusal,
+          cause: error,
+        });
+      }
       error.operation = scriptName;
       error.code =
         error.code === "PROCESS_START_FAILED"
@@ -219,6 +252,15 @@ export class HyperVAdapter {
       },
       { signal },
     );
+    if (result.preservedBranch && result.preservedCommit) {
+      onProgress?.(
+        "workspace-preserved",
+        "Preserved pre-existing guest changes on " +
+          result.preservedBranch +
+          " at " +
+          result.preservedCommit,
+      );
+    }
     onProgress?.(
       "unity",
       "Guest Git branch, Unity, SMB, and Unity Skill are ready",

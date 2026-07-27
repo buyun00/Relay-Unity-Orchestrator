@@ -156,6 +156,78 @@ test("checkpoint-disabled preparation starts the real VM without restoring a sna
   );
 });
 
+test("workspace preparation surfaces structured refusal paths from PowerShell", async () => {
+  const refusal = {
+    ready: false,
+    code: "WORKSPACE_UNSAFE_CHANGES",
+    message:
+      "Workspace checkout refused because deletion status was detected: Assets/Removed.prefab",
+    blockedPaths: ["Assets/Removed.prefab"],
+    deletionPaths: ["Assets/Removed.prefab"],
+  };
+  const processRunner = async (command, args) => {
+    if (scriptName(args) === "Ensure-WorkerReady.ps1") {
+      return { exitCode: 0, stdout: '{"ready":true}', stderr: "" };
+    }
+    throw Object.assign(new Error("PowerShell exited with code 42"), {
+      code: "PROCESS_FAILED",
+      stdout: "",
+      stderr: "RELAY_WORKSPACE_REFUSED:" + JSON.stringify(refusal),
+    });
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    () => adapter.prepare(context(), {}),
+    (error) => {
+      assert.equal(error.code, "WORKSPACE_UNSAFE_CHANGES");
+      assert.equal(error.operation, "Prepare-Workspace.ps1");
+      assert.deepEqual(error.blockedPaths, ["Assets/Removed.prefab"]);
+      assert.deepEqual(error.details.deletionPaths, ["Assets/Removed.prefab"]);
+      assert.match(error.message, /Assets\/Removed\.prefab/u);
+      return true;
+    },
+  );
+});
+
+test("workspace preparation reports the verified preservation branch", async () => {
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify(
+        name === "Prepare-Workspace.ps1"
+          ? {
+              ready: true,
+              preservedBranch:
+                "relay/preserved/codex-task-0001-real-host-task-20260727T120000000Z",
+              preservedCommit: "a".repeat(40),
+            }
+          : { ready: true },
+      ),
+      stderr: "",
+    };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+  const progress = [];
+
+  await adapter.prepare(context(), {
+    onProgress: (phase, message) => progress.push({ phase, message }),
+  });
+
+  const preservation = progress.find(
+    (entry) => entry.phase === "workspace-preserved",
+  );
+  assert.match(preservation.message, /relay\/preserved\/codex-task-0001/u);
+  assert.match(preservation.message, new RegExp("a{40}", "u"));
+});
+
 test("preserved workspace continuation verifies readiness without restore or Git reset", async () => {
   const calls = [];
   const processRunner = async (command, args) => {
@@ -268,7 +340,7 @@ test("workspace preparation and finalization receive a repository-local Git iden
   }
 
   for (const scriptFile of [
-    "Prepare-Workspace.ps1",
+    "Prepare-Workspace.Guest.ps1",
     "Finalize-Workspace.ps1",
   ]) {
     const source = fs.readFileSync(
