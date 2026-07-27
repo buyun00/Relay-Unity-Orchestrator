@@ -20,6 +20,15 @@ function Complete-Inspection([object]$Result) {
     return $Result
 }
 
+function ConvertTo-InspectionArray {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return ,([object[]]@())
+    }
+    return ,([object[]]@($Value))
+}
+
 if (-not (Test-Path -LiteralPath $ProjectPath -PathType Container)) {
     return (Complete-Inspection ([pscustomobject]@{
         ready = $false
@@ -73,7 +82,10 @@ $auditedFiles = @(
         }
     }
 )
-$auditFingerprint = Get-RelayAuditFingerprint $head $auditedFiles
+$auditedFiles = ConvertTo-InspectionArray -Value $auditedFiles
+$auditFingerprint = Get-RelayAuditFingerprint `
+    -Head $head `
+    -AuditedFiles $auditedFiles
 
 # Hashing can race with an editor write. Re-read HEAD and every path before
 # returning so the adapter receives one coherent, immutable audit snapshot.
@@ -96,7 +108,10 @@ $auditedFilesAfter = @(
         }
     }
 )
-$auditFingerprintAfter = Get-RelayAuditFingerprint $headAfter $auditedFilesAfter
+$auditedFilesAfter = ConvertTo-InspectionArray -Value $auditedFilesAfter
+$auditFingerprintAfter = Get-RelayAuditFingerprint `
+    -Head $headAfter `
+    -AuditedFiles $auditedFilesAfter
 if ($headAfter -ne $head -or $auditFingerprintAfter -ne $auditFingerprint) {
     return (Complete-Inspection ([pscustomobject]@{
         ready = $false

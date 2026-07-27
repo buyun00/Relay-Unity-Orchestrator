@@ -217,6 +217,53 @@ function normalizeGitPath(value) {
   return normalized;
 }
 
+function normalizeNullableArray(value, label) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) {
+    throw Object.assign(new Error(`${label} must be an array or null`), {
+      code: "WORKSPACE_AUDIT_INVALID",
+      details: { [label]: value },
+    });
+  }
+  return [...value];
+}
+
+function normalizeInspection(inspection) {
+  if (
+    !inspection ||
+    typeof inspection !== "object" ||
+    Array.isArray(inspection)
+  )
+    return inspection;
+
+  const topLevelAuditedFiles = normalizeNullableArray(
+    inspection.auditedFiles,
+    "auditedFiles",
+  );
+  const auditChanges = inspection.audit
+    ? normalizeNullableArray(
+        inspection.audit.changes ?? topLevelAuditedFiles,
+        "audit.changes",
+      )
+    : topLevelAuditedFiles;
+  return {
+    ...inspection,
+    statusBefore: normalizeNullableArray(
+      inspection.statusBefore,
+      "statusBefore",
+    ),
+    porcelainV2: normalizeNullableArray(inspection.porcelainV2, "porcelainV2"),
+    untrackedFiles: normalizeNullableArray(
+      inspection.untrackedFiles,
+      "untrackedFiles",
+    ),
+    auditedFiles: auditChanges,
+    audit: inspection.audit
+      ? { ...inspection.audit, changes: auditChanges }
+      : inspection.audit,
+  };
+}
+
 function expectedStatus(code) {
   if (code === "??") return "A";
   if (code.includes("R")) return "R";
@@ -645,16 +692,18 @@ export class HyperVAdapter {
       "workspace-inspect",
       `Recording the current guest branch, HEAD, porcelain v2 status, and untracked files on ${context.worker.vmName}`,
     );
-    const inspection = await this.powershell(
-      "Inspect-PreservedWorkspace.ps1",
-      {
-        ...this.workerArguments(context.worker),
-        GuestProjectPath: required(
-          context.project.guestProjectPath,
-          "project.guestProjectPath",
-        ),
-      },
-      { signal },
+    const inspection = normalizeInspection(
+      await this.powershell(
+        "Inspect-PreservedWorkspace.ps1",
+        {
+          ...this.workerArguments(context.worker),
+          GuestProjectPath: required(
+            context.project.guestProjectPath,
+            "project.guestProjectPath",
+          ),
+        },
+        { signal },
+      ),
     );
     if (!inspection.ready || !inspection.repositoryExists) {
       throw Object.assign(
@@ -734,12 +783,59 @@ export class HyperVAdapter {
           "project.guestProjectPath",
         ),
         TaskBranch: required(context.task.branchName, "task.branchName"),
+        ExpectedHead: required(inspection.head, "inspection.head"),
+        AuditedFilesJson: JSON.stringify(inspection.auditedFiles),
       },
       { signal },
     );
+    const verificationStatus = normalizeNullableArray(
+      result.status,
+      "verification.status",
+    );
+    const verificationAuditedFiles = normalizeNullableArray(
+      result.auditedFiles,
+      "verification.auditedFiles",
+    );
+    if (
+      result.ready !== true ||
+      result.preserved !== true ||
+      result.branch !== context.task.branchName ||
+      result.head !== inspection.head ||
+      Number(result.changedFiles) !== 0 ||
+      verificationStatus.length !== 0 ||
+      verificationAuditedFiles.length !== 0
+    ) {
+      throw Object.assign(
+        new Error(
+          result.message ||
+            `Established task branch '${context.task.branchName}' is not a clean verified workspace; refusing to resume Codex`,
+        ),
+        {
+          code: result.code || "PRESERVED_WORKSPACE_VERIFICATION_FAILED",
+          details: {
+            branch: result.branch || inspection.branch || null,
+            head: result.head || inspection.head || null,
+            auditedFiles: inspection.auditedFiles,
+            inspection,
+            verification: {
+              ...result,
+              status: verificationStatus,
+              auditedFiles: verificationAuditedFiles,
+            },
+            transport: result.transport || inspection.transport || null,
+          },
+        },
+      );
+    }
     return this.finishPreservedResume(
       context,
-      { ...result, inspection, recoveryPrepared: false },
+      {
+        ...result,
+        status: verificationStatus,
+        auditedFiles: verificationAuditedFiles,
+        inspection,
+        recoveryPrepared: false,
+      },
       { onProgress },
     );
   }

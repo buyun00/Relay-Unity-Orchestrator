@@ -317,7 +317,9 @@ test("workspace preparation reports the verified preservation branch", async () 
 test("an established task branch uses preserved verification without restart or restore", async () => {
   const calls = [];
   const preservedContext = context();
-  preservedContext.task.codexThreadId = "thread-established-001";
+  preservedContext.task.number = 17;
+  preservedContext.task.branchName = "codex/task-0017-task";
+  preservedContext.task.codexThreadId = "019fa356-ef1d-75b1-b402-dd4adc895039";
   preservedContext.workspaceEstablished = true;
   const processRunner = async (command, args) => {
     const name = scriptName(args);
@@ -344,10 +346,22 @@ test("an established task branch uses preserved verification without restart or 
                   "# branch.head " + preservedContext.task.branchName,
                 ],
                 untrackedFiles: [],
+                auditedFiles: null,
+                audit: {
+                  version: 1,
+                  branch: preservedContext.task.branchName,
+                  head: "a".repeat(40),
+                  fingerprint: "b".repeat(64),
+                  changes: null,
+                },
               }
             : {
                 ready: true,
                 branch: preservedContext.task.branchName,
+                head: "a".repeat(40),
+                changedFiles: 0,
+                status: null,
+                auditedFiles: null,
                 preserved: true,
               },
       ),
@@ -388,6 +402,101 @@ test("an established task branch uses preserved verification without restart or 
   assert.equal(
     verification.args[verification.args.indexOf("-TaskBranch") + 1],
     preservedContext.task.branchName,
+  );
+  assert.equal(
+    verification.args[verification.args.indexOf("-ExpectedHead") + 1],
+    "a".repeat(40),
+  );
+  assert.deepEqual(
+    JSON.parse(
+      verification.args[verification.args.indexOf("-AuditedFilesJson") + 1],
+    ),
+    [],
+  );
+});
+
+test("a dirty established task branch returns branch, HEAD, audit, and transport diagnostics without recovery", async () => {
+  const calls = [];
+  const preservedContext = context();
+  preservedContext.task.number = 17;
+  preservedContext.task.branchName = "codex/task-0017-task";
+  preservedContext.task.codexThreadId = "019fa356-ef1d-75b1-b402-dd4adc895039";
+  preservedContext.workspaceEstablished = true;
+  const auditedFile = {
+    code: "??",
+    path: "baloot_client/Assets/Incident/dirty.meta",
+    originalPath: null,
+    auditBlob: "c".repeat(40),
+  };
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push({ name, args });
+    const payload =
+      name === "Inspect-PreservedWorkspace.ps1"
+        ? {
+            ready: true,
+            repositoryExists: true,
+            branch: preservedContext.task.branchName,
+            head: "a".repeat(40),
+            porcelainV2: ["? " + auditedFile.path],
+            untrackedFiles: [auditedFile.path],
+            auditedFiles: [auditedFile],
+            audit: {
+              version: 1,
+              branch: preservedContext.task.branchName,
+              head: "a".repeat(40),
+              fingerprint: "b".repeat(64),
+              changes: [auditedFile],
+            },
+            transport: {
+              boundary: "PowerShellDirect",
+              resultRecords: 1,
+              auditedFilesCount: 1,
+            },
+          }
+        : {
+            ready: false,
+            preserved: true,
+            code: "PRESERVED_WORKSPACE_DIRTY",
+            message: "Established task branch is not clean",
+            branch: preservedContext.task.branchName,
+            head: "a".repeat(40),
+            changedFiles: 1,
+            status: [{ code: "??", path: auditedFile.path }],
+            auditedFiles: [auditedFile],
+            transport: {
+              boundary: "PowerShellDirect",
+              resultRecords: 1,
+              auditedFilesParameters: 1,
+              auditedFilesCount: 1,
+            },
+          };
+    return { exitCode: 0, stdout: JSON.stringify(payload), stderr: "" };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    () => adapter.resumePreserved(preservedContext, {}),
+    (error) => {
+      assert.equal(error.code, "PRESERVED_WORKSPACE_DIRTY");
+      assert.equal(error.details.branch, preservedContext.task.branchName);
+      assert.equal(error.details.head, "a".repeat(40));
+      assert.deepEqual(error.details.auditedFiles, [auditedFile]);
+      assert.equal(error.details.transport.boundary, "PowerShellDirect");
+      assert.equal(error.details.transport.auditedFilesParameters, 1);
+      return true;
+    },
+  );
+  assert.deepEqual(
+    calls.map((call) => call.name),
+    ["Inspect-PreservedWorkspace.ps1", "Verify-PreservedWorkspace.ps1"],
+  );
+  assert.deepEqual(
+    JSON.parse(calls[1].args[calls[1].args.indexOf("-AuditedFilesJson") + 1]),
+    [auditedFile],
   );
 });
 
@@ -988,6 +1097,34 @@ test("Codex turns pin the Relay model, reasoning effort, and standard speed", as
   assert.match(prompt, /Invoke-UnityDialogGuardAction\.ps1/);
   assert.match(prompt, /VMName unity-worker-01/);
   assert.match(prompt, /Never authorize a high-risk action/);
+});
+
+test("task 17 invokes Codex resume with the existing durable thread instead of starting a new one", async (t) => {
+  const logDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runner-resume-"),
+  );
+  t.after(() => fs.rmSync(logDirectory, { recursive: true, force: true }));
+  const calls = [];
+  const runner = new CodexRunner(config({ logDirectory }), {
+    processRunner: async (command, args, options) => {
+      calls.push({ command, args, options });
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  const taskContext = context();
+  const threadId = "019fa356-ef1d-75b1-b402-dd4adc895039";
+  taskContext.task.number = 17;
+  taskContext.task.branchName = "codex/task-0017-task";
+  taskContext.task.codexThreadId = threadId;
+
+  const result = await runner.run(taskContext, {});
+
+  assert.equal(result.threadId, threadId);
+  assert.equal(calls.length, 1);
+  const [{ args }] = calls;
+  const execIndex = args.indexOf("exec");
+  assert.equal(args[execIndex + 1], "resume");
+  assert.deepEqual(args.slice(-3), ["--", threadId, "-"]);
 });
 
 test("Codex turns use task-level model, reasoning, and Fast overrides", async (t) => {

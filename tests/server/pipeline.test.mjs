@@ -118,6 +118,7 @@ class TrackingFakeAdapter extends FakeAdapter {
   recoveryCalls = 0;
   releaseCalls = 0;
   controlCalls = [];
+  codexContexts = [];
 
   async prepare(...args) {
     this.prepareCalls += 1;
@@ -137,6 +138,14 @@ class TrackingFakeAdapter extends FakeAdapter {
   async recoverPreserved(...args) {
     this.recoveryCalls += 1;
     return super.recoverPreserved(...args);
+  }
+
+  async runCodex(context, ...args) {
+    this.codexContexts.push({
+      branchName: context.task.branchName,
+      codexThreadId: context.task.codexThreadId,
+    });
+    return super.runCodex(context, ...args);
   }
 
   async release(...args) {
@@ -585,6 +594,78 @@ test("a message after delivery failure resumes the preserved worker without prep
           event.message.includes(
             "without checkpoint restore, worker restart, or Git reset",
           ),
+      ),
+  );
+});
+
+test("clean task 17 recovery resumes its durable Codex thread without branch recovery", async (t) => {
+  const config = createConfig();
+  const adapter = new TrackingFakeAdapter(config);
+  const store = new Store(config);
+  const { project, worker } = seedProjectAndWorker(store);
+  const scheduler = new Scheduler({ config, store, adapter });
+  t.after(async () => {
+    scheduler.stop();
+    await waitUntil(
+      () => scheduler.controllers.size === 0 && scheduler.pumping === false,
+      "scheduler cleanup",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  const created = createTask(store, project.id, {
+    title: "Task 17 preserved continuation",
+    message: "Preserve this established workspace",
+  });
+  const threadId = "019fa356-ef1d-75b1-b402-dd4adc895039";
+  const branchName = "codex/task-0017-task";
+  store.db
+    .prepare("UPDATE tasks SET task_number=17, branch_name=? WHERE id=?")
+    .run(branchName, created.task.id);
+  store.setTaskThread(created.task.id, threadId);
+  const claimed = store.claimNextTurn();
+  assert.equal(claimed.turn.id, created.turn.id);
+  store.failTurn(
+    created.turn.id,
+    Object.assign(new Error("Keep the established task branch"), {
+      code: "PRESERVED_FAILURE",
+    }),
+    { preserveWorker: true },
+  );
+  assert.equal(store.getWorker(worker.id).status, "attention");
+
+  const continued = store.appendTurn(created.task.id, {
+    message: "Continue the existing thread",
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(continued.id).status === "success" &&
+      scheduler.status().activeTurns === 0,
+    "task 17 preserved continuation",
+  );
+
+  assert.equal(adapter.resumeCalls, 1);
+  assert.equal(adapter.verifyCalls, 1);
+  assert.equal(adapter.recoveryCalls, 0);
+  assert.equal(adapter.prepareCalls, 0);
+  assert.deepEqual(adapter.controlCalls, []);
+  assert.deepEqual(adapter.codexContexts, [
+    { branchName, codexThreadId: threadId },
+  ]);
+  assert.equal(store.getTask(created.task.id).branchName, branchName);
+  assert.equal(store.getTask(created.task.id).codexThreadId, threadId);
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some(
+        (event) =>
+          event.turnId === continued.id &&
+          event.type === "turn.codex" &&
+          event.message === `Resuming Codex conversation ${threadId}`,
       ),
   );
 });

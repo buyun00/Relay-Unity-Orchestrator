@@ -9,6 +9,12 @@ const guestScript = path.resolve("scripts/hyperv/Prepare-Workspace.Guest.ps1");
 const inspectGuestScript = path.resolve(
   "scripts/hyperv/Inspect-PreservedWorkspace.Guest.ps1",
 );
+const inspectHostScript = path.resolve(
+  "scripts/hyperv/Inspect-PreservedWorkspace.ps1",
+);
+const verifyHostScript = path.resolve(
+  "scripts/hyperv/Verify-PreservedWorkspace.ps1",
+);
 const recoverHostScript = path.resolve("scripts/hyperv/Recover-Workspace.ps1");
 const taskBranch = "codex/task-0017-task";
 
@@ -137,6 +143,86 @@ function inspect(project) {
   return JSON.parse(stdout.trim());
 }
 
+function powershellQuote(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function runHostWorkspaceScript(
+  t,
+  hostScript,
+  project,
+  parameters,
+  expectedArgumentCount,
+) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-host-guest-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const credentialPath = path.join(root, "credential.xml");
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)",
+    `$credential = New-Object System.Management.Automation.PSCredential('relay-test', (ConvertTo-SecureString 'test' -AsPlainText -Force))`,
+    `$credential | Export-Clixml -LiteralPath ${powershellQuote(credentialPath)}`,
+    `function global:Invoke-Command {
+      param(
+        [string]$VMName,
+        [pscredential]$Credential,
+        [object[]]$ArgumentList,
+        [scriptblock]$ScriptBlock
+      )
+      if ($ArgumentList.Count -ne ${expectedArgumentCount}) {
+        throw "Expected ${expectedArgumentCount} PowerShell Direct arguments, received $($ArgumentList.Count)."
+      }
+      & $ScriptBlock @ArgumentList
+    }`,
+    `& ${powershellQuote(hostScript)} -VMName 'fake-vm' -CredentialPath ${powershellQuote(
+      credentialPath,
+    )} -GuestProjectPath ${powershellQuote(project)} ${parameters}`,
+  ].join("; ");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const result = spawnSync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encoded,
+    ],
+    {
+      cwd: path.resolve("."),
+      encoding: "utf8",
+      windowsHide: true,
+    },
+  );
+  assert.equal(
+    result.status,
+    0,
+    `PowerShell host/guest regression failed:\n${result.stderr}\n${result.stdout}`,
+  );
+  return JSON.parse(result.stdout.trim());
+}
+
+function inspectThroughHost(t, project) {
+  return runHostWorkspaceScript(t, inspectHostScript, project, "", 3);
+}
+
+function verifyThroughHost(t, project, auditedFiles) {
+  const head = git(project, "rev-parse", "HEAD");
+  return runHostWorkspaceScript(
+    t,
+    verifyHostScript,
+    project,
+    [
+      `-TaskBranch ${powershellQuote(taskBranch)}`,
+      `-ExpectedHead ${powershellQuote(head)}`,
+      `-AuditedFilesJson ${powershellQuote(JSON.stringify(auditedFiles))}`,
+    ].join(" "),
+    6,
+  );
+}
+
 function prepare(
   project,
   repository,
@@ -229,7 +315,14 @@ function runRecoveryHostWrapper(t, guestPayload, { throwGuest = false } = {}) {
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   return spawnSync(
     "powershell.exe",
-    ["-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encoded,
+    ],
     {
       cwd: path.resolve("."),
       encoding: "utf8",
@@ -250,6 +343,103 @@ test("a clean established workspace produces an empty coherent audit", (t) => {
   assert.deepEqual(inspection.auditedFiles, []);
   assert.deepEqual(inspection.audit.changes, []);
   assert.match(inspection.audit.fingerprint, /^[0-9a-f]{64}$/u);
+});
+
+test("real host/guest verification normalizes empty and null audits into one PowerShell Direct parameter", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-clean-task-branch");
+  const prepared = prepare(project, repository);
+  assert.equal(prepared.ready, true);
+  assert.equal(prepared.branch, taskBranch);
+  const branchBefore = git(project, "branch", "--show-current");
+  const headBefore = git(project, "rev-parse", "HEAD");
+  const preservationRefsBefore = refs(project, "refs/heads/relay/preserved/");
+
+  for (const auditedFiles of [[], null]) {
+    const result = verifyThroughHost(t, project, auditedFiles);
+    assert.equal(result.ready, true);
+    assert.equal(result.preserved, true);
+    assert.equal(result.branch, taskBranch);
+    assert.equal(result.head, headBefore);
+    assert.equal(result.changedFiles, 0);
+    assert.deepEqual(result.status, []);
+    assert.deepEqual(result.auditedFiles, []);
+    assert.equal(result.transport.auditedFilesParameters, 1);
+    assert.equal(result.transport.auditedFilesCount, 0);
+  }
+
+  const inspection = inspectThroughHost(t, project);
+  assert.equal(inspection.ready, true);
+  assert.deepEqual(inspection.auditedFiles, []);
+  assert.deepEqual(inspection.audit.changes, []);
+  assert.equal(inspection.transport.auditedFilesCount, 0);
+  assert.equal(git(project, "branch", "--show-current"), branchBefore);
+  assert.equal(git(project, "rev-parse", "HEAD"), headBefore);
+  assert.deepEqual(
+    refs(project, "refs/heads/relay/preserved/"),
+    preservationRefsBefore,
+  );
+});
+
+test("real host/guest verification refuses one or many dirty audited files without mutation", (t) => {
+  for (const count of [1, 2]) {
+    const repository = createRepository(t);
+    const project = clone(repository, `guest-dirty-task-branch-${count}`);
+    const prepared = prepare(project, repository);
+    assert.equal(prepared.ready, true);
+    for (let index = 0; index < count; index += 1) {
+      write(
+        path.join(
+          project,
+          "baloot_client",
+          "Assets",
+          "Incident",
+          `dirty-${index}.meta`,
+        ),
+        `fileFormatVersion: 2\nguid: dirty-${count}-${index}\n`,
+      );
+    }
+    const branchBefore = git(project, "branch", "--show-current");
+    const headBefore = git(project, "rev-parse", "HEAD");
+    const statusBefore = gitNulFields(
+      project,
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+    );
+    const preservationRefsBefore = refs(project, "refs/heads/relay/preserved/");
+    const inspection = inspectThroughHost(t, project);
+    assert.equal(inspection.auditedFiles.length, count);
+
+    const result = verifyThroughHost(t, project, inspection.auditedFiles);
+
+    assert.equal(result.ready, false);
+    assert.equal(result.preserved, true);
+    assert.equal(result.code, "PRESERVED_WORKSPACE_DIRTY");
+    assert.equal(result.branch, taskBranch);
+    assert.equal(result.head, headBefore);
+    assert.equal(result.changedFiles, count);
+    assert.equal(result.auditedFiles.length, count);
+    assert.equal(result.transport.auditedFilesParameters, 1);
+    assert.equal(result.transport.auditedFilesCount, count);
+    assert.equal(git(project, "branch", "--show-current"), branchBefore);
+    assert.equal(git(project, "rev-parse", "HEAD"), headBefore);
+    assert.deepEqual(
+      gitNulFields(
+        project,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+      ),
+      statusBefore,
+    );
+    assert.deepEqual(
+      refs(project, "refs/heads/relay/preserved/"),
+      preservationRefsBefore,
+    );
+  }
 });
 
 test("recovery preserves every tracked and untracked task-0017 file before target checkout", (t) => {
@@ -645,7 +835,14 @@ test("the raw NUL parser preserves an embedded newline instead of joining record
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   const output = execFileSync(
     "powershell.exe",
-    ["-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encoded,
+    ],
     { encoding: "utf8", windowsHide: true },
   );
   assert.deepEqual(JSON.parse(output.trim()), ["M", "中文 路径\n文件.asset"]);

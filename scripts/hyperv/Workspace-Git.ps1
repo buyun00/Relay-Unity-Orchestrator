@@ -297,10 +297,14 @@ function Get-RelayPathBlob {
 function Get-RelayExpectedChanges {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [object[]]$Status
     )
 
+    if ($null -eq $Status) {
+        $Status = [object[]]@()
+    }
     $changes = New-Object System.Collections.Generic.List[object]
     foreach ($entry in $Status) {
         $code = [string]$entry.code
@@ -393,13 +397,21 @@ function Get-RelayChangeKey {
 function Compare-RelayChangeSets {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [object[]]$Expected,
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [object[]]$Actual
     )
 
+    if ($null -eq $Expected) {
+        $Expected = [object[]]@()
+    }
+    if ($null -eq $Actual) {
+        $Actual = [object[]]@()
+    }
     $expectedSet = New-Object 'System.Collections.Generic.HashSet[string]' (
         [System.StringComparer]::Ordinal
     )
@@ -436,10 +448,14 @@ function Get-RelayAuditFingerprint {
     param(
         [Parameter(Mandatory = $true)][string]$Head,
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [object[]]$AuditedFiles
     )
 
+    if ($null -eq $AuditedFiles) {
+        $AuditedFiles = [object[]]@()
+    }
     $records = @(
         foreach ($file in $AuditedFiles) {
             $code = [string]$file.code
@@ -470,11 +486,15 @@ function Test-RelayPreservationCommit {
         [Parameter(Mandatory = $true)][string]$Commit,
         [Parameter(Mandatory = $true)][string]$AuditHead,
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [object[]]$AuditedFiles,
         [string]$AuditFingerprint
     )
 
+    if ($null -eq $AuditedFiles) {
+        $AuditedFiles = [object[]]@()
+    }
     try {
         $commitType = Get-RelayGitValue $RepositoryPath @('cat-file', '-t', $Commit)
         if ($commitType -ne 'commit') {
