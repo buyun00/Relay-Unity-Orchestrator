@@ -411,13 +411,37 @@ function Test-RelayPreservationCommit {
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string]$Commit,
         [Parameter(Mandatory = $true)][string]$AuditHead,
-        [Parameter(Mandatory = $true)][object[]]$AuditedFiles
+        [Parameter(Mandatory = $true)][object[]]$AuditedFiles,
+        [string]$AuditFingerprint
     )
 
     try {
         $commitType = Get-RelayGitValue $RepositoryPath @('cat-file', '-t', $Commit)
         if ($commitType -ne 'commit') {
-            return [pscustomobject]@{ valid = $false; reason = "'$Commit' is not a commit." }
+            return [pscustomobject]@{
+                valid = $false
+                reason = "'$Commit' is not a commit."
+                parentVerified = $false
+                nameStatusVerified = $false
+                treeVerified = $false
+                blobVerified = $false
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($AuditFingerprint)) {
+            $commitMessage = Get-RelayGitValue $RepositoryPath @(
+                'log', '-1', '--format=%B', $Commit
+            )
+            $fingerprintMarker = "Relay-Audit-Fingerprint: $AuditFingerprint"
+            if (@($commitMessage -split '\r?\n') -notcontains $fingerprintMarker) {
+                return [pscustomobject]@{
+                    valid = $false
+                    reason = "Commit '$Commit' did not contain the audited fingerprint '$AuditFingerprint'."
+                    parentVerified = $false
+                    nameStatusVerified = $false
+                    treeVerified = $false
+                    blobVerified = $false
+                }
+            }
         }
         $parentLine = Get-RelayGitValue $RepositoryPath @(
             'rev-list', '--parents', '-n', '1', $Commit
@@ -427,6 +451,10 @@ function Test-RelayPreservationCommit {
             return [pscustomobject]@{
                 valid = $false
                 reason = "Commit '$Commit' parent did not equal audited HEAD '$AuditHead'."
+                parentVerified = $false
+                nameStatusVerified = $false
+                treeVerified = $false
+                blobVerified = $false
             }
         }
 
@@ -440,6 +468,10 @@ function Test-RelayPreservationCommit {
                 changes = $actualChanges
                 missing = $comparison.missing
                 unexpected = $comparison.unexpected
+                parentVerified = $true
+                nameStatusVerified = $false
+                treeVerified = $false
+                blobVerified = $false
             }
         }
         if (@($actualChanges | Where-Object { $_.status.StartsWith('D') }).Count -gt 0) {
@@ -447,6 +479,10 @@ function Test-RelayPreservationCommit {
                 valid = $false
                 reason = "Commit '$Commit' contained a deletion."
                 changes = $actualChanges
+                parentVerified = $true
+                nameStatusVerified = $false
+                treeVerified = $false
+                blobVerified = $false
             }
         }
 
@@ -462,6 +498,10 @@ function Test-RelayPreservationCommit {
                     valid = $false
                     reason = "Commit '$Commit' blob for '$path' did not equal its audit blob."
                     changes = $actualChanges
+                    parentVerified = $true
+                    nameStatusVerified = $true
+                    treeVerified = $false
+                    blobVerified = $false
                 }
             }
             $files.Add([pscustomobject]@{
@@ -481,11 +521,19 @@ function Test-RelayPreservationCommit {
             tree = $tree
             changes = $actualChanges
             files = $files.ToArray()
+            parentVerified = $true
+            nameStatusVerified = $true
+            treeVerified = $true
+            blobVerified = $true
         }
     } catch {
         return [pscustomobject]@{
             valid = $false
             reason = $_.Exception.Message
+            parentVerified = $false
+            nameStatusVerified = $false
+            treeVerified = $false
+            blobVerified = $false
         }
     }
 }

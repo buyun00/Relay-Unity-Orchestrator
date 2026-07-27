@@ -84,6 +84,92 @@ function context() {
   };
 }
 
+function recoveryProof({
+  taskBranch,
+  auditedHead,
+  auditFingerprint,
+  auditedPath,
+  auditBlob,
+  preservedBlob = auditBlob,
+  reused = false,
+}) {
+  const preservationBranch =
+    "relay/preserved/task-0001-real-host-task-20260727T120000000Z-acde1234abcd";
+  const preservationCommit = "2".repeat(40);
+  const verifiedFiles = [
+    {
+      path: auditedPath,
+      code: "??",
+      originalPath: null,
+      auditBlob,
+      preservedBlob,
+    },
+  ];
+  return {
+    proofVersion: 1,
+    proven: true,
+    auditFingerprint,
+    auditedHead,
+    preservationBranch,
+    preservationCommit,
+    preservationParent: auditedHead,
+    reused,
+    parentVerified: true,
+    nameStatusVerified: true,
+    treeVerified: true,
+    blobVerified: true,
+    verifiedFiles,
+    statusAfter: [],
+    taskBranch,
+    taskBranchCreated: true,
+    currentBranch: taskBranch,
+    ready: true,
+    branch: taskBranch,
+    originalHead: auditedHead,
+    preservedBranch: preservationBranch,
+    preservedCommit: preservationCommit,
+    preservedTree: "3".repeat(40),
+    preservedNameStatus: [
+      { status: "A", path: auditedPath, originalPath: null },
+    ],
+    preservedFiles: verifiedFiles,
+    reusedPreservation: reused,
+    preservationVerified: true,
+    preTargetCheckoutBranch: "main",
+    preTargetCheckoutHead: auditedHead,
+  };
+}
+
+function recoveryInspection({
+  auditedHead,
+  auditFingerprint,
+  auditedPath,
+  auditBlob,
+}) {
+  return {
+    ready: true,
+    repositoryExists: true,
+    branch: "main",
+    head: auditedHead,
+    porcelainV2: ["# branch.head main", `? ${auditedPath}`],
+    untrackedFiles: [auditedPath],
+    audit: {
+      version: 1,
+      branch: "main",
+      head: auditedHead,
+      fingerprint: auditFingerprint,
+      changes: [
+        {
+          code: "??",
+          path: auditedPath,
+          originalPath: null,
+          auditBlob,
+        },
+      ],
+    },
+  };
+}
+
 test("host preflight combines real Hyper-V inventory and Codex login state", async () => {
   const calls = [];
   const processRunner = async (command, args) => {
@@ -312,7 +398,7 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
   recoveryContext.workspaceEstablished = false;
   const auditedMeta =
     "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
-  const auditBlob = "4".repeat(40);
+  const auditBlob = "3033568a1999ebaf6328b316315239ed67cd19a5";
   const auditFingerprint = "5".repeat(64);
   const processRunner = async (command, args) => {
     const name = scriptName(args);
@@ -353,35 +439,13 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
             untrackedFiles: [auditedMeta],
           }
         : name === "Recover-Workspace.ps1"
-          ? {
-              ready: true,
-              branch: recoveryContext.task.branchName,
-              preservedBranch:
-                "relay/preserved/task-0001-real-host-task-20260727T120000000Z-acde1234abcd",
-              preservedCommit: "2".repeat(40),
-              preservedTree: "3".repeat(40),
-              preservedNameStatus: [
-                {
-                  status: "A",
-                  path: auditedMeta,
-                  originalPath: null,
-                },
-              ],
-              preservedFiles: [
-                {
-                  path: auditedMeta,
-                  code: "??",
-                  originalPath: null,
-                  auditBlob,
-                  preservedBlob: auditBlob,
-                },
-              ],
-              originalHead: "1".repeat(40),
+          ? recoveryProof({
+              taskBranch: recoveryContext.task.branchName,
+              auditedHead: "1".repeat(40),
               auditFingerprint,
-              preservationVerified: true,
-              preTargetCheckoutBranch: "main",
-              preTargetCheckoutHead: "1".repeat(40),
-            }
+              auditedPath: auditedMeta,
+              auditBlob,
+            })
           : {
               ready: true,
               vm: true,
@@ -404,6 +468,17 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
 
   assert.equal(result.preserved, true);
   assert.equal(result.recoveryPrepared, true);
+  assert.equal(result.proofVersion, 1);
+  assert.equal(result.proven, true);
+  assert.equal(result.auditedHead, "1".repeat(40));
+  assert.equal(result.preservationParent, "1".repeat(40));
+  assert.equal(result.parentVerified, true);
+  assert.equal(result.nameStatusVerified, true);
+  assert.equal(result.treeVerified, true);
+  assert.equal(result.blobVerified, true);
+  assert.equal(result.taskBranch, recoveryContext.task.branchName);
+  assert.equal(result.taskBranchCreated, true);
+  assert.equal(result.currentBranch, recoveryContext.task.branchName);
   assert.deepEqual(
     calls.map((call) => call.name),
     [
@@ -507,24 +582,16 @@ test("recovery proof failure stops before health, checkpoint, reset, clean, or r
     if (name === "Recover-Workspace.ps1") {
       return {
         exitCode: 0,
-        stdout: JSON.stringify({
-          ready: true,
-          originalHead: "1".repeat(40),
-          auditFingerprint,
-          preservedBranch:
-            "relay/preserved/task-0001-real-host-task-20260727T120000000Z-acde1234abcd",
-          preservedCommit: "2".repeat(40),
-          preservedTree: "3".repeat(40),
-          preservedNameStatus: [{ status: "A", path: auditedPath }],
-          preservedFiles: [
-            {
-              path: auditedPath,
-              auditBlob,
-              preservedBlob: "8".repeat(40),
-            },
-          ],
-          preservationVerified: true,
-        }),
+        stdout: JSON.stringify(
+          recoveryProof({
+            taskBranch: recoveryContext.task.branchName,
+            auditedHead: "1".repeat(40),
+            auditFingerprint,
+            auditedPath,
+            auditBlob,
+            preservedBlob: "8".repeat(40),
+          }),
+        ),
         stderr: "",
       };
     }
@@ -554,6 +621,156 @@ test("recovery proof failure stops before health, checkpoint, reset, clean, or r
       ].includes(name),
     ),
     false,
+  );
+});
+
+test("successful recovery with empty stdout is diagnosed without a fallback result", async () => {
+  const calls = [];
+  const recoveryContext = context();
+  const auditedPath =
+    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
+  const auditBlob = "3033568a1999ebaf6328b316315239ed67cd19a5";
+  const auditedHead = "1".repeat(40);
+  const auditFingerprint = "9".repeat(64);
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push(name);
+    if (name === "Inspect-PreservedWorkspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(
+          recoveryInspection({
+            auditedHead,
+            auditFingerprint,
+            auditedPath,
+            auditBlob,
+          }),
+        ),
+        stderr: "",
+      };
+    }
+    if (name === "Recover-Workspace.ps1") {
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    throw new Error(`Unexpected call ${name}`);
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    () => adapter.resumePreserved(recoveryContext, {}),
+    (error) => {
+      assert.equal(error.code, "RECOVERY_PROOF_EMPTY_STDOUT");
+      assert.equal(error.operation, "Recover-Workspace.ps1");
+      assert.equal(error.exitCode, 0);
+      assert.equal(error.stdout, "");
+      assert.equal(error.stderr, "");
+      assert.equal(error.parseError, null);
+      assert.deepEqual(error.missingFields, []);
+      assert.deepEqual(error.details.transport, {
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        parseError: null,
+        missingFields: [],
+      });
+      return true;
+    },
+  );
+  assert.deepEqual(calls, [
+    "Inspect-PreservedWorkspace.ps1",
+    "Recover-Workspace.ps1",
+  ]);
+});
+
+test("a missing recovery proof field is recorded separately and stops before health", async () => {
+  const calls = [];
+  const recoveryContext = context();
+  const auditedPath = "baloot_client/Assets/中文 恢复/Automation.meta";
+  const auditBlob = "3033568a1999ebaf6328b316315239ed67cd19a5";
+  const auditedHead = "1".repeat(40);
+  const auditFingerprint = "a".repeat(64);
+  const completeProof = recoveryProof({
+    taskBranch: recoveryContext.task.branchName,
+    auditedHead,
+    auditFingerprint,
+    auditedPath,
+    auditBlob,
+  });
+  delete completeProof.blobVerified;
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push(name);
+    if (name === "Inspect-PreservedWorkspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(
+          recoveryInspection({
+            auditedHead,
+            auditFingerprint,
+            auditedPath,
+            auditBlob,
+          }),
+        ),
+        stderr: "",
+      };
+    }
+    if (name === "Recover-Workspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(completeProof),
+        stderr: "",
+      };
+    }
+    throw new Error(`Unexpected call ${name}`);
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    () => adapter.resumePreserved(recoveryContext, {}),
+    (error) => {
+      assert.equal(error.code, "RECOVERY_PROOF_FIELDS_MISSING");
+      assert.deepEqual(error.missingFields, ["blobVerified"]);
+      assert.equal(error.parseError, null);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, [
+    "Inspect-PreservedWorkspace.ps1",
+    "Recover-Workspace.ps1",
+  ]);
+});
+
+test("invalid recovery JSON records the parse error independently", async () => {
+  const adapter = new HyperVAdapter(config(), {
+    processRunner: async () => ({
+      exitCode: 0,
+      stdout: '{"message":"中文\\nline",',
+      stderr: "native warning",
+    }),
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    () =>
+      adapter.powershell(
+        "Recover-Workspace.ps1",
+        {},
+        { responseContract: "recovery-proof" },
+      ),
+    (error) => {
+      assert.equal(error.code, "RECOVERY_PROOF_JSON_INVALID");
+      assert.equal(error.exitCode, 0);
+      assert.match(error.parseError, /JSON/u);
+      assert.equal(error.stderr, "native warning");
+      assert.deepEqual(error.missingFields, []);
+      return true;
+    },
   );
 });
 

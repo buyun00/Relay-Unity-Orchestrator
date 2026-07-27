@@ -12,7 +12,8 @@ param(
     [string]$AuditJson,
     [string]$SharePath,
     [string]$UnityHealthUrl,
-    [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
+    [ValidateRange(30, 900)][int]$TimeoutSeconds = 300,
+    [switch]$OutputObject
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,39 +40,68 @@ $guestSource = [System.IO.File]::ReadAllText(
     $guestScriptPath,
     [System.Text.Encoding]::UTF8
 )
-$gitResult = Invoke-Command -VMName $VMName -Credential $credential -ArgumentList @(
+$remoteOutput = @(
+    Invoke-Command -VMName $VMName -Credential $credential -ArgumentList @(
     $GuestProjectPath, $RepoUrl, $BaseBranch, $TaskBranch, $Mode,
     $GitAuthorName, $GitAuthorEmail, $AuditJson, $helperSource, $guestSource
 ) -ScriptBlock {
-    param(
-        $ProjectPath, $RepositoryUrl, $Base, $Branch, $RequestedMode,
-        $AuthorName, $AuthorEmail, $AuditJson, $HelperSource, $GuestSource
-    )
-    $ErrorActionPreference = 'Stop'
-    Set-StrictMode -Version Latest
-    . ([scriptblock]::Create($HelperSource))
-    & ([scriptblock]::Create($GuestSource)) `
-        -ProjectPath $ProjectPath `
-        -RepositoryUrl $RepositoryUrl `
-        -Base $Base `
-        -Branch $Branch `
-        -RequestedMode $RequestedMode `
-        -AuthorName $AuthorName `
-        -AuthorEmail $AuthorEmail `
-        -AuditJson $AuditJson
+        param(
+            $ProjectPath, $RepositoryUrl, $Base, $Branch, $RequestedMode,
+            $AuthorName, $AuthorEmail, $AuditJson, $HelperSource, $GuestSource
+        )
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version Latest
+        . ([scriptblock]::Create($HelperSource))
+        & ([scriptblock]::Create($GuestSource)) `
+            -ProjectPath $ProjectPath `
+            -RepositoryUrl $RepositoryUrl `
+            -Base $Base `
+            -Branch $Branch `
+            -RequestedMode $RequestedMode `
+            -AuthorName $AuthorName `
+            -AuthorEmail $AuthorEmail `
+            -AuditJson $AuditJson `
+            -OutputJson
+    }
+)
+$remoteRecords = @(
+    $remoteOutput |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+)
+if ($remoteRecords.Count -ne 1) {
+    throw "Guest workspace preparation returned $($remoteRecords.Count) success-stream records; exactly one JSON object was required."
+}
+try {
+    $gitResult = $remoteRecords[0] | ConvertFrom-Json
+} catch {
+    throw "Guest workspace preparation did not return valid JSON: $($_.Exception.Message)"
+}
+if ($null -eq $gitResult -or $gitResult -isnot [psobject]) {
+    throw 'Guest workspace preparation returned JSON that was not an object.'
 }
 
 if (-not [bool]$gitResult.ready) {
     $refusal = $gitResult | Select-Object -Property @(
-        'ready', 'code', 'message', 'projectPath', 'originalBranch', 'originalHead',
+        'proofVersion', 'proven', 'ready', 'code', 'message', 'phase', 'reason',
+        'refusal', 'projectPath', 'originalBranch', 'originalHead',
         'statusBefore', 'porcelainV2Before', 'untrackedFilesBefore', 'blockedPaths',
         'deletionPaths', 'prohibitedPaths', 'unsupportedChanges', 'preservedBranch',
         'preservedCommit', 'preservedTree', 'preservedNameStatus',
         'preservedFiles', 'auditedFiles', 'auditFingerprint', 'reusedPreservation',
-        'preservationVerified', 'preTargetCheckoutBranch', 'preTargetCheckoutHead'
+        'preservationVerified', 'preTargetCheckoutBranch', 'preTargetCheckoutHead',
+        'auditedHead', 'preservationBranch', 'preservationCommit',
+        'preservationParent', 'reused', 'parentVerified', 'nameStatusVerified',
+        'treeVerified', 'blobVerified', 'verifiedFiles', 'statusAfter', 'taskBranch',
+        'taskBranchCreated', 'currentBranch'
     )
+    if ($OutputObject) {
+        return $refusal
+    }
+    $refusalJson = $refusal | ConvertTo-Json -Depth 12 -Compress
+    [Console]::Out.WriteLine($refusalJson)
     [Console]::Error.WriteLine(
-        "RELAY_WORKSPACE_REFUSED:$($refusal | ConvertTo-Json -Depth 12 -Compress)"
+        "RELAY_WORKSPACE_REFUSED:$refusalJson"
     )
     exit 42
 }
@@ -103,7 +133,10 @@ if (-not [string]::IsNullOrWhiteSpace($SharePath) -and -not (Test-Path -LiteralP
     throw "Host SMB workspace '$SharePath' is not reachable."
 }
 
-[pscustomobject]@{
+$result = [pscustomobject]@{
+    proofVersion = $gitResult.proofVersion
+    proven = $gitResult.proven
+    ready = $true
     vmName = $VMName
     workspace = $gitResult.projectPath
     branch = $gitResult.branch
@@ -125,7 +158,25 @@ if (-not [string]::IsNullOrWhiteSpace($SharePath) -and -not (Test-Path -LiteralP
     preservationVerified = $gitResult.preservationVerified
     preTargetCheckoutBranch = $gitResult.preTargetCheckoutBranch
     preTargetCheckoutHead = $gitResult.preTargetCheckoutHead
+    auditedHead = $gitResult.auditedHead
+    preservationBranch = $gitResult.preservationBranch
+    preservationCommit = $gitResult.preservationCommit
+    preservationParent = $gitResult.preservationParent
+    reused = $gitResult.reused
+    parentVerified = $gitResult.parentVerified
+    nameStatusVerified = $gitResult.nameStatusVerified
+    treeVerified = $gitResult.treeVerified
+    blobVerified = $gitResult.blobVerified
+    verifiedFiles = $gitResult.verifiedFiles
+    statusAfter = $gitResult.statusAfter
+    taskBranch = $gitResult.taskBranch
+    taskBranchCreated = $gitResult.taskBranchCreated
+    currentBranch = $gitResult.currentBranch
     unityReady = $unityReady
     skillReady = $skillReady
     smbReady = [string]::IsNullOrWhiteSpace($SharePath) -or (Test-Path -LiteralPath $SharePath)
-} | ConvertTo-Json -Depth 8 -Compress
+}
+if ($OutputObject) {
+    return $result
+}
+[Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 12 -Compress))

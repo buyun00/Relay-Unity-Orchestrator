@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexRunner } from "../codex-runner.mjs";
 import { runProcess } from "../process.mjs";
-import { parseJson, resolveWorkerTemplate } from "../util.mjs";
+import { resolveWorkerTemplate } from "../util.mjs";
 
 const scriptsDirectory = fileURLToPath(
   new URL("../../scripts/hyperv/", import.meta.url),
@@ -22,20 +22,181 @@ function required(value, label) {
 }
 
 const workspaceRefusalMarker = "RELAY_WORKSPACE_REFUSED:";
+const recoveryProofFields = [
+  "proofVersion",
+  "proven",
+  "auditFingerprint",
+  "auditedHead",
+  "preservationBranch",
+  "preservationCommit",
+  "preservationParent",
+  "reused",
+  "parentVerified",
+  "nameStatusVerified",
+  "treeVerified",
+  "blobVerified",
+  "verifiedFiles",
+  "statusAfter",
+  "taskBranch",
+  "taskBranchCreated",
+  "currentBranch",
+];
+
+function parseJsonRecord(text) {
+  try {
+    return { value: JSON.parse(text), error: null };
+  } catch (error) {
+    return { value: null, error: error.message };
+  }
+}
 
 function parseWorkspaceRefusal(error) {
   for (const text of [error?.stderr, error?.stdout, error?.message]) {
     if (!text) continue;
+    const complete = parseJsonRecord(text.trim()).value;
+    if (
+      complete &&
+      typeof complete === "object" &&
+      !Array.isArray(complete) &&
+      (complete.ready === false ||
+        complete.proven === false ||
+        complete.refusal)
+    ) {
+      return complete;
+    }
     const markerIndex = text.lastIndexOf(workspaceRefusalMarker);
     if (markerIndex < 0) continue;
     const candidate = text
       .slice(markerIndex + workspaceRefusalMarker.length)
       .split(/\r?\n/u, 1)[0]
       .trim();
-    const parsed = parseJson(candidate, null);
-    if (parsed && parsed.ready === false) return parsed;
+    const parsed = parseJsonRecord(candidate).value;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      (parsed.ready === false || parsed.proven === false || parsed.refusal)
+    ) {
+      return parsed;
+    }
   }
   return null;
+}
+
+function transportRecord(
+  result,
+  { parseError = null, missingFields = [] } = {},
+) {
+  return {
+    exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : null,
+    stdout: String(result?.stdout || ""),
+    stderr: String(result?.stderr || ""),
+    parseError,
+    missingFields: [...missingFields],
+  };
+}
+
+function recoveryTransportError(code, message, operation, transport) {
+  return Object.assign(new Error(message), {
+    code,
+    operation,
+    ...transport,
+    details: { transport },
+  });
+}
+
+function parseRecoveryResult(operation, result) {
+  const stdout = String(result.stdout || "").trim();
+  if (!stdout) {
+    const transport = transportRecord(result);
+    throw recoveryTransportError(
+      "RECOVERY_PROOF_EMPTY_STDOUT",
+      `Recovery command ${operation} exited successfully but stdout was empty`,
+      operation,
+      transport,
+    );
+  }
+
+  const parsedRecord = parseJsonRecord(stdout);
+  if (parsedRecord.error) {
+    const transport = transportRecord(result, {
+      parseError: parsedRecord.error,
+    });
+    throw recoveryTransportError(
+      "RECOVERY_PROOF_JSON_INVALID",
+      `Recovery command ${operation} returned invalid JSON: ${parsedRecord.error}`,
+      operation,
+      transport,
+    );
+  }
+  const proof = parsedRecord.value;
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) {
+    const transport = transportRecord(result, {
+      parseError: "Recovery stdout JSON was not an object",
+    });
+    throw recoveryTransportError(
+      "RECOVERY_PROOF_JSON_INVALID",
+      `Recovery command ${operation} did not return one JSON object`,
+      operation,
+      transport,
+    );
+  }
+
+  const missingFields = recoveryProofFields.filter(
+    (field) => !Object.hasOwn(proof, field),
+  );
+  if (missingFields.length) {
+    const transport = transportRecord(result, { missingFields });
+    throw recoveryTransportError(
+      "RECOVERY_PROOF_FIELDS_MISSING",
+      `Recovery proof was missing required fields: ${missingFields.join(", ")}`,
+      operation,
+      transport,
+    );
+  }
+
+  const invalidFields = [];
+  if (proof.proofVersion !== 1) invalidFields.push("proofVersion");
+  if (proof.proven !== true) invalidFields.push("proven");
+  for (const field of [
+    "reused",
+    "parentVerified",
+    "nameStatusVerified",
+    "treeVerified",
+    "blobVerified",
+    "taskBranchCreated",
+  ]) {
+    if (typeof proof[field] !== "boolean") invalidFields.push(field);
+  }
+  for (const field of [
+    "auditFingerprint",
+    "auditedHead",
+    "preservationBranch",
+    "preservationCommit",
+    "preservationParent",
+    "taskBranch",
+    "currentBranch",
+  ]) {
+    if (typeof proof[field] !== "string" || !proof[field]) {
+      invalidFields.push(field);
+    }
+  }
+  if (!Array.isArray(proof.verifiedFiles)) invalidFields.push("verifiedFiles");
+  if (!Array.isArray(proof.statusAfter)) invalidFields.push("statusAfter");
+  if (invalidFields.length) {
+    const transport = transportRecord(result);
+    transport.invalidFields = invalidFields;
+    throw Object.assign(
+      recoveryTransportError(
+        "RECOVERY_PROOF_FIELDS_INVALID",
+        `Recovery proof contained invalid fields: ${invalidFields.join(", ")}`,
+        operation,
+        transport,
+      ),
+      { invalidFields },
+    );
+  }
+  return proof;
 }
 
 function normalizeGitPath(value) {
@@ -117,12 +278,16 @@ function requireInspectionAudit(inspection) {
   return audit;
 }
 
-function validateRecoveryProof(inspection, recovery) {
+function validateRecoveryProof(inspection, recovery, taskBranch) {
   const audit = requireInspectionAudit(inspection);
   if (
-    recovery.originalHead !== audit.head ||
+    recovery.proofVersion !== 1 ||
+    recovery.proven !== true ||
+    recovery.auditedHead !== audit.head ||
+    recovery.preservationParent !== audit.head ||
     recovery.auditFingerprint !== audit.fingerprint ||
-    !/^[0-9a-f]{40}$/iu.test(recovery.preservedCommit || "") ||
+    !/^[0-9a-f]{40}$/iu.test(recovery.preservationCommit || "") ||
+    !/^[0-9a-f]{40}$/iu.test(recovery.preservationParent || "") ||
     !/^[0-9a-f]{40}$/iu.test(recovery.preservedTree || "")
   ) {
     throw Object.assign(
@@ -132,6 +297,28 @@ function validateRecoveryProof(inspection, recovery) {
       {
         code: "WORKSPACE_AUDIT_MISMATCH",
         details: { inspection, recovery },
+      },
+    );
+  }
+  if (
+    recovery.parentVerified !== true ||
+    recovery.nameStatusVerified !== true ||
+    recovery.treeVerified !== true ||
+    recovery.blobVerified !== true ||
+    recovery.taskBranch !== taskBranch ||
+    recovery.currentBranch !== taskBranch ||
+    recovery.taskBranchCreated !== true ||
+    recovery.statusAfter.length !== 0 ||
+    recovery.preservationBranch !== recovery.preservedBranch ||
+    recovery.preservationCommit !== recovery.preservedCommit
+  ) {
+    throw Object.assign(
+      new Error(
+        "Recovery proof did not attest a verified preservation and clean new task branch; the worker remains in attention",
+      ),
+      {
+        code: "WORKSPACE_PRESERVATION_UNPROVEN",
+        details: { inspection, recovery, taskBranch },
       },
     );
   }
@@ -163,13 +350,18 @@ function validateRecoveryProof(inspection, recovery) {
   }
 
   const preservedFiles = new Map(
-    (Array.isArray(recovery.preservedFiles) ? recovery.preservedFiles : []).map(
+    (Array.isArray(recovery.verifiedFiles) ? recovery.verifiedFiles : []).map(
       (file) => [normalizeGitPath(file.path), file],
     ),
   );
-  if (preservedFiles.size !== recovery.preservedFiles?.length) {
+  if (
+    preservedFiles.size !== recovery.verifiedFiles.length ||
+    preservedFiles.size !== audit.changes.length
+  ) {
     throw Object.assign(
-      new Error("Recovery proof contained duplicate preserved file paths"),
+      new Error(
+        "Recovery proof contained duplicate, missing, or unexpected verified file paths",
+      ),
       {
         code: "WORKSPACE_PRESERVATION_UNPROVEN",
         details: { inspection, recovery },
@@ -214,7 +406,7 @@ export class HyperVAdapter {
   async powershell(
     scriptName,
     namedArguments,
-    { signal, timeoutMs = 15 * 60_000 } = {},
+    { signal, timeoutMs = 15 * 60_000, responseContract = "default" } = {},
   ) {
     const args = [
       "-NoLogo",
@@ -238,6 +430,7 @@ export class HyperVAdapter {
     } catch (error) {
       const refusal = parseWorkspaceRefusal(error);
       if (refusal) {
+        const transport = transportRecord(error);
         const blockedPaths = Array.isArray(refusal.blockedPaths)
           ? refusal.blockedPaths.map(String)
           : [];
@@ -248,19 +441,38 @@ export class HyperVAdapter {
           code: refusal.code || "WORKSPACE_PREPARATION_REFUSED",
           operation: scriptName,
           blockedPaths,
-          details: refusal,
+          exitCode: transport.exitCode,
+          stdout: transport.stdout,
+          stderr: transport.stderr,
+          parseError: transport.parseError,
+          missingFields: transport.missingFields,
+          details: { ...refusal, transport },
           cause: error,
         });
       }
+      const parsedError = String(error?.stdout || "").trim()
+        ? parseJsonRecord(String(error.stdout).trim()).error
+        : null;
+      const transport = transportRecord(error, { parseError: parsedError });
       error.operation = scriptName;
       error.code =
         error.code === "PROCESS_START_FAILED"
           ? "POWERSHELL_NOT_AVAILABLE"
-          : "HYPERV_COMMAND_FAILED";
+          : responseContract === "recovery-proof"
+            ? "RECOVERY_COMMAND_FAILED"
+            : "HYPERV_COMMAND_FAILED";
+      Object.assign(error, transport);
+      error.details = {
+        ...(error.details || {}),
+        transport,
+      };
       throw error;
     }
+    if (responseContract === "recovery-proof") {
+      return parseRecoveryResult(scriptName, result);
+    }
     const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
-    const parsed = parseJson(lines.at(-1), null);
+    const parsed = parseJsonRecord(lines.at(-1) || "").value;
     return parsed || { stdout: result.stdout.trim() };
   }
 
@@ -559,12 +771,14 @@ export class HyperVAdapter {
           context.worker,
         ),
       },
-      { signal },
+      { signal, responseContract: "recovery-proof" },
     );
     if (
-      !result.preservationVerified ||
-      !result.preservedBranch ||
-      !result.preservedCommit
+      !result.proven ||
+      !result.parentVerified ||
+      !result.nameStatusVerified ||
+      !result.treeVerified ||
+      !result.blobVerified
     ) {
       throw Object.assign(
         new Error(
@@ -576,7 +790,11 @@ export class HyperVAdapter {
         },
       );
     }
-    validateRecoveryProof(inspection, result);
+    validateRecoveryProof(
+      inspection,
+      result,
+      required(context.task.branchName, "task.branchName"),
+    );
     onProgress?.(
       "workspace-preserved",
       `Verified ${result.preservedBranch} at ${result.preservedCommit} before creating ${context.task.branchName}`,
@@ -589,8 +807,8 @@ export class HyperVAdapter {
         untrackedFiles: Array.isArray(result.untrackedFilesBefore)
           ? result.untrackedFilesBefore
           : [],
-        preservedBranch: result.preservedBranch,
-        preservedCommit: result.preservedCommit,
+        preservedBranch: result.preservationBranch,
+        preservedCommit: result.preservationCommit,
         preservedTree: result.preservedTree || null,
         preservedNameStatus: Array.isArray(result.preservedNameStatus)
           ? result.preservedNameStatus
@@ -599,7 +817,7 @@ export class HyperVAdapter {
           ? result.preservedFiles
           : [],
         auditFingerprint: result.auditFingerprint || null,
-        reusedPreservation: Boolean(result.reusedPreservation),
+        reusedPreservation: Boolean(result.reused),
         preservationVerified: true,
         preTargetCheckoutBranch: result.preTargetCheckoutBranch || null,
         preTargetCheckoutHead: result.preTargetCheckoutHead || null,

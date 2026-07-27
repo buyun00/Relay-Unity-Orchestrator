@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,7 @@ const guestScript = path.resolve("scripts/hyperv/Prepare-Workspace.Guest.ps1");
 const inspectGuestScript = path.resolve(
   "scripts/hyperv/Inspect-PreservedWorkspace.Guest.ps1",
 );
+const recoverHostScript = path.resolve("scripts/hyperv/Recover-Workspace.ps1");
 const taskBranch = "codex/task-0017-task";
 
 function git(cwd, ...args) {
@@ -133,7 +134,7 @@ function inspect(project) {
     ],
     { cwd: path.resolve("."), encoding: "utf8", windowsHide: true },
   );
-  return JSON.parse(stdout.trim().split(/\r?\n/u).at(-1));
+  return JSON.parse(stdout.trim());
 }
 
 function prepare(
@@ -173,13 +174,68 @@ function prepare(
     encoding: "utf8",
     windowsHide: true,
   });
-  return JSON.parse(stdout.trim().split(/\r?\n/u).at(-1));
+  return JSON.parse(stdout.trim());
 }
 
 function refs(project, ...prefixes) {
   return git(project, "for-each-ref", "--format=%(refname)", ...prefixes)
     .split(/\r?\n/u)
     .filter(Boolean);
+}
+
+function runRecoveryHostWrapper(t, guestPayload, { throwGuest = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-recovery-host-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const credentialPath = path.join(root, "credential.xml");
+  const payloadBase64 = Buffer.from(
+    JSON.stringify(guestPayload ?? {}),
+    "utf8",
+  ).toString("base64");
+  const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)",
+    `$credential = New-Object System.Management.Automation.PSCredential('relay-test', (ConvertTo-SecureString 'test' -AsPlainText -Force))`,
+    `$credential | Export-Clixml -LiteralPath ${quote(credentialPath)}`,
+    `$global:relayGuestJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payloadBase64}'))`,
+    "$global:relayInvokeCount = 0",
+    `function global:Invoke-Command {
+      param(
+        [string]$VMName,
+        [pscredential]$Credential,
+        [object[]]$ArgumentList,
+        [scriptblock]$ScriptBlock
+      )
+      $global:relayInvokeCount += 1
+      if ($global:relayInvokeCount -eq 1) {
+        if (${throwGuest ? "$true" : "$false"}) {
+          throw '模拟 guest exception'
+        }
+        $decorated = [psobject]$global:relayGuestJson
+        $decorated | Add-Member NoteProperty PSComputerName 'guest-01' -Force
+        $decorated | Add-Member NoteProperty RunspaceId ([Guid]::NewGuid()) -Force
+        $decorated | Add-Member NoteProperty PSShowComputerName $true -Force
+        return $decorated
+      }
+      return $true
+    }`,
+    `& ${quote(recoverHostScript)} -VMName 'fake-vm' -CredentialPath ${quote(
+      credentialPath,
+    )} -GuestProjectPath 'D:\\Work\\中文 Project' -RepoUrl 'https://example.test/repo.git' -BaseBranch 'main' -TaskBranch ${quote(
+      taskBranch,
+    )} -AuditJson '{}' -TimeoutSeconds 30`,
+  ].join("; ");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  return spawnSync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+    {
+      cwd: path.resolve("."),
+      encoding: "utf8",
+      windowsHide: true,
+    },
+  );
 }
 
 test("recovery preserves every tracked and untracked task-0017 file before target checkout", (t) => {
@@ -218,11 +274,27 @@ test("recovery preserves every tracked and untracked task-0017 file before targe
   );
 
   assert.equal(result.ready, true, JSON.stringify(result, null, 2));
+  assert.equal(result.proofVersion, 1);
+  assert.equal(result.proven, true);
   assert.equal(result.originalBranch, "main");
   assert.equal(result.originalHead, originalHead);
+  assert.equal(result.auditedHead, originalHead);
   assert.equal(result.auditFingerprint, inspection.audit.fingerprint);
   assert.equal(result.source, "origin/main");
   assert.equal(result.preservationVerified, true);
+  assert.equal(result.preservationBranch, result.preservedBranch);
+  assert.equal(result.preservationCommit, result.preservedCommit);
+  assert.equal(result.preservationParent, originalHead);
+  assert.equal(result.reused, false);
+  assert.equal(result.parentVerified, true);
+  assert.equal(result.nameStatusVerified, true);
+  assert.equal(result.treeVerified, true);
+  assert.equal(result.blobVerified, true);
+  assert.deepEqual(result.verifiedFiles, result.preservedFiles);
+  assert.deepEqual(result.statusAfter, []);
+  assert.equal(result.taskBranch, taskBranch);
+  assert.equal(result.taskBranchCreated, true);
+  assert.equal(result.currentBranch, taskBranch);
   assert.equal(result.preTargetCheckoutBranch, "main");
   assert.equal(result.preTargetCheckoutHead, originalHead);
   assert.match(
@@ -565,7 +637,131 @@ test("the raw NUL parser preserves an embedded newline instead of joining record
   assert.deepEqual(JSON.parse(output.trim()), ["M", "中文 路径\n文件.asset"]);
 });
 
-test("an interrupted preservation ref is validated and reused without creating another branch", (t) => {
+test("the real host recovery wrapper emits one clean JSON proof through simulated PS Direct", (t) => {
+  const auditedPath = "baloot_client/Assets/中文 恢复\nAutomation.meta";
+  const auditBlob = "3033568a1999ebaf6328b316315239ed67cd19a5";
+  const auditedHead = "1".repeat(40);
+  const preservationBranch =
+    "relay/preserved/task-0017-task-20260727T120000000Z-abcdef123456";
+  const preservationCommit = "2".repeat(40);
+  const verifiedFiles = [
+    {
+      path: auditedPath,
+      code: "??",
+      originalPath: null,
+      auditBlob,
+      preservedBlob: auditBlob,
+    },
+  ];
+  const guestPayload = {
+    proofVersion: 1,
+    proven: true,
+    auditFingerprint: "a".repeat(64),
+    auditedHead,
+    preservationBranch,
+    preservationCommit,
+    preservationParent: auditedHead,
+    reused: true,
+    parentVerified: true,
+    nameStatusVerified: true,
+    treeVerified: true,
+    blobVerified: true,
+    verifiedFiles,
+    statusAfter: [],
+    taskBranch,
+    taskBranchCreated: true,
+    currentBranch: taskBranch,
+    ready: true,
+    projectPath: "D:\\Work\\中文 Project",
+    branch: taskBranch,
+    head: "3".repeat(40),
+    source: "origin/main",
+    originalBranch: "main",
+    originalHead: auditedHead,
+    statusBefore: [{ code: "??", path: auditedPath, originalPath: null }],
+    porcelainV2Before: ["# branch.head main", `? ${auditedPath}`],
+    untrackedFilesBefore: [auditedPath],
+    auditedFiles: verifiedFiles,
+    preservedBranch: preservationBranch,
+    preservedCommit: preservationCommit,
+    preservedTree: "4".repeat(40),
+    preservedNameStatus: [
+      { status: "A", path: auditedPath, originalPath: null },
+    ],
+    preservedFiles: verifiedFiles,
+    reusedPreservation: true,
+    preservationVerified: true,
+    preTargetCheckoutBranch: "main",
+    preTargetCheckoutHead: auditedHead,
+    stdoutBytes: [0, 10, 255],
+    PSComputerName: "polluting-guest",
+  };
+
+  const completed = runRecoveryHostWrapper(t, guestPayload);
+
+  assert.equal(completed.status, 0, completed.stderr);
+  const stdout = completed.stdout.trim();
+  assert.equal(stdout.split(/\r?\n/u).length, 1);
+  const proof = JSON.parse(stdout);
+  assert.equal(proof.proofVersion, 1);
+  assert.equal(proof.proven, true);
+  assert.equal(proof.reused, true);
+  assert.equal(proof.preservationParent, auditedHead);
+  assert.equal(proof.verifiedFiles[0].path, auditedPath);
+  assert.equal(proof.verifiedFiles[0].preservedBlob, auditBlob);
+  assert.deepEqual(proof.statusAfter, []);
+  assert.equal(proof.currentBranch, taskBranch);
+  assert.equal("stdoutBytes" in proof, false);
+  assert.equal("PSComputerName" in proof, false);
+  assert.equal("RunspaceId" in proof, false);
+  assert.equal("PSShowComputerName" in proof, false);
+});
+
+test("the real host recovery wrapper emits a structured refusal with a nonzero exit", (t) => {
+  const refusal = {
+    proofVersion: 1,
+    proven: false,
+    ready: false,
+    code: "WORKSPACE_PRESERVATION_AMBIGUOUS",
+    phase: "preservation-discovery",
+    reason: "WORKSPACE_PRESERVATION_AMBIGUOUS",
+    message: "Multiple preservation candidates matched.",
+    refusal: {
+      phase: "preservation-discovery",
+      reason: "WORKSPACE_PRESERVATION_AMBIGUOUS",
+      code: "WORKSPACE_PRESERVATION_AMBIGUOUS",
+      message: "Multiple preservation candidates matched.",
+    },
+    taskBranch,
+    taskBranchCreated: false,
+    currentBranch: "main",
+  };
+
+  const completed = runRecoveryHostWrapper(t, refusal);
+
+  assert.notEqual(completed.status, 0, completed.stderr);
+  const result = JSON.parse(completed.stdout.trim());
+  assert.equal(result.proven, false);
+  assert.equal(result.refusal.phase, "preservation-discovery");
+  assert.equal(result.refusal.reason, "WORKSPACE_PRESERVATION_AMBIGUOUS");
+  assert.equal(result.taskBranchCreated, false);
+  assert.match(completed.stderr, /RELAY_WORKSPACE_REFUSED:/u);
+});
+
+test("the real host recovery wrapper emits a structured exceptional result", (t) => {
+  const completed = runRecoveryHostWrapper(t, null, { throwGuest: true });
+
+  assert.equal(completed.status, 1);
+  const result = JSON.parse(completed.stdout.trim());
+  assert.equal(result.proven, false);
+  assert.equal(result.code, "RECOVERY_HOST_EXCEPTION");
+  assert.equal(result.phase, "host-wrapper");
+  assert.equal(result.reason, "RECOVERY_HOST_EXCEPTION");
+  assert.match(result.message, /guest exception/u);
+  assert.match(completed.stderr, /RELAY_RECOVERY_FAILED:/u);
+});
+
+test("a preservation ref created before receipt interruption is validated and reused without duplication", (t) => {
   const repository = createRepository(t);
   const project = clone(repository, "guest-partial-preservation");
   const untrackedPath = "baloot_client/Assets/中断 恢复/Automation.meta";
@@ -589,6 +785,8 @@ test("an interrupted preservation ref is validated and reused without creating a
     originalHead,
     "-m",
     `chore(relay): preserve workspace before ${taskBranch}`,
+    "-m",
+    `Relay-Audit-Fingerprint: ${inspection.audit.fingerprint}`,
   );
   const partialBranch =
     "relay/preserved/task-0017-task-20260727T000000000Z-partial000001";
@@ -609,6 +807,7 @@ test("an interrupted preservation ref is validated and reused without creating a
   );
 
   assert.equal(result.reusedPreservation, true);
+  assert.equal(result.reused, true);
   assert.equal(result.preservedBranch, partialBranch);
   assert.equal(result.preservedCommit, partialCommit);
   assert.deepEqual(
@@ -648,6 +847,9 @@ test("an invalid partial preservation ref keeps recovery blocked before task bra
   );
 
   assert.equal(result.ready, false);
+  assert.equal(result.proven, false);
+  assert.equal(result.refusal.phase, "preservation-discovery");
+  assert.equal(result.refusal.reason, "WORKSPACE_PRESERVATION_AMBIGUOUS");
   assert.equal(result.code, "WORKSPACE_PRESERVATION_AMBIGUOUS");
   assert.equal(git(project, "branch", "--show-current"), "main");
   assert.equal(git(project, "rev-parse", "HEAD"), originalHead);

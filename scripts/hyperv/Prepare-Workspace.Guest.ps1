@@ -27,6 +27,14 @@ $script:preTargetCheckoutHead = $null
 $script:auditedFiles = @()
 $script:auditFingerprint = $null
 $script:reusedPreservation = $false
+$script:preservationParent = $null
+$script:parentVerified = $false
+$script:nameStatusVerified = $false
+$script:treeVerified = $false
+$script:blobVerified = $false
+$script:verifiedFiles = @()
+$script:taskBranchCreated = $false
+$script:currentBranch = $null
 
 if (-not (Get-Command Invoke-RelayGit -CommandType Function -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot 'Workspace-Git.ps1')
@@ -92,6 +100,20 @@ function Complete-Result([object]$Result) {
     return $Result
 }
 
+function Get-RefusalPhase([string]$Code) {
+    switch -Regex ($Code) {
+        '^WORKSPACE_AUDIT_' { return 'audit-validation' }
+        '^WORKSPACE_(?:UNSAFE|UNSUPPORTED|DETACHED)' { return 'workspace-safety' }
+        '^WORKSPACE_PRESERVATION_AMBIGUOUS$' { return 'preservation-discovery' }
+        '^WORKSPACE_CHANGED_DURING_PRESERVATION$' { return 'preservation-tree' }
+        '^WORKSPACE_PRESERVATION_UNPROVEN$' { return 'preservation-proof' }
+        '^WORKSPACE_CHANGED_BEFORE_TARGET_CHECKOUT$' { return 'pre-target-checkout' }
+        '^WORKSPACE_TARGET_BRANCH_' { return 'target-branch-precheck' }
+        '^WORKSPACE_TARGET_NOT_CLEAN$' { return 'target-checkout-verification' }
+        default { return 'workspace-recovery' }
+    }
+}
+
 function New-RefusalResult(
     [string]$Code,
     [string]$Message,
@@ -105,10 +127,22 @@ function New-RefusalResult(
     [string]$PreservedBranch = $null,
     [string]$PreservedCommit = $null
 ) {
+    $phase = Get-RefusalPhase $Code
+    $refusal = [pscustomobject]@{
+        phase = $phase
+        reason = $Code
+        code = $Code
+        message = $Message
+    }
     return [pscustomobject]@{
+        proofVersion = 1
+        proven = $false
         ready = $false
         code = $Code
         message = $Message
+        phase = $phase
+        reason = $Code
+        refusal = $refusal
         projectPath = $ProjectPath
         originalBranch = $OriginalBranch
         originalHead = $OriginalHead
@@ -130,6 +164,20 @@ function New-RefusalResult(
         preservationVerified = $script:preservationVerified
         preTargetCheckoutBranch = $script:preTargetCheckoutBranch
         preTargetCheckoutHead = $script:preTargetCheckoutHead
+        auditedHead = $OriginalHead
+        preservationBranch = $PreservedBranch
+        preservationCommit = $PreservedCommit
+        preservationParent = $script:preservationParent
+        reused = $script:reusedPreservation
+        parentVerified = $script:parentVerified
+        nameStatusVerified = $script:nameStatusVerified
+        treeVerified = $script:treeVerified
+        blobVerified = $script:blobVerified
+        verifiedFiles = @($script:verifiedFiles)
+        statusAfter = @()
+        taskBranch = $Branch
+        taskBranchCreated = $script:taskBranchCreated
+        currentBranch = $script:currentBranch
     }
 }
 
@@ -211,6 +259,7 @@ function Test-WorkspaceMatchesAudit(
 
 $observedBranch = Get-GitValue @('branch', '--show-current')
 $observedHead = Get-GitValue @('rev-parse', '--verify', 'HEAD')
+$script:currentBranch = $observedBranch
 $observedStatus = @(Get-WorkspaceStatus)
 $observedFiles = @(Get-AuditedFiles $observedStatus)
 $observedFingerprint = Get-RelayAuditFingerprint $observedHead $observedFiles
@@ -475,7 +524,8 @@ if ($shouldPreserve) {
     $validCandidates = New-Object System.Collections.Generic.List[object]
     foreach ($candidate in $matchingRefs) {
         $proof = Test-RelayPreservationCommit `
-            $ProjectPath $candidate.commit $originalHead $script:auditedFiles
+            $ProjectPath $candidate.commit $originalHead $script:auditedFiles `
+            $script:auditFingerprint
         if ($proof.valid) {
             $validCandidates.Add([pscustomobject]@{
                 branch = $candidate.branch
@@ -524,7 +574,8 @@ if ($shouldPreserve) {
             $subject = Get-GitValue @('log', '-1', '--format=%s', $candidateCommit)
             if ($subject -ne $commitMessage) { continue }
             $proof = Test-RelayPreservationCommit `
-                $ProjectPath $candidateCommit $originalHead $script:auditedFiles
+                $ProjectPath $candidateCommit $originalHead $script:auditedFiles `
+                $script:auditFingerprint
             if ($proof.valid) {
                 $validUnreachable.Add([pscustomobject]@{
                     commit = $candidateCommit
@@ -600,7 +651,8 @@ if ($shouldPreserve) {
                 '-m', "Relay-Audit-Fingerprint: $($script:auditFingerprint)"
             )
             $candidateProof = Test-RelayPreservationCommit `
-                $ProjectPath $preservedCommit $originalHead $script:auditedFiles
+                $ProjectPath $preservedCommit $originalHead $script:auditedFiles `
+                $script:auditFingerprint
             if (-not $candidateProof.valid) {
                 $refusalArguments = @{
                     Code = 'WORKSPACE_PRESERVATION_UNPROVEN'
@@ -639,9 +691,46 @@ if ($shouldPreserve) {
     if ($branchCommit -ne $preservedCommit) {
         throw "Preserved branch '$preservedBranch' did not resolve to '$preservedCommit'."
     }
+    $requiredCandidateProperties = @(
+        'parent', 'tree', 'changes', 'files', 'parentVerified',
+        'nameStatusVerified', 'treeVerified', 'blobVerified'
+    )
+    $missingCandidateProperties = @(
+        $requiredCandidateProperties |
+            Where-Object { $candidateProof.PSObject.Properties.Name -notcontains $_ }
+    )
+    if (
+        $missingCandidateProperties.Count -gt 0 -or
+        -not [bool]$candidateProof.parentVerified -or
+        -not [bool]$candidateProof.nameStatusVerified -or
+        -not [bool]$candidateProof.treeVerified -or
+        -not [bool]$candidateProof.blobVerified -or
+        [string]$candidateProof.parent -ne $originalHead
+    ) {
+        $refusalArguments = @{
+            Code = 'WORKSPACE_PRESERVATION_UNPROVEN'
+            Message = "Preservation candidate proof was incomplete before target branch creation; missing: $($missingCandidateProperties -join ', ')."
+            Status = $statusBefore
+            BlockedPaths = @()
+            DeletionPaths = @()
+            ProhibitedPaths = @()
+            UnsupportedChanges = @()
+            OriginalBranch = $originalBranch
+            OriginalHead = $originalHead
+            PreservedBranch = $preservedBranch
+            PreservedCommit = $preservedCommit
+        }
+        return (Complete-Result (New-RefusalResult @refusalArguments))
+    }
     $script:preservedTree = $candidateProof.tree
     $script:preservedNameStatus = @($candidateProof.changes)
     $script:preservedFiles = @($candidateProof.files)
+    $script:preservationParent = $candidateProof.parent
+    $script:parentVerified = [bool]$candidateProof.parentVerified
+    $script:nameStatusVerified = [bool]$candidateProof.nameStatusVerified
+    $script:treeVerified = [bool]$candidateProof.treeVerified
+    $script:blobVerified = [bool]$candidateProof.blobVerified
+    $script:verifiedFiles = @($candidateProof.files)
     $preservedFiles = @($candidateProof.files)
 
     $preTarget = Test-WorkspaceMatchesAudit `
@@ -741,10 +830,12 @@ if ($localTaskExists) {
     Invoke-Git @('checkout', $Branch) | Out-Null
 } else {
     Invoke-Git @('checkout', '-b', $Branch, $source) | Out-Null
+    $script:taskBranchCreated = $true
 }
 
 $head = Get-GitValue @('rev-parse', 'HEAD')
 $checkedOutBranch = Get-GitValue @('branch', '--show-current')
+$script:currentBranch = $checkedOutBranch
 if ($checkedOutBranch -ne $Branch -or $head -ne $sourceHead) {
     throw "Target checkout verification failed: branch '$checkedOutBranch' at '$head', expected '$Branch' at '$sourceHead'."
 }
@@ -768,6 +859,8 @@ if ($statusAfter.Count -gt 0) {
 }
 
 $result = [pscustomobject]@{
+    proofVersion = 1
+    proven = $RequestedMode -ne 'recovery' -or $script:preservationVerified
     ready = $true
     projectPath = $ProjectPath
     branch = $Branch
@@ -791,5 +884,19 @@ $result = [pscustomobject]@{
     preservationVerified = $script:preservationVerified
     preTargetCheckoutBranch = $script:preTargetCheckoutBranch
     preTargetCheckoutHead = $script:preTargetCheckoutHead
+    auditedHead = $originalHead
+    preservationBranch = $preservedBranch
+    preservationCommit = $preservedCommit
+    preservationParent = $script:preservationParent
+    reused = $script:reusedPreservation
+    parentVerified = $script:parentVerified
+    nameStatusVerified = $script:nameStatusVerified
+    treeVerified = $script:treeVerified
+    blobVerified = $script:blobVerified
+    verifiedFiles = @($script:verifiedFiles)
+    statusAfter = $statusAfter
+    taskBranch = $Branch
+    taskBranchCreated = $script:taskBranchCreated
+    currentBranch = $checkedOutBranch
 }
 Complete-Result $result
