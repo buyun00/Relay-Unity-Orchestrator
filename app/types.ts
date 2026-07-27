@@ -37,6 +37,7 @@ export interface HealthMap {
   smb: HealthState;
   unity: HealthState;
   skill: HealthState;
+  dialogGuard: HealthState;
 }
 
 export interface Project {

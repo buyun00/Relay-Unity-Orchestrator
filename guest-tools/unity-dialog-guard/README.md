@@ -1,12 +1,14 @@
 # Unity Dialog Guard
 
 Unity Dialog Guard 是 Relay 子机内部的独立桌面守护程序。它只在子机的
-Unity 自动登录账户中运行，不依赖宿主机、PowerShell Direct 或 Relay
-控制服务来发现和点击窗口。
+Unity 自动登录账户中运行。已知规则的发现和点击不依赖宿主机；
+PowerShell Direct 只用于可选的 AI 未知窗口决策接口。
 
 ## 行为
 
-- 每 400 ms 扫描由 `Unity.exe` 创建的顶层窗口。
+- 每 400 ms 扫描由 `Unity.exe` 创建的候选弹窗。先排除普通 Editor 主窗口，
+  再以最大深度和节点数限制逐层读取 UI Automation 子树，避免 Unity
+  可访问性树递归导致栈溢出或假活。
 - 首批 `config.json` 规则会自动处理：
   - 外部修改的 UI Document、资源或脚本：选择 `Reload` / `Recompile`；
   - API Updater 同意窗口：选择备份确认、`Update` 或 `Yes`；
@@ -19,6 +21,9 @@ Unity 自动登录账户中运行，不依赖宿主机、PowerShell Direct 或 R
 - `autoLearn=true` 时，用户第一次在未知弹窗中点击按钮，守护程序会记录
   弹窗的规范化指纹和按钮名称到 `learned-rules.json`。同类弹窗再次出现
   时自动执行同一按钮。
+- 守护程序持续写入 `control\state.json` 心跳和待处理窗口；AI 只能从其中
+  已枚举的按钮选择动作，不能提交任意坐标或任意命令。删除、覆盖、丢弃、
+  重置等高风险动作默认拒绝，必须携带显式高风险授权。
 
 `learned-rules.json` 是完整、独立、可复制的同步文件。复制前停止目标机上
 的守护进程，覆盖目标文件，再启动计划任务即可。路径、GUID、版本号以及
@@ -52,6 +57,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 3. 注册 `\Relay\UnityDialogGuard` 登录触发计划任务；
 4. 使用 `Interactive` 登录类型和当前登录用户，确保能看到 Unity 桌面；
 5. 立即启动并返回任务状态和进程 ID。
+6. 配置任务异常退出后每分钟自动重启，并保留上一版可执行文件
+   `UnityDialogGuard.exe.previous`。
 
 重复安装会保留实际 `config.json`、`learned-rules.json` 和日志，同时将仓库
 最新默认规则写到 `config.defaults.json`。需要强制换成仓库默认配置时：
@@ -71,11 +78,39 @@ Set-ExecutionPolicy -Scope Process Bypass
 - `logs\unknown-dialogs.jsonl`：未知弹窗的标题、正文、按钮和指纹。
 - `logs\screenshots\`：能够从交互桌面捕获时保存的未知窗口截图。
 - `logs\errors.log`：守护程序内部错误。
+- `control\state.json`：进程、会话、最后扫描时间和当前未知弹窗。
+- `control\requests` / `control\responses`：受限 AI 动作请求与结果。
 
 已知规则按文件顺序匹配。每条规则必须同时满足其中填写的
 `titleRegex`、`textRegex` 和 `buttonRegex`，然后按 `targetButtonNames`
 顺序选择按钮。规则默认每个弹窗实例只尝试一次，防止错误窗口形成点击
 循环。
+
+## AI 未知窗口接口
+
+Relay/Codex 先读取状态，可选把当前未知弹窗截图导出到宿主机：
+
+```powershell
+.\scripts\hyperv\Get-UnityDialogGuardState.ps1 `
+  -VMName lin-worker-01 `
+  -CredentialPath C:\ProgramData\Relay\secrets\lin-worker-01.xml `
+  -ScreenshotDirectory C:\ProgramData\Relay\data\dialog-snapshots
+```
+
+确认标题、正文、截图和按钮后，只能使用状态中返回的 `dialogId` 与
+`buttonId`：
+
+```powershell
+.\scripts\hyperv\Invoke-UnityDialogGuardAction.ps1 `
+  -VMName lin-worker-01 `
+  -CredentialPath C:\ProgramData\Relay\secrets\lin-worker-01.xml `
+  -DialogId '<state dialogId>' `
+  -ButtonId '<state buttonId>' `
+  -Rationale 'Reload externally modified project files'
+```
+
+接口会拒绝已经消失的窗口、未枚举按钮和未显式授权的高风险动作。每次
+AI 操作都会写入 `logs\actions.jsonl`，包含操作者、理由、风险等级和结果。
 
 Unity 官方说明 Safe Mode 不运行项目或包中的托管代码。为保证子机的
 Unity Skill 仍有机会加载，默认规则选择 `Ignore`。如果某个项目的 Skill
@@ -92,7 +127,8 @@ Unity Skill 仍有机会加载，默认规则选择 `Ignore`。如果某个项�
 ## 验证
 
 集成测试会打开真实 WPF 模态窗口，验证已知规则自动点击、未知窗口
-记录、第一次人工操作学习、规则落盘，以及下一次自动点击：
+状态输出、受限 AI 按钮操作、第一次人工操作学习、规则落盘，以及下一次
+自动点击：
 
 ```powershell
 .\Test-UnityDialogGuard.ps1

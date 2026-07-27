@@ -7,6 +7,12 @@ import { parseJson, resolveWorkerTemplate } from "./util.mjs";
 const schemaPath = fileURLToPath(
   new URL("./codex-output.schema.json", import.meta.url),
 );
+const dialogStateScript = fileURLToPath(
+  new URL("../scripts/hyperv/Get-UnityDialogGuardState.ps1", import.meta.url),
+);
+const dialogActionScript = fileURLToPath(
+  new URL("../scripts/hyperv/Invoke-UnityDialogGuardAction.ps1", import.meta.url),
+);
 
 function eventThreadId(event) {
   if (event?.type !== "thread.started") return null;
@@ -46,6 +52,8 @@ function buildPrompt(context) {
     `You are executing turn ${context.turn.sequence} for persistent task #${context.task.number}: ${context.task.title}.`,
     `Work only on branch ${context.task.branchName}. The workspace is managed externally; do not switch branches or push.`,
     "Use the configured Unity Skill whenever the task requires inspecting or editing scenes, prefabs, or serialized Unity assets.",
+    `If Unity or its Skill times out, inspect pending guest dialogs before treating the timeout as terminal. Read them with ${dialogStateScript} using VMName ${context.worker.vmName} and CredentialPath ${context.worker.credentialPath}.`,
+    `For an unknown dialog, reason from its title, text, screenshot, and enumerated buttons, then use ${dialogActionScript} only with the exact dialogId/buttonId returned by the state interface. Never authorize a high-risk action without explicit user authority.`,
     "Complete the requested change, validate proportionally, and return the required structured result.",
     "",
     context.turn.userMessage,

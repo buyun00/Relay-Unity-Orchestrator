@@ -42,6 +42,9 @@ namespace Relay.UnityDialogGuard
             string logDirectory = options.GetPath(
                 "log-dir",
                 Path.Combine(baseDirectory, "logs"));
+            string controlDirectory = options.GetPath(
+                "control-dir",
+                Path.Combine(baseDirectory, "control"));
 
             GuardLogger logger = new GuardLogger(logDirectory);
             try
@@ -65,6 +68,7 @@ namespace Relay.UnityDialogGuard
                     using (DialogGuard guard = new DialogGuard(
                         configPath,
                         learnedPath,
+                        controlDirectory,
                         logger,
                         options.Has("verbose")))
                     {
@@ -73,7 +77,8 @@ namespace Relay.UnityDialogGuard
                             { "version", BuildInfo.Version },
                             { "sessionId", Process.GetCurrentProcess().SessionId },
                             { "configPath", configPath },
-                            { "learnedRulesPath", learnedPath }
+                            { "learnedRulesPath", learnedPath },
+                            { "controlDirectory", controlDirectory }
                         });
 
                         if (options.Has("once"))
@@ -102,7 +107,7 @@ namespace Relay.UnityDialogGuard
 
     internal static class BuildInfo
     {
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
     }
 
     internal sealed class CommandLine
@@ -218,6 +223,9 @@ namespace Relay.UnityDialogGuard
         public int schemaVersion { get; set; }
         public int pollIntervalMs { get; set; }
         public int initialActionDelayMs { get; set; }
+        public int heartbeatIntervalMs { get; set; }
+        public int maxScanDepth { get; set; }
+        public int maxScanNodes { get; set; }
         public bool autoLearn { get; set; }
         public bool captureUnknownDialogScreenshots { get; set; }
         public string[] unityProcessNames { get; set; }
@@ -262,10 +270,26 @@ namespace Relay.UnityDialogGuard
         public string lastUsedAt { get; set; }
     }
 
+    public sealed class DialogActionRequest
+    {
+        public int schemaVersion { get; set; }
+        public string requestId { get; set; }
+        public string dialogId { get; set; }
+        public string buttonId { get; set; }
+        public string requestedBy { get; set; }
+        public string rationale { get; set; }
+        public bool allowHighRisk { get; set; }
+        public bool remember { get; set; }
+    }
+
     internal sealed class DialogGuard : IDisposable
     {
         private readonly string _configPath;
         private readonly string _learnedPath;
+        private readonly string _controlDirectory;
+        private readonly string _requestDirectory;
+        private readonly string _responseDirectory;
+        private readonly string _statePath;
         private readonly GuardLogger _logger;
         private readonly bool _verbose;
         private readonly JavaScriptSerializer _serializer = new JavaScriptSerializer();
@@ -280,6 +304,8 @@ namespace Relay.UnityDialogGuard
             new Dictionary<string, DateTime>(StringComparer.Ordinal);
         private readonly HashSet<string> _unknownLogged =
             new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, string> _screenshots =
+            new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly AutomationEventHandler _invokedHandler;
         private readonly NativeInputMonitor _nativeInputMonitor;
         private GuardConfig _config;
@@ -287,18 +313,30 @@ namespace Relay.UnityDialogGuard
         private DateTime _configWriteTime;
         private DateTime _learnedWriteTime;
         private DateTime _lastReloadCheck;
+        private DateTime _lastStateWrite;
+        private DateTime _startedAt = DateTime.UtcNow;
+        private string _lastPendingSignature = String.Empty;
+        private long _scanCount;
         private bool _disposed;
 
         public DialogGuard(
             string configPath,
             string learnedPath,
+            string controlDirectory,
             GuardLogger logger,
             bool verbose)
         {
             _configPath = configPath;
             _learnedPath = learnedPath;
+            _controlDirectory = controlDirectory;
+            _requestDirectory = Path.Combine(_controlDirectory, "requests");
+            _responseDirectory = Path.Combine(_controlDirectory, "responses");
+            _statePath = Path.Combine(_controlDirectory, "state.json");
             _logger = logger;
             _verbose = verbose;
+            Directory.CreateDirectory(_controlDirectory);
+            Directory.CreateDirectory(_requestDirectory);
+            Directory.CreateDirectory(_responseDirectory);
             LoadConfiguration(true);
             _invokedHandler = OnButtonInvoked;
             Automation.AddAutomationEventHandler(
@@ -317,7 +355,18 @@ namespace Relay.UnityDialogGuard
 
             while (DateTime.UtcNow < deadline)
             {
-                ScanOnce();
+                try
+                {
+                    ScanOnce();
+                }
+                catch (Exception error)
+                {
+                    _logger.Error("Dialog scan failed but the guard will continue: " + error);
+                    WriteControlState(
+                        new List<DialogSnapshot>(),
+                        "scan-error: " + error.Message,
+                        true);
+                }
                 Thread.Sleep(Math.Max(100, _config.pollIntervalMs));
             }
         }
@@ -327,6 +376,7 @@ namespace Relay.UnityDialogGuard
             ReloadConfigurationIfChanged();
             List<DialogSnapshot> snapshots = WindowScanner.FindUnityWindows(_config, _logger);
             HashSet<int> activeHandles = new HashSet<int>();
+            List<DialogSnapshot> pending = new List<DialogSnapshot>();
 
             foreach (DialogSnapshot snapshot in snapshots)
             {
@@ -352,10 +402,14 @@ namespace Relay.UnityDialogGuard
                 if (snapshot.IsLikelyDialog)
                 {
                     RecordUnknown(snapshot);
+                    pending.Add(snapshot);
                 }
             }
 
+            ProcessControlRequests(pending);
             CleanupState(activeHandles);
+            _scanCount++;
+            WriteControlState(pending, null, false);
         }
 
         private void ReloadConfigurationIfChanged()
@@ -403,6 +457,18 @@ namespace Relay.UnityDialogGuard
             if (config.initialActionDelayMs < 0)
             {
                 config.initialActionDelayMs = 0;
+            }
+            if (config.heartbeatIntervalMs < 500)
+            {
+                config.heartbeatIntervalMs = 2000;
+            }
+            if (config.maxScanDepth < 1 || config.maxScanDepth > 32)
+            {
+                config.maxScanDepth = 12;
+            }
+            if (config.maxScanNodes < 16 || config.maxScanNodes > 2000)
+            {
+                config.maxScanNodes = 250;
             }
             if (config.unityProcessNames == null ||
                 config.unityProcessNames.Length == 0)
@@ -992,6 +1058,7 @@ namespace Relay.UnityDialogGuard
             {
                 screenshot = CaptureScreenshot(snapshot);
             }
+            _screenshots[snapshot.DialogId] = screenshot;
 
             _logger.Unknown(snapshot.ToLogRecord(
                 new Dictionary<string, object>
@@ -1047,6 +1114,255 @@ namespace Relay.UnityDialogGuard
             }
         }
 
+        private void ProcessControlRequests(List<DialogSnapshot> pending)
+        {
+            string[] requestPaths;
+            try
+            {
+                requestPaths = Directory.GetFiles(_requestDirectory, "*.json")
+                    .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                    .Take(20)
+                    .ToArray();
+            }
+            catch (IOException error)
+            {
+                _logger.Error("Unable to enumerate AI dialog requests: " + error.Message);
+                return;
+            }
+
+            foreach (string requestPath in requestPaths)
+            {
+                string requestFileId = Path.GetFileNameWithoutExtension(requestPath);
+                Dictionary<string, object> response = new Dictionary<string, object>
+                {
+                    { "schemaVersion", 1 },
+                    { "requestId", requestFileId },
+                    { "completedAt", DateTime.UtcNow.ToString("o") }
+                };
+                try
+                {
+                    DialogActionRequest request = _serializer.Deserialize<DialogActionRequest>(
+                        File.ReadAllText(requestPath, Encoding.UTF8));
+                    if (request == null || request.schemaVersion != 1)
+                    {
+                        throw new InvalidDataException(
+                            "The dialog action request must use schemaVersion 1.");
+                    }
+                    if (!String.Equals(
+                        request.requestId,
+                        requestFileId,
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidDataException(
+                            "requestId must match the request file name.");
+                    }
+                    if (String.IsNullOrWhiteSpace(request.dialogId) ||
+                        String.IsNullOrWhiteSpace(request.buttonId))
+                    {
+                        throw new InvalidDataException(
+                            "dialogId and buttonId are required.");
+                    }
+
+                    DialogSnapshot snapshot = pending.FirstOrDefault(
+                        item => String.Equals(
+                            item.DialogId,
+                            request.dialogId,
+                            StringComparison.Ordinal));
+                    if (snapshot == null)
+                    {
+                        response["status"] = "stale";
+                        response["message"] =
+                            "The dialog is no longer present or is already handled.";
+                    }
+                    else
+                    {
+                        ButtonSnapshot button = snapshot.Buttons.FirstOrDefault(
+                            item => String.Equals(
+                                item.RuntimeId,
+                                request.buttonId,
+                                StringComparison.Ordinal));
+                        if (button == null)
+                        {
+                            response["status"] = "rejected";
+                            response["message"] =
+                                "The requested button is not one of the currently enumerated actions.";
+                        }
+                        else
+                        {
+                            string risk = DialogRisk.Classify(snapshot, button);
+                            response["dialogId"] = snapshot.DialogId;
+                            response["buttonId"] = button.RuntimeId;
+                            response["buttonName"] = button.Name;
+                            response["risk"] = risk;
+                            response["requestedBy"] = request.requestedBy;
+                            response["rationale"] = request.rationale;
+                            if (String.Equals(risk, "high", StringComparison.Ordinal) &&
+                                !request.allowHighRisk)
+                            {
+                                response["status"] = "rejected";
+                                response["message"] =
+                                    "The action is high risk and requires explicit allowHighRisk authorization.";
+                            }
+                            else
+                            {
+                                bool invoked = InvokeButton(
+                                    snapshot,
+                                    button,
+                                    "ai",
+                                    request.requestId);
+                                bool remembered = false;
+                                if (invoked &&
+                                    request.remember &&
+                                    !String.Equals(
+                                        risk,
+                                        "high",
+                                        StringComparison.Ordinal))
+                                {
+                                    remembered = LearnManualAction(
+                                        snapshot,
+                                        button.Name,
+                                        "ai-action");
+                                }
+                                response["status"] = invoked ? "success" : "failed";
+                                response["message"] = invoked
+                                    ? "The enumerated dialog button was invoked."
+                                    : "The dialog button could not be invoked.";
+                                response["remembered"] = remembered;
+                                _logger.Event(
+                                    "dialog.ai-action",
+                                    snapshot.ToLogRecord(
+                                        new Dictionary<string, object>
+                                        {
+                                            { "requestId", request.requestId },
+                                            { "buttonId", button.RuntimeId },
+                                            { "buttonName", button.Name },
+                                            { "risk", risk },
+                                            { "requestedBy", request.requestedBy },
+                                            { "rationale", request.rationale },
+                                            { "status", response["status"] }
+                                        }));
+                            }
+                        }
+                    }
+                }
+                catch (Exception error)
+                {
+                    response["status"] = "invalid";
+                    response["message"] = error.Message;
+                    _logger.Error(
+                        "Unable to process AI dialog request '" +
+                        requestFileId + "': " + error.Message);
+                }
+
+                try
+                {
+                    WriteJsonAtomic(
+                        Path.Combine(_responseDirectory, requestFileId + ".json"),
+                        response);
+                    File.Delete(requestPath);
+                }
+                catch (Exception error)
+                {
+                    _logger.Error(
+                        "Unable to persist AI dialog response '" +
+                        requestFileId + "': " + error.Message);
+                }
+            }
+        }
+
+        private void WriteControlState(
+            List<DialogSnapshot> pending,
+            string error,
+            bool force)
+        {
+            string signature = String.Join(
+                "\n",
+                pending
+                    .Select(snapshot =>
+                        snapshot.DialogId + "|" +
+                        String.Join(
+                            ",",
+                            snapshot.Buttons
+                                .Select(button => button.RuntimeId)
+                                .ToArray()))
+                    .OrderBy(value => value, StringComparer.Ordinal)
+                    .ToArray());
+            int interval = Math.Max(500, _config.heartbeatIntervalMs);
+            if (!force &&
+                String.Equals(signature, _lastPendingSignature, StringComparison.Ordinal) &&
+                (DateTime.UtcNow - _lastStateWrite).TotalMilliseconds < interval)
+            {
+                return;
+            }
+
+            List<Dictionary<string, object>> dialogs =
+                new List<Dictionary<string, object>>();
+            foreach (DialogSnapshot snapshot in pending)
+            {
+                string screenshot;
+                _screenshots.TryGetValue(snapshot.DialogId, out screenshot);
+                dialogs.Add(new Dictionary<string, object>
+                {
+                    { "dialogId", snapshot.DialogId },
+                    { "fingerprint", snapshot.Fingerprint },
+                    { "processId", snapshot.ProcessId },
+                    { "windowHandle", snapshot.Handle },
+                    { "title", snapshot.Title },
+                    { "text", snapshot.CombinedText },
+                    { "windowClass", snapshot.ClassName },
+                    { "isModal", snapshot.IsModal },
+                    { "hasOwner", snapshot.HasOwner },
+                    { "screenshotPath", screenshot },
+                    { "buttons", snapshot.Buttons.Select(button =>
+                        new Dictionary<string, object>
+                        {
+                            { "buttonId", button.RuntimeId },
+                            { "name", button.Name },
+                            { "risk", DialogRisk.Classify(snapshot, button) }
+                        }).ToArray() }
+                });
+            }
+
+            Dictionary<string, object> state = new Dictionary<string, object>
+            {
+                { "schemaVersion", 1 },
+                { "version", BuildInfo.Version },
+                { "processId", Process.GetCurrentProcess().Id },
+                { "sessionId", Process.GetCurrentProcess().SessionId },
+                { "startedAt", _startedAt.ToString("o") },
+                { "lastScanAt", DateTime.UtcNow.ToString("o") },
+                { "scanCount", _scanCount },
+                { "healthy", String.IsNullOrWhiteSpace(error) },
+                { "error", error },
+                { "pendingDialogs", dialogs }
+            };
+            WriteJsonAtomic(_statePath, state);
+            _lastPendingSignature = signature;
+            _lastStateWrite = DateTime.UtcNow;
+        }
+
+        private void WriteJsonAtomic(string path, object value)
+        {
+            string directory = Path.GetDirectoryName(path);
+            if (!String.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            string temporaryPath = path + "." +
+                Process.GetCurrentProcess().Id + "." +
+                Guid.NewGuid().ToString("N") + ".tmp";
+            string json = JsonFormatting.Indent(_serializer.Serialize(value));
+            File.WriteAllText(temporaryPath, json, new UTF8Encoding(false));
+            if (File.Exists(path))
+            {
+                File.Replace(temporaryPath, path, null, true);
+            }
+            else
+            {
+                File.Move(temporaryPath, path);
+            }
+        }
+
         private void CleanupState(HashSet<int> activeHandles)
         {
             string[] stateKeys = _firstSeen.Keys
@@ -1063,6 +1379,19 @@ namespace Relay.UnityDialogGuard
             {
                 _firstSeen.Remove(key);
                 _attempts.Remove(key);
+            }
+            foreach (string key in _screenshots.Keys
+                .Where(key =>
+                {
+                    int separator = key.IndexOf('|');
+                    int handle;
+                    return separator > 0 &&
+                        int.TryParse(key.Substring(0, separator), out handle) &&
+                        !activeHandles.Contains(handle);
+                })
+                .ToArray())
+            {
+                _screenshots.Remove(key);
             }
 
             lock (_sync)
@@ -1157,7 +1486,9 @@ namespace Relay.UnityDialogGuard
                     DialogSnapshot snapshot = DialogSnapshot.Create(
                         window,
                         processId,
-                        processName);
+                        processName,
+                        config.maxScanDepth,
+                        config.maxScanNodes);
                     if (snapshot != null)
                     {
                         result.Add(snapshot);
@@ -1190,6 +1521,106 @@ namespace Relay.UnityDialogGuard
         }
     }
 
+    internal sealed class AutomationTraversalNode
+    {
+        public AutomationElement Element { get; set; }
+        public int Depth { get; set; }
+    }
+
+    internal static class BoundedAutomationTree
+    {
+        public static List<AutomationElement> Descendants(
+            AutomationElement root,
+            int maximumDepth,
+            int maximumNodes)
+        {
+            List<AutomationElement> result = new List<AutomationElement>();
+            Queue<AutomationTraversalNode> queue =
+                new Queue<AutomationTraversalNode>();
+            HashSet<string> visited = new HashSet<string>(StringComparer.Ordinal);
+            EnqueueChildren(root, 1, maximumNodes, queue);
+
+            while (queue.Count > 0 && result.Count < maximumNodes)
+            {
+                AutomationTraversalNode current = queue.Dequeue();
+                string identity = RuntimeIdentity(current.Element);
+                if (!String.IsNullOrWhiteSpace(identity) && !visited.Add(identity))
+                {
+                    continue;
+                }
+                result.Add(current.Element);
+                if (current.Depth < maximumDepth)
+                {
+                    EnqueueChildren(
+                        current.Element,
+                        current.Depth + 1,
+                        maximumNodes - result.Count,
+                        queue);
+                }
+            }
+            return result;
+        }
+
+        private static void EnqueueChildren(
+            AutomationElement parent,
+            int depth,
+            int remaining,
+            Queue<AutomationTraversalNode> queue)
+        {
+            if (remaining <= 0)
+            {
+                return;
+            }
+            try
+            {
+                AutomationElementCollection children = parent.FindAll(
+                    TreeScope.Children,
+                    Condition.TrueCondition);
+                int count = Math.Min(children.Count, remaining);
+                for (int index = 0; index < count; index++)
+                {
+                    queue.Enqueue(new AutomationTraversalNode
+                    {
+                        Element = children[index],
+                        Depth = depth
+                    });
+                }
+            }
+            catch (ElementNotAvailableException)
+            {
+            }
+            catch (InvalidOperationException)
+            {
+            }
+            catch (COMException)
+            {
+            }
+        }
+
+        private static string RuntimeIdentity(AutomationElement element)
+        {
+            try
+            {
+                int[] parts = element.GetRuntimeId();
+                return parts == null
+                    ? String.Empty
+                    : String.Join(".", parts.Select(value => value.ToString()).ToArray());
+            }
+            catch (ElementNotAvailableException)
+            {
+                return String.Empty;
+            }
+            catch (InvalidOperationException)
+            {
+                return String.Empty;
+            }
+            catch (COMException)
+            {
+                return String.Empty;
+            }
+        }
+    }
+
     internal sealed class DialogSnapshot
     {
         public AutomationElement Window { get; private set; }
@@ -1209,12 +1640,15 @@ namespace Relay.UnityDialogGuard
         public string CanonicalTitle { get; private set; }
         public string CanonicalText { get; private set; }
         public string Fingerprint { get; private set; }
+        public string DialogId { get; private set; }
         public bool IsLikelyDialog { get; private set; }
 
         public static DialogSnapshot Create(
             AutomationElement window,
             int processId,
-            string processName)
+            string processName,
+            int maximumDepth,
+            int maximumNodes)
         {
             int handle = window.Current.NativeWindowHandle;
             if (handle == 0)
@@ -1249,15 +1683,20 @@ namespace Relay.UnityDialogGuard
             result.HasOwner = NativeMethods.GetWindow(
                 new IntPtr(handle),
                 NativeMethods.GW_OWNER) != IntPtr.Zero;
+            if (!IsCandidateWindow(result))
+            {
+                return null;
+            }
 
-            AutomationElementCollection descendants = window.FindAll(
-                TreeScope.Descendants,
-                Condition.TrueCondition);
+            List<AutomationElement> descendants = BoundedAutomationTree.Descendants(
+                window,
+                maximumDepth,
+                maximumNodes);
             HashSet<string> textSet = new HashSet<string>(
                 StringComparer.OrdinalIgnoreCase);
             HashSet<string> buttonIds = new HashSet<string>(
                 StringComparer.Ordinal);
-            for (int index = 0; index < descendants.Count && index < 500; index++)
+            for (int index = 0; index < descendants.Count; index++)
             {
                 AutomationElement element = descendants[index];
                 ControlType controlType;
@@ -1269,10 +1708,34 @@ namespace Relay.UnityDialogGuard
                 {
                     continue;
                 }
+                catch (InvalidOperationException)
+                {
+                    continue;
+                }
+                catch (COMException)
+                {
+                    continue;
+                }
 
                 if (controlType == ControlType.Button)
                 {
-                    ButtonSnapshot button = ButtonSnapshot.FromAutomationElement(element);
+                    ButtonSnapshot button;
+                    try
+                    {
+                        button = ButtonSnapshot.FromAutomationElement(element);
+                    }
+                    catch (ElementNotAvailableException)
+                    {
+                        continue;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        continue;
+                    }
+                    catch (COMException)
+                    {
+                        continue;
+                    }
                     if (button != null && buttonIds.Add(button.RuntimeId))
                     {
                         result.Buttons.Add(button);
@@ -1308,17 +1771,39 @@ namespace Relay.UnityDialogGuard
             result.CanonicalTitle = TextFingerprint.Canonicalize(result.Title);
             result.CanonicalText = TextFingerprint.CanonicalizeFragments(result.Texts);
             result.Fingerprint = TextFingerprint.For(result);
-            result.IsLikelyDialog =
-                result.IsModal ||
-                result.HasOwner ||
-                String.Equals(result.ClassName, "#32770", StringComparison.Ordinal) ||
-                (result.Buttons.Count > 0 &&
-                    result.Buttons.Count <= 8 &&
-                    Regex.IsMatch(
-                        result.Title ?? String.Empty,
-                        "(dialog|warning|error|notice|reload|safe mode|consent|update|required|modified|Unity)",
-                        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant));
+            result.DialogId = result.Handle + "|" + result.Fingerprint;
+            result.IsLikelyDialog = true;
             return result;
+        }
+
+        private static bool IsCandidateWindow(DialogSnapshot snapshot)
+        {
+            if (snapshot.IsModal ||
+                snapshot.HasOwner ||
+                String.Equals(snapshot.ClassName, "#32770", StringComparison.Ordinal))
+            {
+                return true;
+            }
+            if (Regex.IsMatch(
+                snapshot.ClassName ?? String.Empty,
+                "(dialog|popup|modal)",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                return true;
+            }
+            if (String.Equals(
+                (snapshot.Title ?? String.Empty).Trim(),
+                "Unity",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            return Regex.IsMatch(
+                snapshot.Title ?? String.Empty,
+                "(dialog|warning|error|notice|reload|safe mode|consent|update required|" +
+                "modified externally|crash|failed|警告|错误|通知|重新加载|重载|" +
+                "安全模式|需要更新|外部修改|崩溃|失败)",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         }
 
         public Dictionary<string, object> ToLogRecord(
@@ -1357,6 +1842,14 @@ namespace Relay.UnityDialogGuard
             {
                 return String.Empty;
             }
+            catch (InvalidOperationException)
+            {
+                return String.Empty;
+            }
+            catch (COMException)
+            {
+                return String.Empty;
+            }
         }
 
         private static Rect SafeRect(AutomationElement element)
@@ -1366,6 +1859,14 @@ namespace Relay.UnityDialogGuard
                 return element.Current.BoundingRectangle;
             }
             catch (ElementNotAvailableException)
+            {
+                return Rect.Empty;
+            }
+            catch (InvalidOperationException)
+            {
+                return Rect.Empty;
+            }
+            catch (COMException)
             {
                 return Rect.Empty;
             }
@@ -1551,7 +2052,7 @@ namespace Relay.UnityDialogGuard
 
         private IntPtr OnMouse(int code, IntPtr wParam, IntPtr lParam)
         {
-            if (code >= 0 && wParam.ToInt64() == NativeMethods.WM_LBUTTONUP)
+            if (code >= 0 && wParam.ToInt64() == NativeMethods.WM_LBUTTONDOWN)
             {
                 NativeMethods.LowLevelMouse data =
                     (NativeMethods.LowLevelMouse)Marshal.PtrToStructure(
@@ -1625,6 +2126,38 @@ namespace Relay.UnityDialogGuard
             }
             _thread.Join(3000);
             _started.Dispose();
+        }
+    }
+
+    internal static class DialogRisk
+    {
+        private static readonly Regex LowRiskButton = new Regex(
+            @"^(cancel|no|close|later|back|ignore|取消|否|关闭|稍后|返回|忽略)$",
+            RegexOptions.Compiled |
+            RegexOptions.IgnoreCase |
+            RegexOptions.CultureInvariant);
+        private static readonly Regex HighRiskContext = new Regex(
+            @"(delete|remove|overwrite|replace|discard|revert|reset|format|uninstall|" +
+            @"purchase|payment|license|quit without saving|don'?t save|" +
+            @"删除|移除|覆盖|替换|丢弃|还原|重置|格式化|卸载|购买|支付|许可|不保存)",
+            RegexOptions.Compiled |
+            RegexOptions.IgnoreCase |
+            RegexOptions.CultureInvariant);
+
+        public static string Classify(
+            DialogSnapshot snapshot,
+            ButtonSnapshot button)
+        {
+            string buttonName = button == null ? String.Empty : button.Name;
+            if (LowRiskButton.IsMatch(buttonName ?? String.Empty))
+            {
+                return "low";
+            }
+            string context =
+                (snapshot == null ? String.Empty :
+                    snapshot.Title + " | " + snapshot.CombinedText) +
+                " | " + buttonName;
+            return HighRiskContext.IsMatch(context) ? "high" : "medium";
         }
     }
 
@@ -1837,7 +2370,7 @@ namespace Relay.UnityDialogGuard
         public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
         public const int WH_MOUSE_LL = 14;
         public const int WH_KEYBOARD_LL = 13;
-        public const long WM_LBUTTONUP = 0x0202;
+        public const long WM_LBUTTONDOWN = 0x0201;
         public const long WM_KEYDOWN = 0x0100;
         public const long WM_SYSKEYDOWN = 0x0104;
         public const uint WM_QUIT = 0x0012;

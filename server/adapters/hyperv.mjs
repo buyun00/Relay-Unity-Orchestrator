@@ -158,6 +158,7 @@ export class HyperVAdapter {
         smb: false,
         unity: false,
         skill: false,
+        dialogGuard: false,
         error: error.message,
       };
     }

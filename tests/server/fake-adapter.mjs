@@ -24,6 +24,7 @@ export class FakeAdapter {
       smb: running,
       unity: running,
       skill: running,
+      dialogGuard: running,
       adapter: "test",
     };
   }

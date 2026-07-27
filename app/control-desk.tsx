@@ -600,6 +600,7 @@ function HealthStrip({
     ["smb", "SMB"],
     ["unity", "Unity"],
     ["skill", "Skill"],
+    ["dialogGuard", "Dialog Guard"],
   ];
   return (
     <div className={cx("health-strip", detailed && "health-detailed")}>
@@ -2549,6 +2550,7 @@ function WorkerInspector({
       ["smb", "SMB 共享", HardDrive],
       ["unity", "Unity 进程", Box],
       ["skill", "Unity Skill", Zap],
+      ["dialogGuard", "弹窗守护", ShieldCheck],
     ];
   return (
     <>

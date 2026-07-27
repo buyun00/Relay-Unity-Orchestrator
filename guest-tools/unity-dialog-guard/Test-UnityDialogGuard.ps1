@@ -9,12 +9,13 @@ function Start-GuardProcess {
         [string]$Executable,
         [string]$ConfigPath,
         [string]$LearnedPath,
-        [string]$LogDirectory
+        [string]$LogDirectory,
+        [string]$ControlDirectory
     )
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = $Executable
-    $info.Arguments = '--config "{0}" --learned "{1}" --log-dir "{2}" --run-seconds 30 --no-mutex' -f `
-        $ConfigPath, $LearnedPath, $LogDirectory
+    $info.Arguments = '--config "{0}" --learned "{1}" --log-dir "{2}" --control-dir "{3}" --run-seconds 30 --no-mutex' -f `
+        $ConfigPath, $LearnedPath, $LogDirectory, $ControlDirectory
     $info.UseShellExecute = $false
     return [System.Diagnostics.Process]::Start($info)
 }
@@ -104,6 +105,7 @@ New-Item -ItemType Directory -Path $testRoot | Out-Null
 $logDirectory = Join-Path $testRoot 'logs'
 $configPath = Join-Path $testRoot 'config.json'
 $learnedPath = Join-Path $testRoot 'learned-rules.json'
+$controlDirectory = Join-Path $testRoot 'control'
 
 $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'config.json') -Raw -Encoding UTF8 |
     ConvertFrom-Json
@@ -123,7 +125,8 @@ try {
         -Executable $guardExecutable `
         -ConfigPath $configPath `
         -LearnedPath $learnedPath `
-        -LogDirectory $logDirectory
+        -LogDirectory $logDirectory `
+        -ControlDirectory $controlDirectory
     Start-Sleep -Milliseconds 500
 
     $knownOutput = Join-Path $testRoot 'known-result.txt'
@@ -138,6 +141,85 @@ try {
     $knownResult = [string](Get-Content -LiteralPath $knownOutput -Raw)
     if ($knownResult -ne 'Reload') {
         throw "Known dialog selected '$knownResult' instead of 'Reload'."
+    }
+
+    $aiOutput = Join-Path $testRoot 'ai-result.txt'
+    $aiFixture = Start-FixtureProcess `
+        -Executable $fixtureExecutable `
+        -Mode 'ai' `
+        -OutputPath $aiOutput
+    $fixtures.Add($aiFixture)
+    $statePath = Join-Path $controlDirectory 'state.json'
+    Wait-Until `
+        -Condition {
+            (Test-Path -LiteralPath $statePath) -and
+            (Get-Content -LiteralPath $statePath -Raw -Encoding UTF8) -match 'Unknown AI Decision Notice'
+        } `
+        -FailureMessage 'The AI control state did not expose the unknown dialog.'
+    $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    $aiDialog = $state.pendingDialogs |
+        Where-Object { $_.title -eq 'Unknown AI Decision Notice' } |
+        Select-Object -First 1
+    $aiButton = $aiDialog.buttons |
+        Where-Object { $_.name -eq 'Proceed Safely' } |
+        Select-Object -First 1
+    if (-not $aiDialog -or -not $aiButton) {
+        throw 'The AI control state omitted the expected dialog or button.'
+    }
+    $requestId = [Guid]::NewGuid().ToString('N')
+    $requestDirectory = Join-Path $controlDirectory 'requests'
+    $responsePath = Join-Path (Join-Path $controlDirectory 'responses') ($requestId + '.json')
+    $requestPath = Join-Path $requestDirectory ($requestId + '.json')
+    $temporaryRequestPath = $requestPath + '.tmp'
+    [pscustomobject]@{
+        schemaVersion = 1
+        requestId = $requestId
+        dialogId = [string]$aiDialog.dialogId
+        buttonId = [string]$aiButton.buttonId
+        requestedBy = 'integration-test'
+        rationale = 'Validate the bounded AI dialog action interface.'
+        remember = $true
+        allowHighRisk = $false
+    } | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath $temporaryRequestPath -Encoding UTF8
+    Move-Item -LiteralPath $temporaryRequestPath -Destination $requestPath
+    Wait-Until `
+        -Condition { Test-Path -LiteralPath $responsePath } `
+        -FailureMessage 'The AI dialog action did not produce a response.'
+    $aiResponse = Get-Content -LiteralPath $responsePath -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    if ($aiResponse.status -ne 'success') {
+        throw "The AI dialog action returned '$($aiResponse.status)': $($aiResponse.message)"
+    }
+    Wait-Until `
+        -Condition { Test-Path -LiteralPath $aiOutput } `
+        -FailureMessage 'The AI-selected dialog action did not invoke the fixture button.'
+    $aiResult = [string](Get-Content -LiteralPath $aiOutput -Raw)
+    if ($aiResult -ne 'Proceed Safely') {
+        throw "AI dialog action selected '$aiResult' instead of 'Proceed Safely'."
+    }
+    Wait-Until `
+        -Condition {
+            (Get-Content -LiteralPath $learnedPath -Raw -Encoding UTF8) -match
+                'Proceed Safely'
+        } `
+        -FailureMessage 'The AI-selected action was not persisted as a learned rule.'
+
+    $aiLearnedOutput = Join-Path $testRoot 'ai-learned-result.txt'
+    $aiLearnedFixture = Start-FixtureProcess `
+        -Executable $fixtureExecutable `
+        -Mode 'ai' `
+        -OutputPath $aiLearnedOutput
+    $fixtures.Add($aiLearnedFixture)
+    Wait-Until `
+        -Condition { Test-Path -LiteralPath $aiLearnedOutput } `
+        -FailureMessage 'The learned AI dialog rule was not applied on recurrence.'
+    $aiLearnedResult = [string](
+        Get-Content -LiteralPath $aiLearnedOutput -Raw
+    )
+    if ($aiLearnedResult -ne 'Proceed Safely') {
+        throw "Learned AI dialog selected '$aiLearnedResult' instead of 'Proceed Safely'."
     }
 
     $unknownOutput = Join-Path $testRoot 'unknown-first-result.txt'
@@ -159,33 +241,15 @@ try {
     Wait-Until `
         -Condition { Test-Path -LiteralPath $unknownOutput } `
         -FailureMessage 'The simulated first manual action did not complete.'
-    Wait-Until `
-        -Condition {
-            (Get-Content -LiteralPath $learnedPath -Raw) -match 'Apply Now'
-        } `
-        -FailureMessage 'The learning operation was not persisted to learned-rules.json.'
-
-    $learnedOutput = Join-Path $testRoot 'unknown-learned-result.txt'
-    $learnedFixture = Start-FixtureProcess `
-        -Executable $fixtureExecutable `
-        -Mode 'unknown' `
-        -OutputPath $learnedOutput `
-        -Variant '99'
-    $fixtures.Add($learnedFixture)
-    Wait-Until `
-        -Condition { Test-Path -LiteralPath $learnedOutput } `
-        -FailureMessage 'The learned dialog rule was not applied on the second occurrence.'
-    $learnedResult = [string](Get-Content -LiteralPath $learnedOutput -Raw)
-    if ($learnedResult -ne 'Apply Now') {
-        throw "Learned dialog selected '$learnedResult' instead of 'Apply Now'."
-    }
 
     $actionLog = Join-Path $logDirectory 'actions.jsonl'
     $actions = Get-Content -LiteralPath $actionLog -Raw
     if ($actions -notmatch '"ruleType":"known"' -or
         $actions -notmatch '"ruleType":"learned"' -or
+        $actions -notmatch '"ruleType":"ai"' -or
+        $actions -notmatch '"type":"dialog.ai-action"' -or
         $actions -notmatch '"type":"dialog.learned"') {
-        throw 'Action log does not prove known, learned, and learning flows.'
+        throw 'Action log does not prove known, AI, learned, and learning flows.'
     }
     $nativeMonitor = Get-Content -LiteralPath $actionLog |
         ForEach-Object { $_ | ConvertFrom-Json } |
@@ -201,10 +265,12 @@ try {
     [pscustomobject]@{
         passed = $true
         knownDialogAction = $knownResult
+        aiDialogExposed = $true
+        aiDialogAction = $aiResult
         unknownDialogRecorded = $true
-        manualActionLearned = $true
+        aiActionLearned = $true
         interactiveLearningHooksRegistered = $true
-        learnedDialogAction = $learnedResult
+        learnedDialogAction = $aiLearnedResult
         learnedRulesPath = $learnedPath
         actionLog = $actionLog
         unknownDialogLog = $unknownLog

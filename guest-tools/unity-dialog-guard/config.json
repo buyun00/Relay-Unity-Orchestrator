@@ -2,6 +2,9 @@
   "schemaVersion": 1,
   "pollIntervalMs": 400,
   "initialActionDelayMs": 600,
+  "heartbeatIntervalMs": 2000,
+  "maxScanDepth": 12,
+  "maxScanNodes": 250,
   "autoLearn": true,
   "captureUnknownDialogScreenshots": true,
   "unityProcessNames": [

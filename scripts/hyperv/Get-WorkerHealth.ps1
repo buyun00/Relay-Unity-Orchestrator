@@ -19,6 +19,7 @@ $heartbeat = $false
 $unity = $false
 $skill = $false
 $smb = $false
+$dialogGuard = $false
 $errorText = $null
 $credentialConfigured = -not [string]::IsNullOrWhiteSpace($CredentialPath)
 
@@ -52,15 +53,53 @@ if ($vmRunning) {
     do {
         if ($credential -is [System.Management.Automation.PSCredential]) {
             try {
-                $unity = [bool](Invoke-Command -VMName $VMName -Credential $credential -ScriptBlock {
-                    @(Get-Process -Name 'Unity' -ErrorAction SilentlyContinue).Count -gt 0
-                } -ErrorAction Stop)
+                $guestHealth = Invoke-Command -VMName $VMName -Credential $credential -ScriptBlock {
+                    $unityProcesses = @(
+                        Get-CimInstance Win32_Process -Filter "Name='Unity.exe'" -ErrorAction SilentlyContinue
+                    )
+                    $guardProcesses = @(
+                        Get-CimInstance Win32_Process -Filter "Name='UnityDialogGuard.exe'" -ErrorAction SilentlyContinue
+                    )
+                    $unitySessions = @($unityProcesses | ForEach-Object { [int]$_.SessionId })
+                    $sameSessionGuard = @(
+                        $guardProcesses |
+                            Where-Object { $unitySessions -contains [int]$_.SessionId }
+                    ) | Select-Object -First 1
+                    $guardStatePath =
+                        'C:\ProgramData\Relay\UnityDialogGuard\control\state.json'
+                    $guardHeartbeat = $false
+                    if ($sameSessionGuard -and
+                        (Test-Path -LiteralPath $guardStatePath -PathType Leaf)) {
+                        try {
+                            $guardState = Get-Content -LiteralPath $guardStatePath `
+                                -Raw -Encoding UTF8 |
+                                ConvertFrom-Json
+                            $lastScan = [DateTime]::Parse(
+                                [string]$guardState.lastScanAt
+                            ).ToUniversalTime()
+                            $guardHeartbeat =
+                                [bool]$guardState.healthy -and
+                                ([DateTime]::UtcNow - $lastScan).TotalSeconds -le 10 -and
+                                [int]$guardState.processId -eq
+                                    [int]$sameSessionGuard.ProcessId
+                        } catch {
+                            $guardHeartbeat = $false
+                        }
+                    }
+                    [pscustomobject]@{
+                        unity = $unityProcesses.Count -gt 0
+                        dialogGuard = [bool]$sameSessionGuard -and $guardHeartbeat
+                    }
+                } -ErrorAction Stop
+                $unity = [bool]$guestHealth.unity
+                $dialogGuard = [bool]$guestHealth.dialogGuard
                 # A successful PowerShell Direct round trip proves that the
                 # guest is responsive even when Hyper-V Heartbeat is stale.
                 $heartbeat = $true
                 $errorText = $null
             } catch {
                 $unity = $false
+                $dialogGuard = $false
                 $errorText = $_.Exception.Message
             }
         }
@@ -78,7 +117,7 @@ if ($vmRunning) {
         }
 
         $smb = [string]::IsNullOrWhiteSpace($SharePath) -or (Test-Path -LiteralPath $SharePath)
-        if ($heartbeat -and $smb -and $unity -and $skill) {
+        if ($heartbeat -and $smb -and $unity -and $skill -and $dialogGuard) {
             $errorText = $null
             break
         }
@@ -87,13 +126,20 @@ if ($vmRunning) {
     } while ($true)
 }
 
+if ($vmRunning -and $heartbeat -and $smb -and $unity -and $skill -and
+    -not $dialogGuard -and -not $errorText) {
+    $errorText =
+        'UnityDialogGuard is not running with a fresh heartbeat in the Unity interactive session.'
+}
+
 [pscustomobject]@{
-    ready = $vmRunning -and $heartbeat -and $smb -and $unity -and $skill
+    ready = $vmRunning -and $heartbeat -and $smb -and $unity -and $skill -and $dialogGuard
     vm = $vmRunning
     heartbeat = $heartbeat
     smb = $smb
     unity = $unity
     skill = $skill
+    dialogGuard = $dialogGuard
     credentialConfigured = $credentialConfigured
     vmState = $vm.State.ToString()
     error = $errorText

@@ -34,11 +34,59 @@ if (-not (Test-Path -LiteralPath $sourceExecutable)) {
 
 New-Item -ItemType Directory -Path $resolvedInstall -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $resolvedInstall 'logs') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $resolvedInstall 'control\requests') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $resolvedInstall 'control\responses') -Force | Out-Null
 
 $installedExecutable = Join-Path $resolvedInstall 'UnityDialogGuard.exe'
 $installedConfig = Join-Path $resolvedInstall 'config.json'
 $defaultConfig = Join-Path $resolvedInstall 'config.defaults.json'
 $learnedRules = Join-Path $resolvedInstall 'learned-rules.json'
+$controlDirectory = Join-Path $resolvedInstall 'control'
+
+Import-Module ScheduledTasks -ErrorAction Stop
+$existingTask = Get-ScheduledTask `
+    -TaskName $TaskName `
+    -TaskPath $TaskPath `
+    -ErrorAction SilentlyContinue
+if ($existingTask -and $existingTask.State -eq 'Running') {
+    Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
+}
+$runningProcesses = @(
+    Get-CimInstance Win32_Process -Filter "Name='UnityDialogGuard.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and
+            [string]::Equals(
+                [System.IO.Path]::GetFullPath($_.ExecutablePath),
+                $installedExecutable,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        }
+)
+if ($runningProcesses.Count -gt 0) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 200
+        $runningProcesses = @(
+            Get-CimInstance Win32_Process -Filter "Name='UnityDialogGuard.exe'" -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.ExecutablePath -and
+                    [string]::Equals(
+                        [System.IO.Path]::GetFullPath($_.ExecutablePath),
+                        $installedExecutable,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                }
+        )
+    } while ($runningProcesses.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
+}
+foreach ($process in $runningProcesses) {
+    Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
+}
+if (Test-Path -LiteralPath $installedExecutable -PathType Leaf) {
+    Copy-Item -LiteralPath $installedExecutable `
+        -Destination ($installedExecutable + '.previous') `
+        -Force
+}
 
 Copy-Item -LiteralPath $sourceExecutable -Destination $installedExecutable -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'config.json') -Destination $defaultConfig -Force
@@ -50,11 +98,11 @@ if (-not (Test-Path -LiteralPath $learnedRules)) {
         -Destination $learnedRules
 }
 
-Import-Module ScheduledTasks -ErrorAction Stop
-$arguments = '--config "{0}" --learned "{1}" --log-dir "{2}"' -f
+$arguments = '--config "{0}" --learned "{1}" --log-dir "{2}" --control-dir "{3}"' -f
     $installedConfig,
     $learnedRules,
-    (Join-Path $resolvedInstall 'logs')
+    (Join-Path $resolvedInstall 'logs'),
+    $controlDirectory
 $action = New-ScheduledTaskAction `
     -Execute $installedExecutable `
     -Argument $arguments `
@@ -69,6 +117,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Register-ScheduledTask `
@@ -104,6 +154,8 @@ $runningProcess = Get-CimInstance Win32_Process -Filter "Name='UnityDialogGuard.
     executable = $installedExecutable
     config = $installedConfig
     learnedRules = $learnedRules
+    controlDirectory = $controlDirectory
+    state = (Join-Path $controlDirectory 'state.json')
     task = "$TaskPath$TaskName"
     taskState = $task.State.ToString()
     processId = if ($runningProcess) { [int]$runningProcess.ProcessId } else { $null }

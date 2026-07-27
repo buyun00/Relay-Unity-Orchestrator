@@ -347,6 +347,11 @@ test("Codex turns pin the Relay model, reasoning effort, and standard speed", as
   assert.ok(args.indexOf('model_reasoning_effort="xhigh"') < execIndex);
   assert.ok(args.indexOf('service_tier="default"') < execIndex);
   assert.ok(args.indexOf("features.fast_mode=false") < execIndex);
+  const prompt = args.at(-1);
+  assert.match(prompt, /Get-UnityDialogGuardState\.ps1/);
+  assert.match(prompt, /Invoke-UnityDialogGuardAction\.ps1/);
+  assert.match(prompt, /VMName unity-worker-01/);
+  assert.match(prompt, /Never authorize a high-risk action/);
 });
 
 test("Codex turns use task-level model, reasoning, and Fast overrides", async (t) => {

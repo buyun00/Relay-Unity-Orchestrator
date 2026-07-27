@@ -4,6 +4,7 @@ using System.Text;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Threading;
 
 namespace Relay.UnityDialogGuard.Tests
 {
@@ -35,11 +36,17 @@ namespace Relay.UnityDialogGuard.Tests
                 mode,
                 "known",
                 StringComparison.OrdinalIgnoreCase);
+            bool ai = String.Equals(
+                mode,
+                "ai",
+                StringComparison.OrdinalIgnoreCase);
             Window window = new Window
             {
                 Title = known
                     ? "UI Document was modified externally"
-                    : "Custom Import Notice",
+                    : ai
+                        ? "Unknown AI Decision Notice"
+                        : "Custom Import Notice",
                 Width = 620,
                 Height = 210,
                 WindowStartupLocation = WindowStartupLocation.CenterScreen,
@@ -62,9 +69,11 @@ namespace Relay.UnityDialogGuard.Tests
             {
                 Text = known
                     ? "UI Document was modified externally. Reload it from disk?"
-                    : "A custom importer changed Example" + variant +
-                        ".asset at C:\\Work\\Project" + variant +
-                        "\\Assets\\Example" + variant + ".asset.",
+                    : ai
+                        ? "The import is paused and requires an operator decision."
+                        : "A custom importer changed Example" + variant +
+                            ".asset at C:\\Work\\Project" + variant +
+                            "\\Assets\\Example" + variant + ".asset.",
                 TextWrapping = TextWrapping.Wrap,
                 FontSize = 15,
                 VerticalAlignment = VerticalAlignment.Center
@@ -83,6 +92,11 @@ namespace Relay.UnityDialogGuard.Tests
             {
                 AddButton(buttons, window, output, "Reload");
                 AddButton(buttons, window, output, "Ignore");
+            }
+            else if (ai)
+            {
+                AddButton(buttons, window, output, "Proceed Safely");
+                AddButton(buttons, window, output, "Cancel");
             }
             else
             {
@@ -111,7 +125,16 @@ namespace Relay.UnityDialogGuard.Tests
             button.Click += delegate
             {
                 File.WriteAllText(output, text, new UTF8Encoding(false));
-                window.Close();
+                DispatcherTimer closeTimer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(150)
+                };
+                closeTimer.Tick += delegate
+                {
+                    closeTimer.Stop();
+                    window.Close();
+                };
+                closeTimer.Start();
             };
             parent.Children.Add(button);
         }
