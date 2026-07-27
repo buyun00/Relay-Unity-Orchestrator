@@ -503,8 +503,10 @@ if ($shouldPreserve) {
     $commitMessage = "chore(relay): preserve workspace before $Branch"
 
     # Validate all matching refs without changing them. Exactly one valid
-    # candidate is reusable; multiple valid candidates or only invalid partial
-    # refs are ambiguous and leave the worker in attention.
+    # candidate is reusable. A single invalid legacy ref may have been created
+    # by an older Relay before proof metadata was added; retain it unchanged
+    # and create a new verified preservation ref from the still-matching audit.
+    # Multiple invalid refs without a valid candidate remain ambiguous.
     $referenceOutput = Invoke-Git @(
         'for-each-ref', '--format=%(refname)%09%(objectname)',
         "refs/heads/$preservationPrefix*"
@@ -536,7 +538,7 @@ if ($shouldPreserve) {
     }
 
     if ($validCandidates.Count -gt 1 -or (
-        $validCandidates.Count -eq 0 -and $matchingRefs.Count -gt 0
+        $validCandidates.Count -eq 0 -and $matchingRefs.Count -gt 1
     )) {
         $refusalArguments = @{
             Code = 'WORKSPACE_PRESERVATION_AMBIGUOUS'
@@ -585,7 +587,10 @@ if ($shouldPreserve) {
                 $invalidPartialCommits.Add($candidateCommit)
             }
         }
-        if ($validUnreachable.Count -gt 1 -or $invalidPartialCommits.Count -gt 0) {
+        if (
+            $validUnreachable.Count -gt 1 -or
+            $invalidPartialCommits.Count -gt 1
+        ) {
             $refusalArguments = @{
                 Code = 'WORKSPACE_PRESERVATION_AMBIGUOUS'
                 Message = "Recovery found ambiguous partial preservation commits; none were changed or rebuilt."

@@ -820,13 +820,12 @@ test("a preservation ref created before receipt interruption is validated and re
   );
 });
 
-test("an invalid partial preservation ref keeps recovery blocked before task branch creation", (t) => {
+test("one invalid legacy preservation ref is retained while recovery creates a verified replacement", (t) => {
   const repository = createRepository(t);
   const project = clone(repository, "guest-invalid-partial");
   const untrackedPath = "baloot_client/Assets/失败 验证/Automation.meta";
   write(path.join(project, ...untrackedPath.split("/")), "ambiguous\n");
   const originalHead = git(project, "rev-parse", "HEAD");
-  const originalStatus = git(project, "status", "--porcelain=v1");
   const inspection = inspect(project);
   const invalidBranch =
     "relay/preserved/task-0017-task-20260727T000000000Z-invalid000001";
@@ -846,20 +845,81 @@ test("an invalid partial preservation ref keeps recovery blocked before task bra
     inspection.audit,
   );
 
+  assert.equal(result.ready, true);
+  assert.equal(result.proven, true);
+  assert.equal(result.reusedPreservation, false);
+  assert.equal(result.preservationVerified, true);
+  assert.equal(result.taskBranchCreated, true);
+  assert.equal(result.currentBranch, taskBranch);
+  assert.notEqual(result.preservedBranch, invalidBranch);
+  assert.equal(result.preservationParent, originalHead);
+  assert.equal(
+    result.preservedFiles[0].preservedBlob,
+    inspection.audit.changes[0].auditBlob,
+  );
+  assert.equal(
+    git(project, "rev-parse", `refs/heads/${invalidBranch}`),
+    originalHead,
+  );
+  const preservationRefs = refs(
+    project,
+    "refs/heads/relay/preserved/task-0017-task-*",
+  );
+  assert.equal(preservationRefs.length, 2);
+  assert.equal(
+    preservationRefs.includes(`refs/heads/${invalidBranch}`),
+    true,
+  );
+  assert.equal(
+    preservationRefs.includes(`refs/heads/${result.preservedBranch}`),
+    true,
+  );
+  assert.equal(git(project, "status", "--porcelain=v1"), "");
+  assert.doesNotMatch(JSON.stringify(result), /unexpected: \./u);
+});
+
+test("multiple invalid legacy preservation refs remain ambiguous and unchanged", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-multiple-invalid-partials");
+  const untrackedPath = "baloot_client/Assets/多个 旧引用/Automation.meta";
+  write(path.join(project, ...untrackedPath.split("/")), "ambiguous\n");
+  const originalHead = git(project, "rev-parse", "HEAD");
+  const originalStatus = git(project, "status", "--porcelain=v1");
+  const inspection = inspect(project);
+  const invalidBranches = [
+    "relay/preserved/task-0017-task-20260727T000000000Z-invalid000001",
+    "relay/preserved/task-0017-task-20260727T000000001Z-invalid000002",
+  ];
+  for (const branch of invalidBranches) {
+    git(
+      project,
+      "update-ref",
+      `refs/heads/${branch}`,
+      originalHead,
+      "0".repeat(40),
+    );
+  }
+
+  const result = prepare(
+    project,
+    repository,
+    taskBranch,
+    "recovery",
+    inspection.audit,
+  );
+
   assert.equal(result.ready, false);
   assert.equal(result.proven, false);
   assert.equal(result.refusal.phase, "preservation-discovery");
   assert.equal(result.refusal.reason, "WORKSPACE_PRESERVATION_AMBIGUOUS");
-  assert.equal(result.code, "WORKSPACE_PRESERVATION_AMBIGUOUS");
   assert.equal(git(project, "branch", "--show-current"), "main");
   assert.equal(git(project, "rev-parse", "HEAD"), originalHead);
   assert.equal(git(project, "status", "--porcelain=v1"), originalStatus);
   assert.equal(refs(project, `refs/heads/${taskBranch}`).length, 0);
   assert.deepEqual(
     refs(project, "refs/heads/relay/preserved/task-0017-task-*"),
-    [`refs/heads/${invalidBranch}`],
+    invalidBranches.map((branch) => `refs/heads/${branch}`),
   );
-  assert.doesNotMatch(JSON.stringify(result), /unexpected: \./u);
 });
 
 test("a tracked deletion stops without checkout, preservation, or status changes", (t) => {
