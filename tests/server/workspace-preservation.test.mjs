@@ -238,6 +238,20 @@ function runRecoveryHostWrapper(t, guestPayload, { throwGuest = false } = {}) {
   );
 }
 
+test("a clean established workspace produces an empty coherent audit", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-clean-inspection");
+
+  const inspection = inspect(project);
+
+  assert.equal(inspection.ready, true);
+  assert.equal(inspection.repositoryExists, true);
+  assert.deepEqual(inspection.statusBefore, []);
+  assert.deepEqual(inspection.auditedFiles, []);
+  assert.deepEqual(inspection.audit.changes, []);
+  assert.match(inspection.audit.fingerprint, /^[0-9a-f]{64}$/u);
+});
+
 test("recovery preserves every tracked and untracked task-0017 file before target checkout", (t) => {
   const repository = createRepository(t);
   const project = clone(repository, "guest-safe");

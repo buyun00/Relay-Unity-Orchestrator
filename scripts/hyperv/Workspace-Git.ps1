@@ -295,7 +295,11 @@ function Get-RelayPathBlob {
 }
 
 function Get-RelayExpectedChanges {
-    param([Parameter(Mandatory = $true)][object[]]$Status)
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Status
+    )
 
     $changes = New-Object System.Collections.Generic.List[object]
     foreach ($entry in $Status) {
@@ -388,8 +392,12 @@ function Get-RelayChangeKey {
 
 function Compare-RelayChangeSets {
     param(
-        [Parameter(Mandatory = $true)][object[]]$Expected,
-        [Parameter(Mandatory = $true)][object[]]$Actual
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Expected,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Actual
     )
 
     $expectedSet = New-Object 'System.Collections.Generic.HashSet[string]' (
@@ -427,7 +435,9 @@ function Compare-RelayChangeSets {
 function Get-RelayAuditFingerprint {
     param(
         [Parameter(Mandatory = $true)][string]$Head,
-        [Parameter(Mandatory = $true)][object[]]$AuditedFiles
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$AuditedFiles
     )
 
     $records = @(
@@ -459,7 +469,9 @@ function Test-RelayPreservationCommit {
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string]$Commit,
         [Parameter(Mandatory = $true)][string]$AuditHead,
-        [Parameter(Mandatory = $true)][object[]]$AuditedFiles,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$AuditedFiles,
         [string]$AuditFingerprint
     )
 
