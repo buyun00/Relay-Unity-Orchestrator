@@ -230,7 +230,9 @@ export class RepairManager {
       const prompt = [
         "You are the Relay self-repair engineer operating in an isolated Git worktree.",
         "Diagnose and fix the supplied Relay runtime incident completely.",
-        "You may edit code, configuration, scripts, tests, and documentation and may create Git commits.",
+        "You may edit code, configuration, scripts, tests, and documentation.",
+        "Do not run git add, git commit, git checkout, git reset, git clean, git stash, or any command that writes Git metadata.",
+        "The outer Relay repair manager deliberately protects .git and will audit, stage, commit, fast-forward, deploy, and roll back after you return.",
         "Never delete files, branches, tags, worktrees, logs, databases, tasks, workers, VMs, or checkpoints.",
         "Do not push and do not modify the source worktree outside the current repair worktree.",
         "Preserve backward compatibility unless the incident requires a deliberate migration.",

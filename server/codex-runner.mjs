@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { findCodexSandboxHelperDirectory } from "./codex-session.mjs";
 import { runProcess } from "./process.mjs";
 import { parseJson, resolveWorkerTemplate } from "./util.mjs";
 
@@ -11,7 +12,10 @@ const dialogStateScript = fileURLToPath(
   new URL("../scripts/hyperv/Get-UnityDialogGuardState.ps1", import.meta.url),
 );
 const dialogActionScript = fileURLToPath(
-  new URL("../scripts/hyperv/Invoke-UnityDialogGuardAction.ps1", import.meta.url),
+  new URL(
+    "../scripts/hyperv/Invoke-UnityDialogGuardAction.ps1",
+    import.meta.url,
+  ),
 );
 
 function eventThreadId(event) {
@@ -62,20 +66,60 @@ function buildPrompt(context) {
 }
 
 export class CodexRunner {
-  constructor(config, { processRunner = runProcess } = {}) {
+  constructor(
+    config,
+    {
+      processRunner = runProcess,
+      runtimeDirectoryResolver = findCodexSandboxHelperDirectory,
+    } = {},
+  ) {
     this.config = config;
     this.processRunner = processRunner;
+    this.runtimeDirectoryResolver = runtimeDirectoryResolver;
   }
 
-  environment() {
-    return this.config.codexHome
-      ? { CODEX_HOME: this.config.codexHome }
-      : undefined;
+  runtimeDirectory() {
+    if (!/^codex(?:\.exe)?$/iu.test(this.config.codexCommand || "")) {
+      return null;
+    }
+    return this.runtimeDirectoryResolver?.() || null;
+  }
+
+  command(runtimeDirectory = this.runtimeDirectory()) {
+    const runtimeCommand = runtimeDirectory
+      ? path.join(runtimeDirectory, "codex.exe")
+      : null;
+    return runtimeCommand && fs.existsSync(runtimeCommand)
+      ? runtimeCommand
+      : this.config.codexCommand;
+  }
+
+  environment(runtimeDirectory = this.runtimeDirectory()) {
+    const environment = {};
+    if (this.config.codexHome) environment.CODEX_HOME = this.config.codexHome;
+    if (runtimeDirectory) {
+      const inheritedPath = process.env.PATH || "";
+      const existing = inheritedPath
+        .split(path.delimiter)
+        .some(
+          (entry) =>
+            path.resolve(entry).toLowerCase() ===
+            path.resolve(runtimeDirectory).toLowerCase(),
+        );
+      environment.PATH = existing
+        ? inheritedPath
+        : [runtimeDirectory, inheritedPath]
+            .filter(Boolean)
+            .join(path.delimiter);
+    }
+    return Object.keys(environment).length ? environment : undefined;
   }
 
   async inspect() {
+    const runtimeDirectory = this.runtimeDirectory();
+    const command = this.command(runtimeDirectory);
     const status = {
-      command: this.config.codexCommand,
+      command,
       home: this.config.codexHome,
       available: false,
       authenticated: false,
@@ -84,25 +128,17 @@ export class CodexRunner {
       error: null,
     };
     try {
-      const version = await this.processRunner(
-        this.config.codexCommand,
-        ["--version"],
-        {
-          env: this.environment(),
-          timeoutMs: 15_000,
-        },
-      );
+      const version = await this.processRunner(command, ["--version"], {
+        env: this.environment(runtimeDirectory),
+        timeoutMs: 15_000,
+      });
       status.available = true;
       status.version = (version.stdout || version.stderr).trim() || null;
-      const login = await this.processRunner(
-        this.config.codexCommand,
-        ["login", "status"],
-        {
-          env: this.environment(),
-          timeoutMs: 15_000,
-          acceptExitCodes: [0, 1],
-        },
-      );
+      const login = await this.processRunner(command, ["login", "status"], {
+        env: this.environment(runtimeDirectory),
+        timeoutMs: 15_000,
+        acceptExitCodes: [0, 1],
+      });
       status.authenticated = login.exitCode === 0;
       status.loginStatus = (login.stdout || login.stderr).trim() || null;
     } catch (error) {
@@ -208,9 +244,10 @@ export class CodexRunner {
     };
 
     try {
-      await this.processRunner(this.config.codexCommand, args, {
+      const runtimeDirectory = this.runtimeDirectory();
+      await this.processRunner(this.command(runtimeDirectory), args, {
         cwd: workspace,
-        env: this.environment(),
+        env: this.environment(runtimeDirectory),
         input: prompt,
         signal,
         timeoutMs: this.config.codexTimeoutMs,

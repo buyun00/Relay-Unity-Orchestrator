@@ -8,16 +8,96 @@ function eventThreadId(event) {
   return event.thread_id || event.threadId || event.thread?.id || null;
 }
 
+export function findCodexSandboxHelperDirectory(
+  localAppData = process.env.LOCALAPPDATA,
+) {
+  if (process.platform !== "win32" || !localAppData) return null;
+  const runtimeRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+  let entries = [];
+  try {
+    entries = fs.readdirSync(runtimeRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const directory = path.join(runtimeRoot, entry.name);
+    const codex = path.join(directory, "codex.exe");
+    const setup = path.join(directory, "codex-windows-sandbox-setup.exe");
+    const runner = path.join(directory, "codex-command-runner.exe");
+    if (
+      !fs.existsSync(codex) ||
+      !fs.existsSync(setup) ||
+      !fs.existsSync(runner)
+    ) {
+      continue;
+    }
+    try {
+      candidates.push({
+        directory,
+        modified: Math.max(
+          fs.statSync(setup).mtimeMs,
+          fs.statSync(runner).mtimeMs,
+        ),
+      });
+    } catch {
+      // A concurrently updating desktop runtime is skipped.
+    }
+  }
+  return (
+    candidates.sort((a, b) => b.modified - a.modified)[0]?.directory || null
+  );
+}
+
 export class CodexSessionRunner {
-  constructor(config, { processRunner = runProcess } = {}) {
+  constructor(
+    config,
+    {
+      processRunner = runProcess,
+      sandboxHelperDirectoryResolver = findCodexSandboxHelperDirectory,
+    } = {},
+  ) {
     this.config = config;
     this.processRunner = processRunner;
+    this.sandboxHelperDirectoryResolver = sandboxHelperDirectoryResolver;
   }
 
-  environment() {
-    return this.config.codexHome
-      ? { CODEX_HOME: this.config.codexHome }
-      : undefined;
+  runtimeDirectory() {
+    if (!/^codex(?:\.exe)?$/iu.test(this.config.codexCommand || "")) {
+      return null;
+    }
+    return this.sandboxHelperDirectoryResolver?.() || null;
+  }
+
+  command(runtimeDirectory = this.runtimeDirectory()) {
+    const runtimeCommand = runtimeDirectory
+      ? path.join(runtimeDirectory, "codex.exe")
+      : null;
+    return runtimeCommand && fs.existsSync(runtimeCommand)
+      ? runtimeCommand
+      : this.config.codexCommand;
+  }
+
+  environment(runtimeDirectory = this.runtimeDirectory()) {
+    const environment = {};
+    if (this.config.codexHome) environment.CODEX_HOME = this.config.codexHome;
+    if (runtimeDirectory) {
+      const inheritedPath = process.env.PATH || "";
+      const existing = inheritedPath
+        .split(path.delimiter)
+        .some(
+          (entry) =>
+            path.resolve(entry).toLowerCase() ===
+            path.resolve(runtimeDirectory).toLowerCase(),
+        );
+      environment.PATH = existing
+        ? inheritedPath
+        : [runtimeDirectory, inheritedPath]
+            .filter(Boolean)
+            .join(path.delimiter);
+    }
+    return Object.keys(environment).length ? environment : undefined;
   }
 
   async run({
@@ -88,9 +168,10 @@ export class CodexSessionRunner {
     };
 
     try {
-      await this.processRunner(this.config.codexCommand, args, {
+      const runtimeDirectory = this.runtimeDirectory();
+      await this.processRunner(this.command(runtimeDirectory), args, {
         cwd,
-        env: this.environment(),
+        env: this.environment(runtimeDirectory),
         input: prompt,
         signal,
         timeoutMs: this.config.codexTimeoutMs,

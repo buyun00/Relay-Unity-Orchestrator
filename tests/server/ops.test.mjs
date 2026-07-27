@@ -157,6 +157,42 @@ class ParallelOpsSession {
   }
 }
 
+class ActionProposingOpsSession {
+  calls = [];
+
+  constructor(taskId) {
+    this.taskId = taskId;
+  }
+
+  async run(options) {
+    this.calls.push(options);
+    options.onEvent?.({
+      type: "codex.stderr",
+      message:
+        "ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit",
+    });
+    return {
+      threadId: "action-policy-codex-thread",
+      final: {
+        status: "action_required",
+        summary: "The task can be continued from its preserved workspace.",
+        diagnosis:
+          "Git refused checkout because local files would be overwritten.",
+        confidence: 0.99,
+        actions: [
+          {
+            type: "task.continue",
+            targetId: this.taskId,
+            message: "Continue the preserved task safely.",
+            reason: "The workspace contains the required state.",
+          },
+        ],
+        verification: "Wait for the continued task turn.",
+      },
+    };
+  }
+}
+
 test("attention failures automatically enter the persistent Ops conversation and recover", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-ops-test-"),
@@ -270,6 +306,93 @@ test("manual System Codex messages resume the same durable Ops thread", async (t
     store.listOpsTurns().map((turn) => turn.sequence),
     [1, 2],
   );
+});
+
+test("manual diagnosis stays read-only until the operator explicitly authorizes action", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-ops-manual-policy-test-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  const { task } = store.createTask({
+    projectId: project.id,
+    title: "Preserved task",
+    message: "Original task request",
+    userName: "Tester",
+  });
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const session = new ActionProposingOpsSession(task.id);
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { sessionRunner: session },
+  );
+  t.after(async () => {
+    ops.stop();
+    scheduler.stop();
+    await scheduler.waitForIdle();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  await scheduler.start();
+  await ops.start();
+
+  ops.sendMessage(
+    [
+      "现场已保留",
+      "error: Please commit your changes or stash them before checkout.",
+      "HYPERV_COMMAND_FAILED 任务报错了",
+    ].join("\n"),
+    "Remote User",
+  );
+  await waitUntil(
+    () => store.listOpsTurns().at(-1)?.status === "completed",
+    "manual read-only diagnosis",
+  );
+
+  const diagnosticTurn = store.listOpsTurns().at(-1);
+  assert.match(session.calls[0].prompt, /manual diagnosis-only turn/iu);
+  assert.deepEqual(diagnosticTurn.final.actions, []);
+  assert.equal(diagnosticTurn.final.actionResults[0].status, "suppressed");
+  assert.equal(store.listOpsActions().length, 0);
+  assert.equal(store.listTaskTurns(task.id).length, 1);
+  const diagnosticEvents = store.listEvents({ limit: 250 });
+  assert.ok(
+    diagnosticEvents.some((event) => event.type === "ops.action.suppressed"),
+  );
+  assert.ok(
+    diagnosticEvents.every(
+      (event) => !event.message.includes("failed to refresh available models"),
+    ),
+  );
+
+  ops.sendMessage("请继续任务并安全恢复现场", "Remote User");
+  await waitUntil(
+    () =>
+      store.listOpsTurns().length === 2 &&
+      store.listOpsTurns().at(-1)?.status === "completed",
+    "explicitly authorized manual action",
+  );
+
+  assert.match(session.calls[1].prompt, /authorized to execute/iu);
+  assert.ok(
+    store
+      .listOpsActions()
+      .some(
+        (action) =>
+          action.type === "task.continue" && action.status === "completed",
+      ),
+  );
+  assert.ok(store.listTaskTurns(task.id).length >= 2);
 });
 
 test("multiple System Codex conversations run in parallel with independent settings and non-destructive clear", async (t) => {

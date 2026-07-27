@@ -4,12 +4,52 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { CodexSessionRunner } from "../../server/codex-session.mjs";
+import {
+  CodexSessionRunner,
+  findCodexSandboxHelperDirectory,
+} from "../../server/codex-session.mjs";
+
+test("Windows Codex sandbox helpers are discovered from the desktop runtime", (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows-specific sandbox helper discovery");
+    return;
+  }
+  const localAppData = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runtime-"),
+  );
+  t.after(() => fs.rmSync(localAppData, { recursive: true, force: true }));
+  const runtimeRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+  const older = path.join(runtimeRoot, "older");
+  const current = path.join(runtimeRoot, "current");
+  for (const directory of [older, current]) {
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "codex.exe"), "");
+    fs.writeFileSync(
+      path.join(directory, "codex-windows-sandbox-setup.exe"),
+      "",
+    );
+    fs.writeFileSync(path.join(directory, "codex-command-runner.exe"), "");
+  }
+  const olderTime = new Date("2026-01-01T00:00:00Z");
+  const currentTime = new Date("2026-07-27T00:00:00Z");
+  for (const name of [
+    "codex-windows-sandbox-setup.exe",
+    "codex-command-runner.exe",
+  ]) {
+    fs.utimesSync(path.join(older, name), olderTime, olderTime);
+    fs.utimesSync(path.join(current, name), currentTime, currentTime);
+  }
+
+  assert.equal(findCodexSandboxHelperDirectory(localAppData), current);
+});
 
 test("persistent Ops prompts use stdin and resume without Windows command-line overflow", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-codex-session-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const calls = [];
+  const helperDirectory = path.join(root, "codex-runtime-bin");
+  fs.mkdirSync(helperDirectory);
+  fs.writeFileSync(path.join(helperDirectory, "codex.exe"), "");
   const runner = new CodexSessionRunner(
     {
       codexCommand: "codex",
@@ -20,6 +60,7 @@ test("persistent Ops prompts use stdin and resume without Windows command-line o
       codexHome: null,
     },
     {
+      sandboxHelperDirectoryResolver: () => helperDirectory,
       processRunner: async (command, args, options) => {
         calls.push({ command, args, options });
         const finalPath = args[args.indexOf("--output-last-message") + 1];
@@ -64,9 +105,14 @@ test("persistent Ops prompts use stdin and resume without Windows command-line o
   });
 
   assert.equal(resumed.threadId, "ops-thread-from-stdin");
+  assert.equal(calls[0].command, path.join(helperDirectory, "codex.exe"));
   assert.equal(calls[0].args.at(-1), "-");
   assert.equal(calls[0].options.input, longPrompt);
   assert.equal(calls[0].args.includes(longPrompt), false);
+  assert.equal(
+    calls[0].options.env.PATH.split(path.delimiter)[0],
+    helperDirectory,
+  );
   assert.ok(calls[1].args.includes("resume"));
   assert.deepEqual(calls[1].args.slice(-2), ["ops-thread-from-stdin", "-"]);
   assert.equal(calls[1].options.input, "follow-up");

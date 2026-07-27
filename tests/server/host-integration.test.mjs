@@ -354,7 +354,12 @@ test("workspace preparation and finalization receive a repository-local Git iden
 
 test("Codex preflight uses the configured executable and persistent CODEX_HOME", async () => {
   const calls = [];
+  const runtimeDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runtime-"),
+  );
+  fs.writeFileSync(path.join(runtimeDirectory, "codex.exe"), "");
   const runner = new CodexRunner(config(), {
+    runtimeDirectoryResolver: () => runtimeDirectory,
     processRunner: async (command, args, options) => {
       calls.push({ command, args, options });
       if (args[0] === "--version") {
@@ -371,21 +376,28 @@ test("Codex preflight uses the configured executable and persistent CODEX_HOME",
       };
     },
   });
+  try {
+    const status = await runner.inspect();
 
-  const status = await runner.inspect();
-
-  assert.equal(status.available, true);
-  assert.equal(status.authenticated, true);
-  assert.equal(status.version, "codex-cli 0.145.0");
-  assert.deepEqual(
-    calls.map((call) => call.args),
-    [["--version"], ["login", "status"]],
-  );
-  assert.ok(
-    calls.every(
-      (call) => call.options.env.CODEX_HOME === "C:\\Relay\\codex-home",
-    ),
-  );
+    assert.equal(status.available, true);
+    assert.equal(status.authenticated, true);
+    assert.equal(status.version, "codex-cli 0.145.0");
+    assert.equal(status.command, path.join(runtimeDirectory, "codex.exe"));
+    assert.deepEqual(
+      calls.map((call) => call.args),
+      [["--version"], ["login", "status"]],
+    );
+    assert.ok(
+      calls.every(
+        (call) =>
+          call.command === path.join(runtimeDirectory, "codex.exe") &&
+          call.options.env.CODEX_HOME === "C:\\Relay\\codex-home" &&
+          call.options.env.PATH.split(path.delimiter)[0] === runtimeDirectory,
+      ),
+    );
+  } finally {
+    fs.rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
 });
 
 test("Codex turns pin the Relay model, reasoning effort, and standard speed", async (t) => {

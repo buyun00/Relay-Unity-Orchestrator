@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 import { config } from "./config.mjs";
 import { codexTaskSettings } from "./codex-settings.mjs";
 import { CodexSessionRunner } from "./codex-session.mjs";
+import {
+  actionPolicyPrompt,
+  suppressUnauthorizedActions,
+} from "./ops-policy.mjs";
 import { RepairManager } from "./repair-manager.mjs";
 import { runProcess } from "./process.mjs";
 import { id, now, parseJson } from "./util.mjs";
@@ -637,8 +641,9 @@ async function runEmergencyTurn(turn) {
     if (!thread) throw new Error("System Codex conversation not found");
     const prompt = [
       "You are the emergency Guardian Codex. The main Relay API is unavailable.",
-      "Diagnose and recover the service without waiting for a user.",
+      "Diagnose the service and follow the action policy for this turn.",
       "Never delete files, data, logs, branches, worktrees, VMs, checkpoints, tasks, projects, or workers.",
+      ...actionPolicyPrompt(turn),
       "Use relay.restart or web.restart for process faults and relay.repair for code faults.",
       "Relay repairs run in an isolated worktree, reject file deletions, validate, commit, deploy, and roll back on failed health checks.",
       "",
@@ -666,8 +671,9 @@ async function runEmergencyTurn(turn) {
       fastMode: thread.codexFastMode,
     });
     thread.codexThreadId = result.threadId;
-    const actionResults = [];
-    for (const action of result.final.actions) {
+    const policy = suppressUnauthorizedActions(turn, result.final);
+    const actionResults = [...policy.suppressed];
+    for (const action of policy.actions) {
       try {
         actionResults.push({
           type: action.type,
@@ -685,7 +691,7 @@ async function runEmergencyTurn(turn) {
       }
     }
     turn.status = "completed";
-    turn.final = { ...result.final, actionResults };
+    turn.final = { ...policy.final, actionResults };
     turn.finishedAt = now();
   } catch (error) {
     turn.status = "failed";

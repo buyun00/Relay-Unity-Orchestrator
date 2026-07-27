@@ -2,6 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexSessionRunner } from "./codex-session.mjs";
+import {
+  actionPolicyPrompt,
+  isNonFatalCodexStderr,
+  suppressUnauthorizedActions,
+} from "./ops-policy.mjs";
 import { HttpError } from "./util.mjs";
 
 const opsSchemaPath = fileURLToPath(
@@ -393,14 +398,13 @@ export class OpsEngine {
     const context = this.buildContext(turn);
     return [
       "You are the persistent Relay system operations Codex.",
-      "Your job is to diagnose any Relay, Hyper-V worker, Unity task, Git delivery, web, Guardian, or Relay-code incident and recover it without waiting for a human.",
+      "Your job is to diagnose any Relay, Hyper-V worker, Unity task, Git delivery, web, Guardian, or Relay-code incident.",
       "You have broad authority for reversible operations. Never delete files, data, logs, tasks, projects, workers, branches, tags, VMs, checkpoints, or worktrees.",
-      "Return concrete actions using only the structured action catalog. The executor will run and audit them.",
+      ...actionPolicyPrompt(turn),
       "For an attention worker with a preserved failed task, prefer task.continue with precise recovery instructions so the same Codex thread and workspace are resumed without reset.",
       "Use worker.release only when delivery is already durable. Use worker.restart for infrastructure faults, not to discard uncommitted task work.",
       "If Relay code is the root cause, use relay.repair with a complete repair instruction. It creates an isolated worktree, rejects file deletions, validates, commits, fast-forwards, and asks Guardian to restart.",
       "Use relay.restart or web.restart when code changes are unnecessary. Mark an incident resolved only when the supplied state already proves recovery.",
-      "Do not merely recommend that a user inspect something; act or start a repair whenever a non-deleting recovery exists.",
       "",
       "Current authoritative context:",
       safeJson(context),
@@ -452,33 +456,54 @@ export class OpsEngine {
           }
           const message = codexAgentMessage(event);
           if (message) this.emit(turn, message);
-          else if (event?.type === "codex.stderr" && event.message) {
+          else if (
+            event?.type === "codex.stderr" &&
+            event.message &&
+            !isNonFatalCodexStderr(event.message)
+          ) {
             this.emit(turn, event.message.slice(0, 2_000), "warning");
           }
         },
       });
       this.store.setOpsCodexThread(turn.threadId, result.threadId);
+      const policy = suppressUnauthorizedActions(turn, result.final);
       const actionResults = [];
       let pending = false;
       let failed = false;
-      if (turn.incidentId && result.final.actions.length) {
-        this.store.updateIncident(turn.incidentId, {
-          status: "acting",
-          lastAction: result.final.actions[0].type,
+      if (policy.suppressed.length) {
+        actionResults.push(...policy.suppressed);
+        this.store.emit({
+          opsTurnId: turn.id,
+          incidentId: turn.incidentId,
+          actorName: "Relay Ops Policy",
+          type: "ops.action.suppressed",
+          phase: "ops-action",
+          level: "warning",
+          message: `Kept manual diagnosis read-only; suppressed ${policy.suppressed.length} unauthorized action(s)`,
+          data: {
+            reason: "manual_action_not_authorized",
+            actions: policy.suppressed.map((action) => action.type),
+          },
         });
       }
-      for (const proposed of result.final.actions) {
+      if (turn.incidentId && policy.actions.length) {
+        this.store.updateIncident(turn.incidentId, {
+          status: "acting",
+          lastAction: policy.actions[0].type,
+        });
+      }
+      for (const proposed of policy.actions) {
         const execution = await this.serializeAction(() =>
-          this.executeAction(turn, proposed, result.final),
+          this.executeAction(turn, proposed, policy.final),
         );
         actionResults.push(execution);
         pending ||= Boolean(execution.pending);
         failed ||= execution.status === "failed";
       }
-      const final = { ...result.final, actionResults };
+      const final = { ...policy.final, actionResults };
       this.store.completeOpsTurn(turn.id, final);
-      this.emit(turn, result.final.summary, failed ? "error" : "info", {
-        status: result.final.status,
+      this.emit(turn, policy.final.summary, failed ? "error" : "info", {
+        status: policy.final.status,
         actions: actionResults.length,
       });
 
@@ -498,7 +523,7 @@ export class OpsEngine {
               "One or more proposed actions failed; choose another non-deleting recovery",
             );
           }
-        } else if (pending || result.final.status === "monitoring") {
+        } else if (pending || policy.final.status === "monitoring") {
           this.store.updateIncident(turn.incidentId, {
             status: "monitoring",
           });

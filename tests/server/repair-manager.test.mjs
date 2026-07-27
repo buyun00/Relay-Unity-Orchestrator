@@ -96,8 +96,11 @@ test("self-repair commits, fast-forwards, records deployment, and requests Guard
   );
   const store = new MemoryRepairStore();
   let restartRequest = null;
+  let repairPrompt = null;
   const sessionRunner = {
-    async run({ cwd }) {
+    async run({ cwd, prompt, sandbox }) {
+      repairPrompt = prompt;
+      assert.equal(sandbox, "workspace-write");
       fs.writeFileSync(
         path.join(cwd, "server", "existing.mjs"),
         "export const value = 2;\n",
@@ -138,6 +141,8 @@ test("self-repair commits, fast-forwards, records deployment, and requests Guard
   const repair = await manager.run({
     instructions: "Fix the test defect",
   });
+  assert.match(repairPrompt, /Do not run git add, git commit/iu);
+  assert.match(repairPrompt, /outer Relay repair manager/iu);
   assert.equal(repair.status, "deployed");
   assert.ok(repair.commitSha);
   assert.equal(
