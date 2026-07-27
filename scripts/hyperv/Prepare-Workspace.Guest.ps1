@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateSet('new', 'resume', 'recovery')][string]$RequestedMode,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$AuthorName,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$AuthorEmail,
+    [string]$AuditJson,
     [switch]$OutputJson
 )
 
@@ -19,87 +20,40 @@ $script:porcelainV2Before = @()
 $script:untrackedFilesBefore = @()
 $script:preservedTree = $null
 $script:preservedNameStatus = @()
+$script:preservedFiles = @()
 $script:preservationVerified = $false
 $script:preTargetCheckoutBranch = $null
 $script:preTargetCheckoutHead = $null
+$script:auditedFiles = @()
+$script:auditFingerprint = $null
+$script:reusedPreservation = $false
 
-function Invoke-Git([string[]]$Arguments) {
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        # Git Credential Manager may write non-fatal provider warnings to
-        # stderr. PowerShell 5 converts those lines to ErrorRecord objects,
-        # so judge success by Git's exit code instead.
-        $ErrorActionPreference = 'Continue'
-        $output = & git -C $ProjectPath @Arguments 2>&1
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($exitCode -ne 0) {
-        throw "git $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)"
-    }
-    return $output
+if (-not (Get-Command Invoke-RelayGit -CommandType Function -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'Workspace-Git.ps1')
+}
+
+function Invoke-Git {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [hashtable]$Environment = @{}
+    )
+    return (Invoke-RelayGit $ProjectPath $Arguments $Environment).stdout
 }
 
 function Test-GitReference([string]$Reference) {
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = & git -C $ProjectPath show-ref --verify --quiet $Reference 2>&1
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($exitCode -eq 0) { return $true }
-    if ($exitCode -eq 1) { return $false }
-    throw "git show-ref --verify --quiet $Reference failed: $($output -join [Environment]::NewLine)"
+    return Test-RelayGitReference $ProjectPath $Reference
 }
 
-function Get-GitValue([string[]]$Arguments) {
-    $lines = @(Invoke-Git $Arguments)
-    if ($lines.Count -eq 0) { return '' }
-    return $lines[-1].ToString().Trim()
-}
-
-function ConvertFrom-PorcelainStatus([string]$RawStatus) {
-    $records = @($RawStatus -split [char]0)
-    $entries = New-Object System.Collections.Generic.List[object]
-    for ($index = 0; $index -lt $records.Count; $index += 1) {
-        $record = $records[$index]
-        if ([string]::IsNullOrEmpty($record)) { continue }
-        if ($record.Length -lt 4 -or $record[2] -ne ' ') {
-            throw "Unexpected Git porcelain status record: '$record'"
-        }
-        $statusCode = $record.Substring(0, 2)
-        $statusPath = $record.Substring(3)
-        $originalPath = $null
-        if (@('R', 'C') -contains $statusCode[0] -or @('R', 'C') -contains $statusCode[1]) {
-            $index += 1
-            if ($index -ge $records.Count -or [string]::IsNullOrEmpty($records[$index])) {
-                throw "Git porcelain rename/copy record for '$statusPath' did not include its original path."
-            }
-            $originalPath = $records[$index]
-        }
-        $entries.Add([pscustomobject]@{
-            code = $statusCode
-            path = $statusPath
-            originalPath = $originalPath
-        })
-    }
-    return $entries.ToArray()
+function Get-GitValue {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [hashtable]$Environment = @{}
+    )
+    return Get-RelayGitValue $ProjectPath $Arguments $Environment
 }
 
 function Get-WorkspaceStatus {
-    $rawStatus = (Invoke-Git @(
-        'status', '--porcelain=v1', '-z', '--untracked-files=all'
-    )) -join ''
-    return @(ConvertFrom-PorcelainStatus $rawStatus)
-}
-
-function Get-NulSeparatedPaths([string[]]$Arguments) {
-    $rawPaths = (Invoke-Git $Arguments) -join ''
-    if ([string]::IsNullOrEmpty($rawPaths)) { return @() }
-    return @($rawPaths -split [char]0 | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    return @(Get-RelayWorkspaceStatus $ProjectPath)
 }
 
 function Get-ProhibitedPathCategories([string]$StatusPath) {
@@ -161,6 +115,8 @@ function New-RefusalResult(
         statusBefore = @($Status)
         porcelainV2Before = @($script:porcelainV2Before)
         untrackedFilesBefore = @($script:untrackedFilesBefore)
+        auditedFiles = @($script:auditedFiles)
+        auditFingerprint = $script:auditFingerprint
         blockedPaths = @($BlockedPaths)
         deletionPaths = @($DeletionPaths)
         prohibitedPaths = @($ProhibitedPaths)
@@ -169,6 +125,8 @@ function New-RefusalResult(
         preservedCommit = $PreservedCommit
         preservedTree = $script:preservedTree
         preservedNameStatus = @($script:preservedNameStatus)
+        preservedFiles = @($script:preservedFiles)
+        reusedPreservation = $script:reusedPreservation
         preservationVerified = $script:preservationVerified
         preTargetCheckoutBranch = $script:preTargetCheckoutBranch
         preTargetCheckoutHead = $script:preTargetCheckoutHead
@@ -200,37 +158,164 @@ if (-not (Test-Path -LiteralPath (Join-Path $ProjectPath '.git'))) {
     }
 }
 
-# Capture the guest workspace before any checkout or branch creation. Repository
-# configuration and fetches do not alter the index or working tree, but unsafe
-# content is preserved or refused before either of them is attempted.
-$originalBranch = Get-GitValue @('branch', '--show-current')
-$originalHead = Get-GitValue @('rev-parse', '--verify', 'HEAD')
-$statusBefore = @(Get-WorkspaceStatus)
+# Capture only the audited changes. The preservation tree starts at the audited
+# HEAD, but baseline paths are deliberately not part of the expected diff.
+function Get-AuditedFiles([object[]]$Status) {
+    return @(
+        foreach ($entry in $Status) {
+            $normalizedPath = ConvertTo-RelayGitPath ([string]$entry.path)
+            $absolutePath = [System.IO.Path]::GetFullPath(
+                (Join-Path $ProjectPath $normalizedPath)
+            )
+            [pscustomobject]@{
+                code = [string]$entry.code
+                path = $normalizedPath
+                originalPath = if ([string]::IsNullOrEmpty([string]$entry.originalPath)) {
+                    $null
+                } else {
+                    ConvertTo-RelayGitPath ([string]$entry.originalPath)
+                }
+                auditBlob = if ([System.IO.File]::Exists($absolutePath)) {
+                    Get-RelayPathBlob $ProjectPath $normalizedPath
+                } else {
+                    ''
+                }
+            }
+        }
+    )
+}
+
+function Test-WorkspaceMatchesAudit(
+    [string]$ExpectedBranch,
+    [string]$ExpectedHead,
+    [string]$ExpectedFingerprint
+) {
+    $currentBranch = Get-GitValue @('branch', '--show-current')
+    $currentHead = Get-GitValue @('rev-parse', '--verify', 'HEAD')
+    $currentStatus = @(Get-WorkspaceStatus)
+    $currentFiles = @(Get-AuditedFiles $currentStatus)
+    $currentFingerprint = Get-RelayAuditFingerprint $currentHead $currentFiles
+    return [pscustomobject]@{
+        matches = (
+            $currentBranch -eq $ExpectedBranch -and
+            $currentHead -eq $ExpectedHead -and
+            $currentFingerprint -eq $ExpectedFingerprint
+        )
+        branch = $currentBranch
+        head = $currentHead
+        status = $currentStatus
+        files = $currentFiles
+        fingerprint = $currentFingerprint
+    }
+}
+
+$observedBranch = Get-GitValue @('branch', '--show-current')
+$observedHead = Get-GitValue @('rev-parse', '--verify', 'HEAD')
+$observedStatus = @(Get-WorkspaceStatus)
+$observedFiles = @(Get-AuditedFiles $observedStatus)
+$observedFingerprint = Get-RelayAuditFingerprint $observedHead $observedFiles
+
+if (-not [string]::IsNullOrWhiteSpace($AuditJson)) {
+    try {
+        $suppliedAudit = $AuditJson | ConvertFrom-Json
+        if (
+            [int]$suppliedAudit.version -ne 1 -or
+            [string]::IsNullOrWhiteSpace([string]$suppliedAudit.head) -or
+            [string]::IsNullOrWhiteSpace([string]$suppliedAudit.fingerprint)
+        ) {
+            throw 'Audit version, HEAD, or fingerprint was missing.'
+        }
+        $originalBranch = [string]$suppliedAudit.branch
+        $originalHead = ([string]$suppliedAudit.head).ToLowerInvariant()
+        $statusBefore = @(
+            foreach ($change in @($suppliedAudit.changes)) {
+                [pscustomobject]@{
+                    code = [string]$change.code
+                    path = ConvertTo-RelayGitPath ([string]$change.path)
+                    originalPath = if ([string]::IsNullOrEmpty([string]$change.originalPath)) {
+                        $null
+                    } else {
+                        ConvertTo-RelayGitPath ([string]$change.originalPath)
+                    }
+                }
+            }
+        )
+        $script:auditedFiles = @(
+            foreach ($change in @($suppliedAudit.changes)) {
+                [pscustomobject]@{
+                    code = [string]$change.code
+                    path = ConvertTo-RelayGitPath ([string]$change.path)
+                    originalPath = if ([string]::IsNullOrEmpty([string]$change.originalPath)) {
+                        $null
+                    } else {
+                        ConvertTo-RelayGitPath ([string]$change.originalPath)
+                    }
+                    auditBlob = ([string]$change.auditBlob).ToLowerInvariant()
+                }
+            }
+        )
+        $script:auditFingerprint = Get-RelayAuditFingerprint $originalHead $script:auditedFiles
+        if ($script:auditFingerprint -ne [string]$suppliedAudit.fingerprint) {
+            throw 'Audit fingerprint did not match its HEAD, paths, status, and blobs.'
+        }
+    } catch {
+        $refusalArguments = @{
+            Code = 'WORKSPACE_AUDIT_INVALID'
+            Message = "Workspace recovery audit was invalid: $($_.Exception.Message)"
+            Status = $observedStatus
+            BlockedPaths = @()
+            DeletionPaths = @()
+            ProhibitedPaths = @()
+            UnsupportedChanges = @()
+            OriginalBranch = $observedBranch
+            OriginalHead = $observedHead
+        }
+        return (Complete-Result (New-RefusalResult @refusalArguments))
+    }
+} else {
+    $originalBranch = $observedBranch
+    $originalHead = $observedHead
+    $statusBefore = $observedStatus
+    $script:auditedFiles = $observedFiles
+    $script:auditFingerprint = $observedFingerprint
+}
+
+$auditMatch = Test-WorkspaceMatchesAudit `
+    $originalBranch $originalHead $script:auditFingerprint
+if (-not $auditMatch.matches) {
+    $refusalArguments = @{
+        Code = 'WORKSPACE_AUDIT_MISMATCH'
+        Message = "Workspace changed after inspection; expected '$originalBranch' at '$originalHead'. It remains in attention."
+        Status = $statusBefore
+        BlockedPaths = @($auditMatch.status | ForEach-Object { $_.path })
+        DeletionPaths = @()
+        ProhibitedPaths = @()
+        UnsupportedChanges = @()
+        OriginalBranch = $originalBranch
+        OriginalHead = $originalHead
+    }
+    return (Complete-Result (New-RefusalResult @refusalArguments))
+}
+
+$porcelainV2Result = Invoke-RelayGit $ProjectPath @(
+    'status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'
+)
 $script:porcelainV2Before = @(
-    Invoke-Git @(
-        'status', '--porcelain=v2', '--branch', '--untracked-files=all'
-    ) | ForEach-Object { $_.ToString() }
+    ConvertFrom-RelayNulFields $porcelainV2Result.stdoutBytes
 )
 $script:untrackedFilesBefore = @(
-    Get-NulSeparatedPaths @(
-        'ls-files', '--others', '--exclude-standard', '-z'
-    ) | Sort-Object
+    $statusBefore |
+        Where-Object { $_.code -eq '??' } |
+        ForEach-Object { $_.path }
 )
-
-if ($usesUnencryptedHttp) {
-    Invoke-Git @('config', '--local', 'credential.allowUnsafeRemotes', 'true') | Out-Null
-}
-Invoke-Git @('config', '--local', 'user.name', $AuthorName) | Out-Null
-Invoke-Git @('config', '--local', 'user.email', $AuthorEmail) | Out-Null
 
 $deletionPaths = New-Object System.Collections.Generic.List[string]
 $prohibitedPaths = New-Object System.Collections.Generic.List[object]
 $unsupportedChanges = New-Object System.Collections.Generic.List[object]
 $blockedPaths = New-Object System.Collections.Generic.List[string]
-
 foreach ($entry in $statusBefore) {
     $entryPaths = @($entry.path)
-    if (-not [string]::IsNullOrWhiteSpace($entry.originalPath)) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$entry.originalPath)) {
         $entryPaths += $entry.originalPath
     }
     if ($entry.code.Contains('D')) {
@@ -239,20 +324,16 @@ foreach ($entry in $statusBefore) {
             $blockedPaths.Add($statusPath)
         }
     }
-
     $unmergedStatuses = @('DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU')
     $allowedStatus = $entry.code -eq '??' -or (
         $unmergedStatuses -notcontains $entry.code -and
-        $entry.code -match '^[ MA][ MA]$' -and
+        $entry.code -match '^[ MARC][ MARC]$' -and
         $entry.code.Trim().Length -gt 0
     )
     if (-not $allowedStatus) {
         $unsupportedChanges.Add($entry)
-        foreach ($statusPath in $entryPaths) {
-            $blockedPaths.Add($statusPath)
-        }
+        foreach ($statusPath in $entryPaths) { $blockedPaths.Add($statusPath) }
     }
-
     foreach ($statusPath in $entryPaths) {
         $categories = @(Get-ProhibitedPathCategories $statusPath)
         if ($categories.Count -gt 0) {
@@ -285,7 +366,7 @@ if ($deletionPaths.Count -gt 0 -or $prohibitedPaths.Count -gt 0 -or $unsupported
     return (Complete-Result (New-RefusalResult @refusalArguments))
 }
 
-$allowedPaths = @($statusBefore | ForEach-Object { $_.path } | Sort-Object -Unique)
+$allowedPaths = @($script:auditedFiles | ForEach-Object { $_.path })
 if ([string]::IsNullOrWhiteSpace($originalBranch) -and $allowedPaths.Count -eq 0) {
     $refusalArguments = @{
         Code = 'WORKSPACE_DETACHED_HEAD'
@@ -300,18 +381,18 @@ if ([string]::IsNullOrWhiteSpace($originalBranch) -and $allowedPaths.Count -eq 0
     }
     return (Complete-Result (New-RefusalResult @refusalArguments))
 }
-$expectedWorkspacePaths = @(
-    Get-NulSeparatedPaths @(
-        'ls-files', '--cached', '--others', '--exclude-standard', '-z'
-    ) | Sort-Object -Unique
-)
-$originalBlobs = @{}
+
 $projectRoot = [System.IO.Path]::GetFullPath($ProjectPath).TrimEnd('\', '/') +
     [System.IO.Path]::DirectorySeparatorChar
 foreach ($statusPath in $allowedPaths) {
     $absolutePath = [System.IO.Path]::GetFullPath((Join-Path $ProjectPath $statusPath))
-    if (-not $absolutePath.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        -not [System.IO.File]::Exists($absolutePath)) {
+    if (
+        -not $absolutePath.StartsWith(
+            $projectRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [System.IO.File]::Exists($absolutePath)
+    ) {
         $refusalArguments = @{
             Code = 'WORKSPACE_UNSUPPORTED_CHANGES'
             Message = "Workspace checkout refused because '$statusPath' is not a regular project file."
@@ -319,15 +400,43 @@ foreach ($statusPath in $allowedPaths) {
             BlockedPaths = @($statusPath)
             DeletionPaths = @()
             ProhibitedPaths = @()
-            UnsupportedChanges = @([pscustomobject]@{ code = 'NON_FILE'; path = $statusPath })
+            UnsupportedChanges = @([pscustomobject]@{
+                code = 'NON_FILE'
+                path = $statusPath
+            })
             OriginalBranch = $originalBranch
             OriginalHead = $originalHead
         }
         return (Complete-Result (New-RefusalResult @refusalArguments))
     }
-    $originalBlobs[$statusPath] = Get-GitValue @(
-        'hash-object', "--path=$statusPath", '--', $statusPath
-    )
+}
+
+# A prior interrupted recovery may already have created the task ref. Without
+# durable completion proof it must not be switched to or overwritten.
+if ($RequestedMode -eq 'recovery' -and (Test-GitReference "refs/heads/$Branch")) {
+    $localTaskHead = Get-GitValue @('rev-parse', "refs/heads/$Branch")
+    $refusalArguments = @{
+        Code = 'WORKSPACE_TARGET_BRANCH_EXISTS'
+        Message = "Recovery target branch '$Branch' already exists at '$localTaskHead'; it was not checked out or overwritten."
+        Status = $statusBefore
+        BlockedPaths = @()
+        DeletionPaths = @()
+        ProhibitedPaths = @()
+        UnsupportedChanges = @()
+        OriginalBranch = $originalBranch
+        OriginalHead = $originalHead
+    }
+    return (Complete-Result (New-RefusalResult @refusalArguments))
+}
+
+function Set-RepositoryIdentity {
+    if ($usesUnencryptedHttp) {
+        Invoke-Git @(
+            'config', '--local', 'credential.allowUnsafeRemotes', 'true'
+        ) | Out-Null
+    }
+    Invoke-Git @('config', '--local', 'user.name', $AuthorName) | Out-Null
+    Invoke-Git @('config', '--local', 'user.email', $AuthorEmail) | Out-Null
 }
 
 $preservedBranch = $null
@@ -341,200 +450,224 @@ if ($shouldPreserve) {
     if ($taskPart.Length -gt 64) {
         $taskPart = $taskPart.Substring(0, 64).TrimEnd('-', '.')
     }
-    $timestamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
-    $preservationNonce = [Guid]::NewGuid().ToString('N').Substring(0, 12)
-    $preservedBranch = "relay/preserved/$taskPart-$timestamp-$preservationNonce"
-    if (Test-GitReference "refs/heads/$preservedBranch") {
-        throw "Generated preservation branch '$preservedBranch' already exists."
-    }
-    Invoke-Git @('check-ref-format', '--branch', $preservedBranch) | Out-Null
+    $preservationPrefix = "relay/preserved/$taskPart-"
+    $commitMessage = "chore(relay): preserve workspace before $Branch"
 
-    $gitDirectoryValue = Get-GitValue @('rev-parse', '--git-dir')
-    $gitDirectory = if ([System.IO.Path]::IsPathRooted($gitDirectoryValue)) {
-        [System.IO.Path]::GetFullPath($gitDirectoryValue)
-    } else {
-        [System.IO.Path]::GetFullPath((Join-Path $ProjectPath $gitDirectoryValue))
-    }
-    $evidenceDirectory = Join-Path $gitDirectory 'relay-preservation-indexes'
-    if (-not (Test-Path -LiteralPath $evidenceDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $evidenceDirectory | Out-Null
-    }
-    $evidenceIndex = Join-Path $evidenceDirectory "$preservationNonce.index"
-    if (Test-Path -LiteralPath $evidenceIndex) {
-        throw "Generated preservation evidence index '$evidenceIndex' already exists."
-    }
-
-    $previousIndexFile = [Environment]::GetEnvironmentVariable(
-        'GIT_INDEX_FILE',
-        [EnvironmentVariableTarget]::Process
+    # Validate all matching refs without changing them. Exactly one valid
+    # candidate is reusable; multiple valid candidates or only invalid partial
+    # refs are ambiguous and leave the worker in attention.
+    $referenceOutput = Invoke-Git @(
+        'for-each-ref', '--format=%(refname)%09%(objectname)',
+        "refs/heads/$preservationPrefix*"
     )
-    try {
-        [Environment]::SetEnvironmentVariable(
-            'GIT_INDEX_FILE',
-            $evidenceIndex,
-            [EnvironmentVariableTarget]::Process
-        )
-        Invoke-Git @('read-tree', $originalHead) | Out-Null
-        Invoke-Git @('add', '--all', '--', '.') | Out-Null
-        $script:preservedTree = Get-GitValue @('write-tree')
-    } finally {
-        [Environment]::SetEnvironmentVariable(
-            'GIT_INDEX_FILE',
-            $previousIndexFile,
-            [EnvironmentVariableTarget]::Process
-        )
+    $matchingRefs = New-Object System.Collections.Generic.List[object]
+    foreach ($line in @($referenceOutput -split '\r?\n')) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $fields = @($line -split "`t", 2)
+        if ($fields.Count -ne 2) {
+            throw "Unexpected preservation reference record '$line'."
+        }
+        $matchingRefs.Add([pscustomobject]@{
+            branch = $fields[0].Substring('refs/heads/'.Length)
+            commit = $fields[1]
+        })
+    }
+    $validCandidates = New-Object System.Collections.Generic.List[object]
+    foreach ($candidate in $matchingRefs) {
+        $proof = Test-RelayPreservationCommit `
+            $ProjectPath $candidate.commit $originalHead $script:auditedFiles
+        if ($proof.valid) {
+            $validCandidates.Add([pscustomobject]@{
+                branch = $candidate.branch
+                commit = $candidate.commit
+                proof = $proof
+            })
+        }
     }
 
-    foreach ($statusPath in $allowedPaths) {
-        $currentBlob = Get-GitValue @(
-            'hash-object', "--path=$statusPath", '--', $statusPath
+    if ($validCandidates.Count -gt 1 -or (
+        $validCandidates.Count -eq 0 -and $matchingRefs.Count -gt 0
+    )) {
+        $refusalArguments = @{
+            Code = 'WORKSPACE_PRESERVATION_AMBIGUOUS'
+            Message = "Recovery found $($matchingRefs.Count) existing preservation refs and $($validCandidates.Count) uniquely valid candidates; none were changed."
+            Status = $statusBefore
+            BlockedPaths = @()
+            DeletionPaths = @()
+            ProhibitedPaths = @()
+            UnsupportedChanges = @()
+            OriginalBranch = $originalBranch
+            OriginalHead = $originalHead
+        }
+        return (Complete-Result (New-RefusalResult @refusalArguments))
+    }
+
+    $candidateProof = $null
+    $needsPreservationRef = $false
+    if ($validCandidates.Count -eq 1) {
+        $preservedBranch = $validCandidates[0].branch
+        $preservedCommit = $validCandidates[0].commit
+        $candidateProof = $validCandidates[0].proof
+        $script:reusedPreservation = $true
+    } else {
+        # commit-tree may have completed before an earlier process was
+        # interrupted. Search unreachable commits read-only and reuse the
+        # unique valid one instead of manufacturing another snapshot.
+        $unreachableOutput = Invoke-Git @(
+            'fsck', '--unreachable', '--no-reflogs', '--no-progress'
         )
-        if ($currentBlob -ne $originalBlobs[$statusPath]) {
+        $validUnreachable = New-Object System.Collections.Generic.List[object]
+        $invalidPartialCommits = New-Object System.Collections.Generic.List[string]
+        foreach ($line in @($unreachableOutput -split '\r?\n')) {
+            if ($line -notmatch '^unreachable commit ([0-9a-f]{40})$') { continue }
+            $candidateCommit = $Matches[1]
+            $subject = Get-GitValue @('log', '-1', '--format=%s', $candidateCommit)
+            if ($subject -ne $commitMessage) { continue }
+            $proof = Test-RelayPreservationCommit `
+                $ProjectPath $candidateCommit $originalHead $script:auditedFiles
+            if ($proof.valid) {
+                $validUnreachable.Add([pscustomobject]@{
+                    commit = $candidateCommit
+                    proof = $proof
+                })
+            } else {
+                $invalidPartialCommits.Add($candidateCommit)
+            }
+        }
+        if ($validUnreachable.Count -gt 1 -or $invalidPartialCommits.Count -gt 0) {
             $refusalArguments = @{
-                Code = 'WORKSPACE_CHANGED_DURING_PRESERVATION'
-                Message = "Workspace preservation stopped because '$statusPath' changed after the status snapshot."
+                Code = 'WORKSPACE_PRESERVATION_AMBIGUOUS'
+                Message = "Recovery found ambiguous partial preservation commits; none were changed or rebuilt."
                 Status = $statusBefore
-                BlockedPaths = @($statusPath)
+                BlockedPaths = @()
                 DeletionPaths = @()
                 ProhibitedPaths = @()
                 UnsupportedChanges = @()
                 OriginalBranch = $originalBranch
                 OriginalHead = $originalHead
-                PreservedBranch = $preservedBranch
             }
             return (Complete-Result (New-RefusalResult @refusalArguments))
         }
+        if ($validUnreachable.Count -eq 1) {
+            $preservedCommit = $validUnreachable[0].commit
+            $candidateProof = $validUnreachable[0].proof
+            $script:reusedPreservation = $true
+            $needsPreservationRef = $true
+        } else {
+            $preservationNonce = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+            $gitDirectoryValue = Get-GitValue @('rev-parse', '--git-dir')
+            $gitDirectory = if ([System.IO.Path]::IsPathRooted($gitDirectoryValue)) {
+                [System.IO.Path]::GetFullPath($gitDirectoryValue)
+            } else {
+                [System.IO.Path]::GetFullPath(
+                    (Join-Path $ProjectPath $gitDirectoryValue)
+                )
+            }
+            $evidenceDirectory = Join-Path $gitDirectory 'relay-preservation-indexes'
+            if (-not (Test-Path -LiteralPath $evidenceDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Path $evidenceDirectory | Out-Null
+            }
+            $evidenceIndex = Join-Path $evidenceDirectory "$preservationNonce.index"
+            if (Test-Path -LiteralPath $evidenceIndex) {
+                throw "Generated preservation evidence index '$evidenceIndex' already exists."
+            }
+            $indexEnvironment = @{ GIT_INDEX_FILE = $evidenceIndex }
+            Invoke-Git @('read-tree', $originalHead) $indexEnvironment | Out-Null
+            Invoke-Git @('add', '--all') $indexEnvironment | Out-Null
+            $script:preservedTree = Get-GitValue @('write-tree') $indexEnvironment
+
+            $beforeCommit = Test-WorkspaceMatchesAudit `
+                $originalBranch $originalHead $script:auditFingerprint
+            if (-not $beforeCommit.matches) {
+                $refusalArguments = @{
+                    Code = 'WORKSPACE_CHANGED_DURING_PRESERVATION'
+                    Message = 'Workspace changed while Relay prepared its preservation tree; it remains in attention.'
+                    Status = $statusBefore
+                    BlockedPaths = @($beforeCommit.status | ForEach-Object { $_.path })
+                    DeletionPaths = @()
+                    ProhibitedPaths = @()
+                    UnsupportedChanges = @()
+                    OriginalBranch = $originalBranch
+                    OriginalHead = $originalHead
+                }
+                return (Complete-Result (New-RefusalResult @refusalArguments))
+            }
+
+            Set-RepositoryIdentity
+            $preservedCommit = Get-GitValue @(
+                'commit-tree', $script:preservedTree, '-p', $originalHead,
+                '-m', $commitMessage,
+                '-m', "Relay-Audit-Fingerprint: $($script:auditFingerprint)"
+            )
+            $candidateProof = Test-RelayPreservationCommit `
+                $ProjectPath $preservedCommit $originalHead $script:auditedFiles
+            if (-not $candidateProof.valid) {
+                $refusalArguments = @{
+                    Code = 'WORKSPACE_PRESERVATION_UNPROVEN'
+                    Message = "New preservation commit failed validation: $($candidateProof.reason)"
+                    Status = $statusBefore
+                    BlockedPaths = @()
+                    DeletionPaths = @()
+                    ProhibitedPaths = @()
+                    UnsupportedChanges = @()
+                    OriginalBranch = $originalBranch
+                    OriginalHead = $originalHead
+                    PreservedCommit = $preservedCommit
+                }
+                return (Complete-Result (New-RefusalResult @refusalArguments))
+            }
+            $needsPreservationRef = $true
+        }
+
+        if ($needsPreservationRef) {
+            $timestamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+            $suffix = $script:auditFingerprint.Substring(0, 12)
+            $preservedBranch = "$preservationPrefix$timestamp-$suffix"
+            Invoke-Git @('check-ref-format', '--branch', $preservedBranch) | Out-Null
+            if (Test-GitReference "refs/heads/$preservedBranch") {
+                throw "Preservation branch '$preservedBranch' unexpectedly already exists."
+            }
+            $zeroObjectId = '0000000000000000000000000000000000000000'
+            Invoke-Git @(
+                'update-ref', '--create-reflog', "refs/heads/$preservedBranch",
+                $preservedCommit, $zeroObjectId
+            ) | Out-Null
+        }
     }
 
-    $preservedCommit = Get-GitValue @(
-        'commit-tree', $script:preservedTree, '-p', $originalHead,
-        '-m', "chore(relay): preserve workspace before $Branch"
-    )
-    Invoke-Git @('cat-file', '-e', "$preservedCommit^{commit}") | Out-Null
-    $commitTree = Get-GitValue @('rev-parse', "$preservedCommit^{tree}")
-    if ($commitTree -ne $script:preservedTree) {
-        throw "Preserved commit tree '$commitTree' did not match prepared tree '$($script:preservedTree)'."
-    }
-    $commitParent = Get-GitValue @('rev-parse', "$preservedCommit^")
-    if ($commitParent -ne $originalHead) {
-        throw "Preserved commit parent '$commitParent' did not match original HEAD '$originalHead'."
-    }
-
-    $zeroObjectId = '0000000000000000000000000000000000000000'
-    Invoke-Git @(
-        'update-ref', '--create-reflog', "refs/heads/$preservedBranch",
-        $preservedCommit, $zeroObjectId
-    ) | Out-Null
     $branchCommit = Get-GitValue @('rev-parse', "refs/heads/$preservedBranch")
     if ($branchCommit -ne $preservedCommit) {
         throw "Preserved branch '$preservedBranch' did not resolve to '$preservedCommit'."
     }
+    $script:preservedTree = $candidateProof.tree
+    $script:preservedNameStatus = @($candidateProof.changes)
+    $script:preservedFiles = @($candidateProof.files)
+    $preservedFiles = @($candidateProof.files)
 
-    $preservedTreePaths = @(
-        Get-NulSeparatedPaths @(
-            'ls-tree', '-r', '--name-only', '-z', $preservedCommit
-        ) | Sort-Object -Unique
-    )
-    $treePathDifferences = @(
-        Compare-Object `
-            -ReferenceObject $expectedWorkspacePaths `
-            -DifferenceObject $preservedTreePaths
-    )
-    if ($treePathDifferences.Count -gt 0) {
-        $missingPaths = @(
-            $treePathDifferences |
-                Where-Object { $_.SideIndicator -eq '<=' } |
-                ForEach-Object { $_.InputObject }
-        )
-        $unexpectedPaths = @(
-            $treePathDifferences |
-                Where-Object { $_.SideIndicator -eq '=>' } |
-                ForEach-Object { $_.InputObject }
-        )
-        throw "Preserved tree inventory mismatch. Missing: $($missingPaths -join ', '); unexpected: $($unexpectedPaths -join ', ')."
-    }
-
-    $nameStatusRecords = @(
-        Get-NulSeparatedPaths @(
-            'diff-tree', '--no-commit-id', '--name-status', '-r', '-z',
-            $preservedCommit
-        )
-    )
-    $preservedNameStatus = New-Object System.Collections.Generic.List[object]
-    for ($nameIndex = 0; $nameIndex -lt $nameStatusRecords.Count; $nameIndex += 2) {
-        if ($nameIndex + 1 -ge $nameStatusRecords.Count) {
-            throw "Preserved commit name-status evidence ended unexpectedly at '$($nameStatusRecords[$nameIndex])'."
+    $preTarget = Test-WorkspaceMatchesAudit `
+        $originalBranch $originalHead $script:auditFingerprint
+    $script:preTargetCheckoutBranch = $preTarget.branch
+    $script:preTargetCheckoutHead = $preTarget.head
+    if (-not $preTarget.matches) {
+        $refusalArguments = @{
+            Code = 'WORKSPACE_CHANGED_BEFORE_TARGET_CHECKOUT'
+            Message = 'Workspace changed after preservation validation; the task branch was not created or switched.'
+            Status = $statusBefore
+            BlockedPaths = @($preTarget.status | ForEach-Object { $_.path })
+            DeletionPaths = @()
+            ProhibitedPaths = @()
+            UnsupportedChanges = @()
+            OriginalBranch = $originalBranch
+            OriginalHead = $originalHead
+            PreservedBranch = $preservedBranch
+            PreservedCommit = $preservedCommit
         }
-        $preservedNameStatus.Add([pscustomobject]@{
-            status = $nameStatusRecords[$nameIndex]
-            path = $nameStatusRecords[$nameIndex + 1]
-        })
-    }
-    $script:preservedNameStatus = @($preservedNameStatus.ToArray())
-    $preservedDeletions = @(Get-NulSeparatedPaths @(
-        'diff-tree', '--no-commit-id', '--diff-filter=D', '--name-only', '-r', '-z',
-        $preservedCommit
-    ))
-    if ($preservedDeletions.Count -gt 0) {
-        throw "Preserved commit unexpectedly contains deletions: $($preservedDeletions -join ', ')"
-    }
-    foreach ($statusPath in $allowedPaths) {
-        $commitPath = $preservedCommit + ':' + $statusPath
-        $commitBlob = Get-GitValue @('rev-parse', $commitPath)
-        if ($commitBlob -ne $originalBlobs[$statusPath]) {
-            throw "Preserved commit content verification failed for '$statusPath'."
-        }
-        $preservedFiles += [pscustomobject]@{
-            path = $statusPath
-            blob = $commitBlob
-        }
-    }
-
-    $script:preTargetCheckoutBranch = Get-GitValue @('branch', '--show-current')
-    $script:preTargetCheckoutHead = Get-GitValue @('rev-parse', '--verify', 'HEAD')
-    $preTargetPorcelainV2 = @(
-        Invoke-Git @(
-            'status', '--porcelain=v2', '--branch', '--untracked-files=all'
-        ) | ForEach-Object { $_.ToString() }
-    )
-    $preTargetUntrackedFiles = @(
-        Get-NulSeparatedPaths @(
-            'ls-files', '--others', '--exclude-standard', '-z'
-        ) | Sort-Object
-    )
-    $statusEvidenceDifferences = @(
-        Compare-Object `
-            -ReferenceObject $script:porcelainV2Before `
-            -DifferenceObject $preTargetPorcelainV2
-    )
-    $untrackedEvidenceMatches =
-        $script:untrackedFilesBefore.Count -eq $preTargetUntrackedFiles.Count
-    if ($untrackedEvidenceMatches) {
-        for (
-            $untrackedIndex = 0;
-            $untrackedIndex -lt $script:untrackedFilesBefore.Count;
-            $untrackedIndex += 1
-        ) {
-            if (
-                $script:untrackedFilesBefore[$untrackedIndex] -ne
-                $preTargetUntrackedFiles[$untrackedIndex]
-            ) {
-                $untrackedEvidenceMatches = $false
-                break
-            }
-        }
-    }
-    if (
-        $script:preTargetCheckoutBranch -ne $originalBranch -or
-        $script:preTargetCheckoutHead -ne $originalHead -or
-        $statusEvidenceDifferences.Count -gt 0 -or
-        -not $untrackedEvidenceMatches
-    ) {
-        throw "Workspace changed before target checkout. Branch '$($script:preTargetCheckoutBranch)' at '$($script:preTargetCheckoutHead)'; expected '$originalBranch' at '$originalHead'."
+        return (Complete-Result (New-RefusalResult @refusalArguments))
     }
     $script:preservationVerified = $true
 }
 
+Set-RepositoryIdentity
 Invoke-Git @('remote', 'set-url', 'origin', $RepositoryUrl) | Out-Null
 Invoke-Git @('fetch', 'origin') | Out-Null
 
@@ -647,11 +780,14 @@ $result = [pscustomobject]@{
     statusBefore = $statusBefore
     porcelainV2Before = $script:porcelainV2Before
     untrackedFilesBefore = $script:untrackedFilesBefore
+    auditedFiles = $script:auditedFiles
+    auditFingerprint = $script:auditFingerprint
     preservedBranch = $preservedBranch
     preservedCommit = $preservedCommit
     preservedTree = $script:preservedTree
     preservedNameStatus = $script:preservedNameStatus
     preservedFiles = $preservedFiles
+    reusedPreservation = $script:reusedPreservation
     preservationVerified = $script:preservationVerified
     preTargetCheckoutBranch = $script:preTargetCheckoutBranch
     preTargetCheckoutHead = $script:preTargetCheckoutHead

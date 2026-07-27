@@ -8,6 +8,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$TaskBranch,
     [ValidateNotNullOrEmpty()][string]$GitAuthorName = 'Relay Unity Orchestrator',
     [ValidateNotNullOrEmpty()][string]$GitAuthorEmail = 'relay-unity-orchestrator@localhost',
+    [string]$AuditJson,
     [string]$SharePath,
     [string]$UnityHealthUrl,
     [ValidateRange(30, 900)][int]$TimeoutSeconds = 300
@@ -31,6 +32,7 @@ if (-not (Test-Path -LiteralPath $prepareScript -PathType Leaf)) {
     -Mode recovery `
     -GitAuthorName $GitAuthorName `
     -GitAuthorEmail $GitAuthorEmail `
+    -AuditJson $AuditJson `
     -SharePath $SharePath `
     -UnityHealthUrl $UnityHealthUrl `
     -TimeoutSeconds $TimeoutSeconds

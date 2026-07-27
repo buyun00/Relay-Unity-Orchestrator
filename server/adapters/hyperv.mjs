@@ -38,6 +38,166 @@ function parseWorkspaceRefusal(error) {
   return null;
 }
 
+function normalizeGitPath(value) {
+  const normalized = String(value || "")
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter((part) => part && part !== ".")
+    .join("/");
+  if (
+    !normalized ||
+    normalized === "." ||
+    normalized.startsWith("/") ||
+    /^[A-Za-z]:\//u.test(normalized) ||
+    normalized.split("/").includes("..")
+  ) {
+    throw new Error(`Invalid audited Git path '${String(value)}'`);
+  }
+  return normalized;
+}
+
+function expectedStatus(code) {
+  if (code === "??") return "A";
+  if (code.includes("R")) return "R";
+  if (code.includes("C")) return "C";
+  if (code.includes("A")) return "A";
+  if (code.includes("M")) return "M";
+  return null;
+}
+
+function changeKey(change, status = change.status) {
+  return [
+    String(status || "")[0] || "",
+    change.originalPath ? normalizeGitPath(change.originalPath) : "",
+    normalizeGitPath(change.path),
+  ].join("\0");
+}
+
+function requireInspectionAudit(inspection) {
+  const audit = inspection?.audit;
+  if (
+    !audit ||
+    audit.version !== 1 ||
+    !/^[0-9a-f]{40}$/iu.test(audit.head || "") ||
+    !/^[0-9a-f]{64}$/iu.test(audit.fingerprint || "") ||
+    !Array.isArray(audit.changes)
+  ) {
+    throw Object.assign(
+      new Error(
+        "Preserved workspace inspection did not return a complete versioned audit; recovery was not attempted",
+      ),
+      {
+        code: "WORKSPACE_AUDIT_INCOMPLETE",
+        details: { inspection },
+      },
+    );
+  }
+  const keys = audit.changes.map((change) => {
+    const status = expectedStatus(String(change.code || ""));
+    if (!status || !/^[0-9a-f]{40}$/iu.test(change.auditBlob || "")) {
+      throw Object.assign(
+        new Error(`Incomplete audited file proof for '${String(change.path)}'`),
+        {
+          code: "WORKSPACE_AUDIT_INCOMPLETE",
+          details: { inspection },
+        },
+      );
+    }
+    return changeKey(change, status);
+  });
+  if (new Set(keys).size !== keys.length) {
+    throw Object.assign(
+      new Error("Inspection audit contained duplicate paths"),
+      {
+        code: "WORKSPACE_AUDIT_INCOMPLETE",
+        details: { inspection },
+      },
+    );
+  }
+  return audit;
+}
+
+function validateRecoveryProof(inspection, recovery) {
+  const audit = requireInspectionAudit(inspection);
+  if (
+    recovery.originalHead !== audit.head ||
+    recovery.auditFingerprint !== audit.fingerprint ||
+    !/^[0-9a-f]{40}$/iu.test(recovery.preservedCommit || "") ||
+    !/^[0-9a-f]{40}$/iu.test(recovery.preservedTree || "")
+  ) {
+    throw Object.assign(
+      new Error(
+        "Recovery proof did not match the inspected HEAD and audit fingerprint; the worker remains in attention",
+      ),
+      {
+        code: "WORKSPACE_AUDIT_MISMATCH",
+        details: { inspection, recovery },
+      },
+    );
+  }
+
+  const expectedChanges = new Set(
+    audit.changes.map((change) =>
+      changeKey(change, expectedStatus(String(change.code || ""))),
+    ),
+  );
+  const preservedChanges = Array.isArray(recovery.preservedNameStatus)
+    ? recovery.preservedNameStatus
+    : [];
+  const actualChanges = new Set(
+    preservedChanges.map((change) => changeKey(change)),
+  );
+  if (
+    expectedChanges.size !== actualChanges.size ||
+    [...expectedChanges].some((key) => !actualChanges.has(key))
+  ) {
+    throw Object.assign(
+      new Error(
+        "Recovery commit name-status did not exactly match the inspected change set",
+      ),
+      {
+        code: "WORKSPACE_PRESERVATION_UNPROVEN",
+        details: { inspection, recovery },
+      },
+    );
+  }
+
+  const preservedFiles = new Map(
+    (Array.isArray(recovery.preservedFiles) ? recovery.preservedFiles : []).map(
+      (file) => [normalizeGitPath(file.path), file],
+    ),
+  );
+  if (preservedFiles.size !== recovery.preservedFiles?.length) {
+    throw Object.assign(
+      new Error("Recovery proof contained duplicate preserved file paths"),
+      {
+        code: "WORKSPACE_PRESERVATION_UNPROVEN",
+        details: { inspection, recovery },
+      },
+    );
+  }
+  for (const audited of audit.changes) {
+    const path = normalizeGitPath(audited.path);
+    const preserved = preservedFiles.get(path);
+    if (
+      !preserved ||
+      preserved.auditBlob !== audited.auditBlob ||
+      preserved.preservedBlob !== audited.auditBlob
+    ) {
+      throw Object.assign(
+        new Error(
+          `Recovery commit blob for '${path}' did not match the inspection audit`,
+        ),
+        {
+          code: "WORKSPACE_PRESERVATION_UNPROVEN",
+          details: { inspection, recovery },
+        },
+      );
+    }
+  }
+  return audit;
+}
+
 export class HyperVAdapter {
   constructor(
     config,
@@ -308,6 +468,10 @@ export class HyperVAdapter {
         untrackedFiles: Array.isArray(inspection.untrackedFiles)
           ? inspection.untrackedFiles
           : [],
+        auditFingerprint: inspection.audit?.fingerprint || null,
+        auditedFiles: Array.isArray(inspection.audit?.changes)
+          ? inspection.audit.changes
+          : [],
       },
     );
 
@@ -369,6 +533,7 @@ export class HyperVAdapter {
   }
 
   async recoverPreserved(context, inspection, { signal, onProgress }) {
+    const audit = requireInspectionAudit(inspection);
     onProgress?.(
       "workspace-recovery",
       `Guest is on ${inspection.branch || "a detached HEAD"} at ${inspection.head}; preserving it before creating ${context.task.branchName}`,
@@ -387,6 +552,7 @@ export class HyperVAdapter {
         GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
         GitAuthorEmail:
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
+        AuditJson: JSON.stringify(audit),
         SharePath: context.worker.sharePath || context.project.smbPath,
         UnityHealthUrl: resolveWorkerTemplate(
           context.project.unityHealthUrl || context.project.unitySkillUrl,
@@ -410,6 +576,7 @@ export class HyperVAdapter {
         },
       );
     }
+    validateRecoveryProof(inspection, result);
     onProgress?.(
       "workspace-preserved",
       `Verified ${result.preservedBranch} at ${result.preservedCommit} before creating ${context.task.branchName}`,
@@ -431,6 +598,8 @@ export class HyperVAdapter {
         preservedFiles: Array.isArray(result.preservedFiles)
           ? result.preservedFiles
           : [],
+        auditFingerprint: result.auditFingerprint || null,
+        reusedPreservation: Boolean(result.reusedPreservation),
         preservationVerified: true,
         preTargetCheckoutBranch: result.preTargetCheckoutBranch || null,
         preTargetCheckoutHead: result.preTargetCheckoutHead || null,

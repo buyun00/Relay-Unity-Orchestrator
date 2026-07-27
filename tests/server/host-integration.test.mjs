@@ -310,6 +310,10 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
   const progress = [];
   const recoveryContext = context();
   recoveryContext.workspaceEstablished = false;
+  const auditedMeta =
+    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
+  const auditBlob = "4".repeat(40);
+  const auditFingerprint = "5".repeat(64);
   const processRunner = async (command, args) => {
     const name = scriptName(args);
     calls.push({ name, args });
@@ -320,14 +324,33 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
             repositoryExists: true,
             branch: "main",
             head: "1".repeat(40),
-            porcelainV2: [
-              "# branch.head main",
-              "1 .M N... baloot_client/Packages/manifest.json",
-              "? baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta",
+            statusBefore: [
+              { code: "??", path: auditedMeta, originalPath: null },
             ],
-            untrackedFiles: [
-              "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta",
+            auditedFiles: [
+              {
+                code: "??",
+                path: auditedMeta,
+                originalPath: null,
+                auditBlob,
+              },
             ],
+            audit: {
+              version: 1,
+              branch: "main",
+              head: "1".repeat(40),
+              fingerprint: auditFingerprint,
+              changes: [
+                {
+                  code: "??",
+                  path: auditedMeta,
+                  originalPath: null,
+                  auditBlob,
+                },
+              ],
+            },
+            porcelainV2: ["# branch.head main", "? " + auditedMeta],
+            untrackedFiles: [auditedMeta],
           }
         : name === "Recover-Workspace.ps1"
           ? {
@@ -339,10 +362,22 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
               preservedTree: "3".repeat(40),
               preservedNameStatus: [
                 {
-                  status: "M",
-                  path: "baloot_client/Packages/manifest.json",
+                  status: "A",
+                  path: auditedMeta,
+                  originalPath: null,
                 },
               ],
+              preservedFiles: [
+                {
+                  path: auditedMeta,
+                  code: "??",
+                  originalPath: null,
+                  auditBlob,
+                  preservedBlob: auditBlob,
+                },
+              ],
+              originalHead: "1".repeat(40),
+              auditFingerprint,
               preservationVerified: true,
               preTargetCheckoutBranch: "main",
               preTargetCheckoutHead: "1".repeat(40),
@@ -394,14 +429,29 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
     recoveryContext.task.branchName,
   );
   assert.equal(recovery.args[recovery.args.indexOf("-BaseBranch") + 1], "main");
+  assert.deepEqual(
+    JSON.parse(recovery.args[recovery.args.indexOf("-AuditJson") + 1]),
+    {
+      version: 1,
+      branch: "main",
+      head: "1".repeat(40),
+      fingerprint: auditFingerprint,
+      changes: [
+        {
+          code: "??",
+          path: auditedMeta,
+          originalPath: null,
+          auditBlob,
+        },
+      ],
+    },
+  );
   const inspectionEvidence = progress.find(
     (entry) => entry.phase === "workspace-inspected",
   );
   assert.equal(inspectionEvidence.data.branch, "main");
   assert.equal(inspectionEvidence.data.head, "1".repeat(40));
-  assert.deepEqual(inspectionEvidence.data.untrackedFiles, [
-    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta",
-  ]);
+  assert.deepEqual(inspectionEvidence.data.untrackedFiles, [auditedMeta]);
   const preservationEvidence = progress.find(
     (entry) => entry.phase === "workspace-preserved",
   );
@@ -413,6 +463,97 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
   assert.equal(
     preservationEvidence.data.preservedCommit,
     result.preservedCommit,
+  );
+});
+
+test("recovery proof failure stops before health, checkpoint, reset, clean, or restart", async () => {
+  const calls = [];
+  const recoveryContext = context();
+  recoveryContext.workspaceEstablished = false;
+  const auditedPath = "baloot_client/Assets/中文 技能/Automation meta.asset";
+  const auditBlob = "6".repeat(40);
+  const auditFingerprint = "7".repeat(64);
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push(name);
+    if (name === "Inspect-PreservedWorkspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          ready: true,
+          repositoryExists: true,
+          branch: "main",
+          head: "1".repeat(40),
+          porcelainV2: ["# branch.head main"],
+          untrackedFiles: [auditedPath],
+          audit: {
+            version: 1,
+            branch: "main",
+            head: "1".repeat(40),
+            fingerprint: auditFingerprint,
+            changes: [
+              {
+                code: "??",
+                path: auditedPath,
+                originalPath: null,
+                auditBlob,
+              },
+            ],
+          },
+        }),
+        stderr: "",
+      };
+    }
+    if (name === "Recover-Workspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          ready: true,
+          originalHead: "1".repeat(40),
+          auditFingerprint,
+          preservedBranch:
+            "relay/preserved/task-0001-real-host-task-20260727T120000000Z-acde1234abcd",
+          preservedCommit: "2".repeat(40),
+          preservedTree: "3".repeat(40),
+          preservedNameStatus: [{ status: "A", path: auditedPath }],
+          preservedFiles: [
+            {
+              path: auditedPath,
+              auditBlob,
+              preservedBlob: "8".repeat(40),
+            },
+          ],
+          preservationVerified: true,
+        }),
+        stderr: "",
+      };
+    }
+    throw new Error(`Unexpected call ${name}`);
+  };
+  const adapter = new HyperVAdapter(config({ checkpointsEnabled: true }), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    () => adapter.resumePreserved(recoveryContext, {}),
+    (error) => error?.code === "WORKSPACE_PRESERVATION_UNPROVEN",
+  );
+  assert.deepEqual(calls, [
+    "Inspect-PreservedWorkspace.ps1",
+    "Recover-Workspace.ps1",
+  ]);
+  assert.equal(
+    calls.some((name) =>
+      [
+        "Get-WorkerHealth.ps1",
+        "Restore-Worker.ps1",
+        "Ensure-WorkerReady.ps1",
+        "Control-Worker.ps1",
+        "Restart-Relay.ps1",
+      ].includes(name),
+    ),
+    false,
   );
 });
 
@@ -451,9 +592,13 @@ test("an unproven matching task branch remains blocked without verification or r
 test("the recovery call chain contains no checkpoint, reset, clean, restore, or worker control", () => {
   const sources = [
     "Inspect-PreservedWorkspace.ps1",
+    "Inspect-PreservedWorkspace.Guest.ps1",
     "Recover-Workspace.ps1",
     "Prepare-Workspace.ps1",
     "Prepare-Workspace.Guest.ps1",
+    "Verify-PreservedWorkspace.ps1",
+    "Verify-PreservedWorkspace.Guest.ps1",
+    "Workspace-Git.ps1",
   ].map((scriptFile) =>
     fs.readFileSync(
       new URL(`../../scripts/hyperv/${scriptFile}`, import.meta.url),
