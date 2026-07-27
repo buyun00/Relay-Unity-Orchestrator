@@ -35,6 +35,7 @@ $script:blobVerified = $false
 $script:verifiedFiles = @()
 $script:taskBranchCreated = $false
 $script:currentBranch = $null
+$script:candidateDiagnostics = $null
 
 if (-not (Get-Command Invoke-RelayGit -CommandType Function -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot 'Workspace-Git.ps1')
@@ -160,6 +161,7 @@ function New-RefusalResult(
         preservedTree = $script:preservedTree
         preservedNameStatus = @($script:preservedNameStatus)
         preservedFiles = @($script:preservedFiles)
+        candidateDiagnostics = $script:candidateDiagnostics
         reusedPreservation = $script:reusedPreservation
         preservationVerified = $script:preservationVerified
         preTargetCheckoutBranch = $script:preTargetCheckoutBranch
@@ -345,6 +347,7 @@ if (-not $auditMatch.matches) {
     }
     return (Complete-Result (New-RefusalResult @refusalArguments))
 }
+$skipWorktreePaths = @(Get-RelaySkipWorktreePaths $ProjectPath)
 
 $porcelainV2Result = Invoke-RelayGit $ProjectPath @(
     'status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'
@@ -627,9 +630,28 @@ if ($shouldPreserve) {
             if (Test-Path -LiteralPath $evidenceIndex) {
                 throw "Generated preservation evidence index '$evidenceIndex' already exists."
             }
-            $indexEnvironment = @{ GIT_INDEX_FILE = $evidenceIndex }
+            $indexEnvironment = @{
+                GIT_INDEX_FILE = $evidenceIndex
+                GIT_LITERAL_PATHSPECS = '1'
+            }
             Invoke-Git @('read-tree', $originalHead) $indexEnvironment | Out-Null
-            Invoke-Git @('add', '--all') $indexEnvironment | Out-Null
+            $preservationPaths = @(
+                foreach ($auditedFile in $script:auditedFiles) {
+                    ConvertTo-RelayGitPath ([string]$auditedFile.path)
+                    if (
+                        -not [string]::IsNullOrEmpty(
+                            [string]$auditedFile.originalPath
+                        )
+                    ) {
+                        ConvertTo-RelayGitPath ([string]$auditedFile.originalPath)
+                    }
+                }
+            )
+            foreach ($preservationPath in $preservationPaths) {
+                Invoke-Git @(
+                    'add', '--all', '--', [string]$preservationPath
+                ) $indexEnvironment | Out-Null
+            }
             $script:preservedTree = Get-GitValue @('write-tree') $indexEnvironment
 
             $beforeCommit = Test-WorkspaceMatchesAudit `
@@ -659,6 +681,13 @@ if ($shouldPreserve) {
                 $ProjectPath $preservedCommit $originalHead $script:auditedFiles `
                 $script:auditFingerprint
             if (-not $candidateProof.valid) {
+                $script:candidateDiagnostics = $candidateProof
+                if (
+                    $candidateProof.PSObject.Properties.Name -contains
+                        'changes'
+                ) {
+                    $script:preservedNameStatus = @($candidateProof.changes)
+                }
                 $refusalArguments = @{
                     Code = 'WORKSPACE_PRESERVATION_UNPROVEN'
                     Message = "New preservation commit failed validation: $($candidateProof.reason)"
@@ -819,6 +848,13 @@ if ($preservedCommit) {
     # current tracked and untracked file. Align only the index first so the
     # subsequent branch switch does not overwrite the working tree.
     Invoke-Git @('read-tree', $preservedCommit) | Out-Null
+    $literalPathEnvironment = @{ GIT_LITERAL_PATHSPECS = '1' }
+    foreach ($skipWorktreePath in $skipWorktreePaths) {
+        Invoke-Git @(
+            'update-index', '--skip-worktree', '--',
+            [string]$skipWorktreePath
+        ) $literalPathEnvironment | Out-Null
+    }
     Invoke-Git @('checkout', $preservedBranch) | Out-Null
     $preservedCheckoutBranch = Get-GitValue @('branch', '--show-current')
     $preservedCheckoutHead = Get-GitValue @('rev-parse', '--verify', 'HEAD')

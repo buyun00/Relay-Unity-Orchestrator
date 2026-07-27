@@ -866,16 +866,67 @@ test("one invalid legacy preservation ref is retained while recovery creates a v
     "refs/heads/relay/preserved/task-0017-task-*",
   );
   assert.equal(preservationRefs.length, 2);
-  assert.equal(
-    preservationRefs.includes(`refs/heads/${invalidBranch}`),
-    true,
-  );
+  assert.equal(preservationRefs.includes(`refs/heads/${invalidBranch}`), true);
   assert.equal(
     preservationRefs.includes(`refs/heads/${result.preservedBranch}`),
     true,
   );
   assert.equal(git(project, "status", "--porcelain=v1"), "");
   assert.doesNotMatch(JSON.stringify(result), /unexpected: \./u);
+});
+
+test("recovery preserves sparse baseline entries while adding only audited paths", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-sparse-baseline");
+  const sparseBaselinePath = "baloot_client/Assets/Tournament/Tracked.asset";
+  const untrackedPath =
+    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
+  const sparseBaselineFile = path.join(
+    project,
+    ...sparseBaselinePath.split("/"),
+  );
+  write(
+    path.join(project, ...untrackedPath.split("/")),
+    "fileFormatVersion: 2\nguid: sparse-preservation\n",
+  );
+  git(project, "update-index", "--skip-worktree", "--", sparseBaselinePath);
+  fs.unlinkSync(sparseBaselineFile);
+
+  const inspection = inspect(project);
+  assert.deepEqual(
+    inspection.audit.changes.map(({ code, path: auditedPath }) => [
+      code,
+      auditedPath,
+    ]),
+    [["??", untrackedPath]],
+  );
+
+  const result = prepare(
+    project,
+    repository,
+    taskBranch,
+    "recovery",
+    inspection.audit,
+  );
+
+  assert.equal(result.ready, true);
+  assert.equal(result.proven, true);
+  assert.deepEqual(
+    result.preservedNameStatus.map(({ status, path: changedPath }) => [
+      status[0],
+      changedPath,
+    ]),
+    [["A", untrackedPath]],
+  );
+  assert.equal(
+    git(
+      project,
+      "cat-file",
+      "-e",
+      `${result.preservedCommit}:${sparseBaselinePath}`,
+    ),
+    "",
+  );
 });
 
 test("multiple invalid legacy preservation refs remain ambiguous and unchanged", (t) => {

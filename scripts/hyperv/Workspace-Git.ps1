@@ -234,6 +234,19 @@ function Get-RelayWorkspaceStatus {
     return $entries.ToArray()
 }
 
+function Get-RelaySkipWorktreePaths {
+    param([Parameter(Mandatory = $true)][string]$RepositoryPath)
+
+    $result = Invoke-RelayGit $RepositoryPath @('ls-files', '-t', '-z')
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($record in @(ConvertFrom-RelayNulFields $result.stdoutBytes)) {
+        if ($record.StartsWith('S ', [System.StringComparison]::Ordinal)) {
+            $paths.Add((ConvertTo-RelayGitPath $record.Substring(2)))
+        }
+    }
+    return $paths.ToArray()
+}
+
 function Get-RelayPathBlob {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
@@ -458,6 +471,7 @@ function Test-RelayPreservationCommit {
             }
         }
 
+        $tree = Get-RelayGitValue $RepositoryPath @('rev-parse', "$Commit^{tree}")
         $expectedChanges = @(Get-RelayExpectedChanges $AuditedFiles)
         $actualChanges = @(Get-RelayCommitChanges $RepositoryPath $AuditHead $Commit)
         $comparison = Compare-RelayChangeSets $expectedChanges $actualChanges
@@ -465,6 +479,9 @@ function Test-RelayPreservationCommit {
             return [pscustomobject]@{
                 valid = $false
                 reason = "Commit '$Commit' name-status did not equal the audited change set."
+                parent = $AuditHead
+                tree = $tree
+                expectedChanges = $expectedChanges
                 changes = $actualChanges
                 missing = $comparison.missing
                 unexpected = $comparison.unexpected
@@ -513,7 +530,6 @@ function Test-RelayPreservationCommit {
                 blob = $commitBlob
             })
         }
-        $tree = Get-RelayGitValue $RepositoryPath @('rev-parse', "$Commit^{tree}")
         return [pscustomobject]@{
             valid = $true
             reason = $null
