@@ -190,12 +190,12 @@ export class Scheduler {
         this.emitProgress(
           context,
           "resume",
-          `Continuing preserved workspace on ${context.worker.name} without checkpoint restore or Git reset`,
+          `Inspecting preserved workspace on ${context.worker.name} without checkpoint restore, worker restart, or Git reset`,
         );
         await this.adapter.resumePreserved?.(context, {
           signal,
-          onProgress: (phase, message) =>
-            this.emitProgress(context, phase, message),
+          onProgress: (phase, message, data = null) =>
+            this.emitProgress(context, phase, message, "info", data),
         });
       } else {
         this.emitProgress(
@@ -205,10 +205,17 @@ export class Scheduler {
         );
         await this.adapter.prepare(context, {
           signal,
-          onProgress: (phase, message) =>
-            this.emitProgress(context, phase, message),
+          onProgress: (phase, message, data = null) =>
+            this.emitProgress(context, phase, message, "info", data),
         });
       }
+      this.emitProgress(
+        context,
+        "workspace-established",
+        `Task workspace ${context.task.branchName} is established and verified`,
+        "info",
+        { branchName: context.task.branchName },
+      );
       if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
 
       this.store.setTurnPhase(context.turn.id, "running");
@@ -269,8 +276,8 @@ export class Scheduler {
       );
       const delivery = await this.adapter.finalize(context, {
         signal,
-        onProgress: (phase, message) =>
-          this.emitProgress(context, phase, message),
+        onProgress: (phase, message, data = null) =>
+          this.emitProgress(context, phase, message, "info", data),
       });
       this.store.completeTurn(context.turn.id, {
         codexFinal: codexResult.final,
@@ -306,8 +313,8 @@ export class Scheduler {
       try {
         await this.adapter.release(context, {
           signal,
-          onProgress: (phase, message) =>
-            this.emitProgress(context, phase, message),
+          onProgress: (phase, message, data = null) =>
+            this.emitProgress(context, phase, message, "info", data),
         });
         this.store.releaseWorkerAfterSuccess(context.worker.id);
         this.emitProgress(

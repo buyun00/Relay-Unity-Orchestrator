@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$RepoUrl,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$BaseBranch,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$TaskBranch,
-    [Parameter(Mandatory = $true)][ValidateSet('new', 'resume')][string]$Mode,
+    [Parameter(Mandatory = $true)][ValidateSet('new', 'resume', 'recovery')][string]$Mode,
     [ValidateNotNullOrEmpty()][string]$GitAuthorName = 'Relay Unity Orchestrator',
     [ValidateNotNullOrEmpty()][string]$GitAuthorEmail = 'relay-unity-orchestrator@localhost',
     [string]$SharePath,
@@ -38,8 +38,10 @@ $gitResult = Invoke-Command -VMName $VMName -Credential $credential -ArgumentLis
 if (-not [bool]$gitResult.ready) {
     $refusal = $gitResult | Select-Object -Property @(
         'ready', 'code', 'message', 'projectPath', 'originalBranch', 'originalHead',
-        'statusBefore', 'blockedPaths', 'deletionPaths', 'prohibitedPaths',
-        'unsupportedChanges', 'preservedBranch', 'preservedCommit'
+        'statusBefore', 'porcelainV2Before', 'untrackedFilesBefore', 'blockedPaths',
+        'deletionPaths', 'prohibitedPaths', 'unsupportedChanges', 'preservedBranch',
+        'preservedCommit', 'preservedTree', 'preservedNameStatus',
+        'preservationVerified', 'preTargetCheckoutBranch', 'preTargetCheckoutHead'
     )
     [Console]::Error.WriteLine(
         "RELAY_WORKSPACE_REFUSED:$($refusal | ConvertTo-Json -Depth 12 -Compress)"
@@ -83,9 +85,16 @@ if (-not [string]::IsNullOrWhiteSpace($SharePath) -and -not (Test-Path -LiteralP
     originalBranch = $gitResult.originalBranch
     originalHead = $gitResult.originalHead
     statusBefore = $gitResult.statusBefore
+    porcelainV2Before = $gitResult.porcelainV2Before
+    untrackedFilesBefore = $gitResult.untrackedFilesBefore
     preservedBranch = $gitResult.preservedBranch
     preservedCommit = $gitResult.preservedCommit
+    preservedTree = $gitResult.preservedTree
+    preservedNameStatus = $gitResult.preservedNameStatus
     preservedFiles = $gitResult.preservedFiles
+    preservationVerified = $gitResult.preservationVerified
+    preTargetCheckoutBranch = $gitResult.preTargetCheckoutBranch
+    preTargetCheckoutHead = $gitResult.preTargetCheckoutHead
     unityReady = $unityReady
     skillReady = $skillReady
     smbReady = [string]::IsNullOrWhiteSpace($SharePath) -or (Test-Path -LiteralPath $SharePath)

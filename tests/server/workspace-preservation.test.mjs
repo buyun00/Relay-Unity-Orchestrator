@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 const guestScript = path.resolve("scripts/hyperv/Prepare-Workspace.Guest.ps1");
-const taskBranch = "codex/task-0042-preserve-incident";
+const taskBranch = "codex/task-0017-task";
 
 function git(cwd, ...args) {
   return execFileSync("git", args, {
@@ -31,9 +31,18 @@ function createRepository(t) {
 
   git(root, "init", "--bare", "-q", remote);
   git(root, "init", "-q", "-b", "main", seed);
-  write(path.join(seed, "Packages", "manifest.json"), '{"base":1}\n');
-  write(path.join(seed, "Packages", "packages-lock.json"), '{"lock":1}\n');
-  write(path.join(seed, "Assets", "Tournament", "Tracked.asset"), "base\n");
+  write(
+    path.join(seed, "baloot_client", "Packages", "manifest.json"),
+    '{"base":1}\n',
+  );
+  write(
+    path.join(seed, "baloot_client", "Packages", "packages-lock.json"),
+    '{"lock":1}\n',
+  );
+  write(
+    path.join(seed, "baloot_client", "Assets", "Tournament", "Tracked.asset"),
+    "base\n",
+  );
   git(seed, "add", ".");
   git(
     seed,
@@ -58,7 +67,7 @@ function clone(repository, name) {
   return project;
 }
 
-function prepare(project, repository, branch = taskBranch) {
+function prepare(project, repository, branch = taskBranch, mode = "new") {
   const stdout = execFileSync(
     "powershell.exe",
     [
@@ -78,7 +87,7 @@ function prepare(project, repository, branch = taskBranch) {
       "-Branch",
       branch,
       "-RequestedMode",
-      "new",
+      mode,
       "-AuthorName",
       "Relay Test",
       "-AuthorEmail",
@@ -96,17 +105,16 @@ function refs(project, ...prefixes) {
     .filter(Boolean);
 }
 
-test("safe Packages changes and an untracked meta file are preserved before target checkout", (t) => {
+test("recovery preserves every tracked and untracked task-0017 file before target checkout", (t) => {
   const repository = createRepository(t);
   const project = clone(repository, "guest-safe");
-  const manifest = path.join(project, "Packages", "manifest.json");
-  const packageLock = path.join(project, "Packages", "packages-lock.json");
-  const meta = path.join(
-    project,
-    "Assets",
-    "Tournament",
-    "Incident.prefab.meta",
-  );
+  const manifestPath = "baloot_client/Packages/manifest.json";
+  const packageLockPath = "baloot_client/Packages/packages-lock.json";
+  const metaPath =
+    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
+  const manifest = path.join(project, ...manifestPath.split("/"));
+  const packageLock = path.join(project, ...packageLockPath.split("/"));
+  const meta = path.join(project, ...metaPath.split("/"));
   const manifestContent = '{"base":2,"incident":true}\n';
   const packageLockContent = '{"lock":2,"incident":true}\n';
   const metaContent = "fileFormatVersion: 2\nguid: preserved-guid\n";
@@ -115,34 +123,56 @@ test("safe Packages changes and an untracked meta file are preserved before targ
   write(meta, metaContent);
 
   const originalHead = git(project, "rev-parse", "HEAD");
-  const result = prepare(project, repository);
+  const workspacePathsBefore = git(
+    project,
+    "ls-files",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+  )
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .sort();
+  const result = prepare(project, repository, taskBranch, "recovery");
 
-  assert.equal(result.ready, true);
+  assert.equal(result.ready, true, JSON.stringify(result, null, 2));
   assert.equal(result.originalBranch, "main");
   assert.equal(result.originalHead, originalHead);
   assert.equal(result.source, "origin/main");
+  assert.equal(result.preservationVerified, true);
+  assert.equal(result.preTargetCheckoutBranch, "main");
+  assert.equal(result.preTargetCheckoutHead, originalHead);
   assert.match(
     result.preservedBranch,
-    /^relay\/preserved\/codex-task-0042-preserve-incident-\d{8}T\d{9}Z(?:-\d+)?$/u,
+    /^relay\/preserved\/task-0017-task-\d{8}T\d{9}Z-[0-9a-f]{12}$/u,
   );
   assert.match(result.preservedCommit, /^[0-9a-f]{40}$/u);
+  assert.match(result.preservedTree, /^[0-9a-f]{40}$/u);
+  assert.ok(
+    result.porcelainV2Before.some((line) =>
+      line.startsWith("# branch.head main"),
+    ),
+  );
+  assert.deepEqual(result.untrackedFilesBefore, [metaPath]);
   assert.deepEqual(
     result.statusBefore.map(({ code, path: statusPath }) => [code, statusPath]),
     [
-      [" M", "Packages/manifest.json"],
-      [" M", "Packages/packages-lock.json"],
-      ["??", "Assets/Tournament/Incident.prefab.meta"],
+      [" M", manifestPath],
+      [" M", packageLockPath],
+      ["??", metaPath],
     ],
   );
   assert.deepEqual(
     result.preservedFiles
       .map(({ path: preservedPath }) => preservedPath)
       .sort(),
-    [
-      "Assets/Tournament/Incident.prefab.meta",
-      "Packages/manifest.json",
-      "Packages/packages-lock.json",
-    ],
+    [manifestPath, packageLockPath, metaPath].sort(),
+  );
+  assert.deepEqual(
+    result.preservedNameStatus
+      .map(({ status, path: changedPath }) => `${status}\t${changedPath}`)
+      .sort(),
+    [`A\t${metaPath}`, `M\t${manifestPath}`, `M\t${packageLockPath}`].sort(),
   );
 
   git(project, "cat-file", "-e", result.preservedCommit + "^{commit}");
@@ -151,24 +181,15 @@ test("safe Packages changes and an untracked meta file are preserved before targ
     result.preservedCommit,
   );
   assert.equal(
-    git(project, "show", result.preservedCommit + ":Packages/manifest.json") +
-      "\n",
+    git(project, "show", result.preservedCommit + ":" + manifestPath) + "\n",
     manifestContent,
   );
   assert.equal(
-    git(
-      project,
-      "show",
-      result.preservedCommit + ":Packages/packages-lock.json",
-    ) + "\n",
+    git(project, "show", result.preservedCommit + ":" + packageLockPath) + "\n",
     packageLockContent,
   );
   assert.equal(
-    git(
-      project,
-      "show",
-      result.preservedCommit + ":Assets/Tournament/Incident.prefab.meta",
-    ) + "\n",
+    git(project, "show", result.preservedCommit + ":" + metaPath) + "\n",
     metaContent,
   );
 
@@ -179,14 +200,20 @@ test("safe Packages changes and an untracked meta file are preserved before targ
     originalHead,
     result.preservedCommit,
   ).split(/\r?\n/u);
-  assert.deepEqual(preservedChanges.sort(), [
-    "A\tAssets/Tournament/Incident.prefab.meta",
-    "M\tPackages/manifest.json",
-    "M\tPackages/packages-lock.json",
-  ]);
+  assert.deepEqual(
+    preservedChanges.sort(),
+    [`A\t${metaPath}`, `M\t${manifestPath}`, `M\t${packageLockPath}`].sort(),
+  );
   assert.equal(
     preservedChanges.some((line) => line.startsWith("D\t")),
     false,
+  );
+  assert.deepEqual(
+    git(project, "ls-tree", "-r", "--name-only", result.preservedCommit)
+      .split(/\r?\n/u)
+      .filter(Boolean)
+      .sort(),
+    workspacePathsBefore,
   );
 
   assert.equal(git(project, "branch", "--show-current"), taskBranch);
@@ -197,12 +224,20 @@ test("safe Packages changes and an untracked meta file are preserved before targ
   assert.equal(git(project, "status", "--porcelain"), "");
   assert.equal(fs.existsSync(manifest), true);
   assert.equal(fs.existsSync(packageLock), true);
+  const checkoutHistory = git(project, "reflog", "--format=%gs", "HEAD");
+  assert.match(
+    checkoutHistory,
+    new RegExp(
+      `checkout: moving from main to ${result.preservedBranch.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`,
+      "u",
+    ),
+  );
 });
 
 test("a tracked deletion stops without checkout, preservation, or status changes", (t) => {
   const repository = createRepository(t);
   const project = clone(repository, "guest-deletion");
-  const deletedPath = "Assets/Tournament/Tracked.asset";
+  const deletedPath = "baloot_client/Assets/Tournament/Tracked.asset";
   fs.unlinkSync(path.join(project, ...deletedPath.split("/")));
   const originalBranch = git(project, "branch", "--show-current");
   const originalHead = git(project, "rev-parse", "HEAD");

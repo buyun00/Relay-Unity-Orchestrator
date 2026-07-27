@@ -203,7 +203,7 @@ test("workspace preparation reports the verified preservation branch", async () 
           ? {
               ready: true,
               preservedBranch:
-                "relay/preserved/codex-task-0001-real-host-task-20260727T120000000Z",
+                "relay/preserved/task-0001-real-host-task-20260727T120000000Z-acde1234abcd",
               preservedCommit: "a".repeat(40),
             }
           : { ready: true },
@@ -224,12 +224,15 @@ test("workspace preparation reports the verified preservation branch", async () 
   const preservation = progress.find(
     (entry) => entry.phase === "workspace-preserved",
   );
-  assert.match(preservation.message, /relay\/preserved\/codex-task-0001/u);
+  assert.match(preservation.message, /relay\/preserved\/task-0001/u);
   assert.match(preservation.message, new RegExp("a{40}", "u"));
 });
 
-test("preserved workspace continuation verifies readiness without restore or Git reset", async () => {
+test("an established task branch uses preserved verification without restart or restore", async () => {
   const calls = [];
+  const preservedContext = context();
+  preservedContext.task.codexThreadId = "thread-established-001";
+  preservedContext.workspaceEstablished = true;
   const processRunner = async (command, args) => {
     const name = scriptName(args);
     calls.push({ name, args });
@@ -245,7 +248,22 @@ test("preserved workspace continuation verifies readiness without restore or Git
               unity: true,
               skill: true,
             }
-          : { ready: true, branch: context().task.branchName, preserved: true },
+          : name === "Inspect-PreservedWorkspace.ps1"
+            ? {
+                ready: true,
+                repositoryExists: true,
+                branch: preservedContext.task.branchName,
+                head: "a".repeat(40),
+                porcelainV2: [
+                  "# branch.head " + preservedContext.task.branchName,
+                ],
+                untrackedFiles: [],
+              }
+            : {
+                ready: true,
+                branch: preservedContext.task.branchName,
+                preserved: true,
+              },
       ),
       stderr: "",
     };
@@ -255,20 +273,26 @@ test("preserved workspace continuation verifies readiness without restore or Git
     codex: { inspect: async () => ({}) },
   });
 
-  const result = await adapter.resumePreserved(context(), {});
+  const result = await adapter.resumePreserved(preservedContext, {});
 
   assert.equal(result.preserved, true);
+  assert.equal(result.recoveryPrepared, false);
   assert.deepEqual(
     calls.map((call) => call.name),
     [
-      "Ensure-WorkerReady.ps1",
+      "Inspect-PreservedWorkspace.ps1",
       "Verify-PreservedWorkspace.ps1",
       "Get-WorkerHealth.ps1",
     ],
   );
   assert.equal(
     calls.some((call) =>
-      ["Restore-Worker.ps1", "Prepare-Workspace.ps1"].includes(call.name),
+      [
+        "Ensure-WorkerReady.ps1",
+        "Restore-Worker.ps1",
+        "Prepare-Workspace.ps1",
+        "Recover-Workspace.ps1",
+      ].includes(call.name),
     ),
     false,
   );
@@ -277,8 +301,173 @@ test("preserved workspace continuation verifies readiness without restore or Git
   );
   assert.equal(
     verification.args[verification.args.indexOf("-TaskBranch") + 1],
-    context().task.branchName,
+    preservedContext.task.branchName,
   );
+});
+
+test("a pre-Codex prepare failure on main uses non-destructive recovery preparation", async () => {
+  const calls = [];
+  const progress = [];
+  const recoveryContext = context();
+  recoveryContext.workspaceEstablished = false;
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push({ name, args });
+    const payload =
+      name === "Inspect-PreservedWorkspace.ps1"
+        ? {
+            ready: true,
+            repositoryExists: true,
+            branch: "main",
+            head: "1".repeat(40),
+            porcelainV2: [
+              "# branch.head main",
+              "1 .M N... baloot_client/Packages/manifest.json",
+              "? baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta",
+            ],
+            untrackedFiles: [
+              "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta",
+            ],
+          }
+        : name === "Recover-Workspace.ps1"
+          ? {
+              ready: true,
+              branch: recoveryContext.task.branchName,
+              preservedBranch:
+                "relay/preserved/task-0001-real-host-task-20260727T120000000Z-acde1234abcd",
+              preservedCommit: "2".repeat(40),
+              preservedTree: "3".repeat(40),
+              preservedNameStatus: [
+                {
+                  status: "M",
+                  path: "baloot_client/Packages/manifest.json",
+                },
+              ],
+              preservationVerified: true,
+              preTargetCheckoutBranch: "main",
+              preTargetCheckoutHead: "1".repeat(40),
+            }
+          : {
+              ready: true,
+              vm: true,
+              heartbeat: true,
+              smb: true,
+              unity: true,
+              skill: true,
+            };
+    return { exitCode: 0, stdout: JSON.stringify(payload), stderr: "" };
+  };
+  const adapter = new HyperVAdapter(config({ checkpointsEnabled: true }), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  const result = await adapter.resumePreserved(recoveryContext, {
+    onProgress: (phase, message, data) =>
+      progress.push({ phase, message, data }),
+  });
+
+  assert.equal(result.preserved, true);
+  assert.equal(result.recoveryPrepared, true);
+  assert.deepEqual(
+    calls.map((call) => call.name),
+    [
+      "Inspect-PreservedWorkspace.ps1",
+      "Recover-Workspace.ps1",
+      "Get-WorkerHealth.ps1",
+    ],
+  );
+  assert.equal(
+    calls.some((call) =>
+      [
+        "Verify-PreservedWorkspace.ps1",
+        "Ensure-WorkerReady.ps1",
+        "Restore-Worker.ps1",
+        "Control-Worker.ps1",
+      ].includes(call.name),
+    ),
+    false,
+  );
+  const recovery = calls.find((call) => call.name === "Recover-Workspace.ps1");
+  assert.equal(
+    recovery.args[recovery.args.indexOf("-TaskBranch") + 1],
+    recoveryContext.task.branchName,
+  );
+  assert.equal(recovery.args[recovery.args.indexOf("-BaseBranch") + 1], "main");
+  const inspectionEvidence = progress.find(
+    (entry) => entry.phase === "workspace-inspected",
+  );
+  assert.equal(inspectionEvidence.data.branch, "main");
+  assert.equal(inspectionEvidence.data.head, "1".repeat(40));
+  assert.deepEqual(inspectionEvidence.data.untrackedFiles, [
+    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta",
+  ]);
+  const preservationEvidence = progress.find(
+    (entry) => entry.phase === "workspace-preserved",
+  );
+  assert.equal(preservationEvidence.data.preservationVerified, true);
+  assert.equal(
+    preservationEvidence.data.preservedBranch,
+    result.preservedBranch,
+  );
+  assert.equal(
+    preservationEvidence.data.preservedCommit,
+    result.preservedCommit,
+  );
+});
+
+test("an unproven matching task branch remains blocked without verification or recovery", async () => {
+  const calls = [];
+  const unprovenContext = context();
+  unprovenContext.workspaceEstablished = false;
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push(name);
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        ready: true,
+        repositoryExists: true,
+        branch: unprovenContext.task.branchName,
+        head: "4".repeat(40),
+        porcelainV2: ["# branch.head " + unprovenContext.task.branchName],
+        untrackedFiles: [],
+      }),
+      stderr: "",
+    };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    () => adapter.resumePreserved(unprovenContext, {}),
+    (error) => error?.code === "WORKSPACE_ESTABLISHMENT_UNPROVEN",
+  );
+  assert.deepEqual(calls, ["Inspect-PreservedWorkspace.ps1"]);
+});
+
+test("the recovery call chain contains no checkpoint, reset, clean, restore, or worker control", () => {
+  const sources = [
+    "Inspect-PreservedWorkspace.ps1",
+    "Recover-Workspace.ps1",
+    "Prepare-Workspace.ps1",
+    "Prepare-Workspace.Guest.ps1",
+  ].map((scriptFile) =>
+    fs.readFileSync(
+      new URL(`../../scripts/hyperv/${scriptFile}`, import.meta.url),
+      "utf8",
+    ),
+  );
+  const recoveryChain = sources.join("\n");
+
+  assert.doesNotMatch(
+    recoveryChain,
+    /(?:Restore-Worker|Ensure-WorkerReady|Control-Worker|Restart-Relay)/u,
+  );
+  assert.doesNotMatch(recoveryChain, /(?:'|")(?:reset|clean|restore)(?:'|")/u);
+  assert.doesNotMatch(recoveryChain, /\bRemove-Item\b/u);
 });
 
 test("worker start and restart wait for PowerShell Direct before health probing", async () => {

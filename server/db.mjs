@@ -1496,7 +1496,26 @@ export class Store {
     const worker = turn.workerId ? this.getWorker(turn.workerId) : null;
     const project = task ? this.getProject(task.projectId) : null;
     const attachments = this.listTurnAttachments(turnId);
-    return { task, turn, worker, project, attachments };
+    const workspaceEstablished = Boolean(
+      task?.codexThreadId ||
+      this.db
+        .prepare(
+          `
+            SELECT 1 FROM events
+            WHERE task_id=? AND type='turn.workspace-established'
+            LIMIT 1
+          `,
+        )
+        .get(task?.id),
+    );
+    return {
+      task,
+      turn,
+      worker,
+      project,
+      attachments,
+      workspaceEstablished,
+    };
   }
 
   setTurnPhase(turnId, status) {

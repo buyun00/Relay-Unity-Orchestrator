@@ -114,7 +114,10 @@ async function nextTimestamp() {
 class TrackingFakeAdapter extends FakeAdapter {
   prepareCalls = 0;
   resumeCalls = 0;
+  verifyCalls = 0;
+  recoveryCalls = 0;
   releaseCalls = 0;
+  controlCalls = [];
 
   async prepare(...args) {
     this.prepareCalls += 1;
@@ -126,9 +129,36 @@ class TrackingFakeAdapter extends FakeAdapter {
     return super.resumePreserved(...args);
   }
 
+  async verifyPreserved(...args) {
+    this.verifyCalls += 1;
+    return super.verifyPreserved(...args);
+  }
+
+  async recoverPreserved(...args) {
+    this.recoveryCalls += 1;
+    return super.recoverPreserved(...args);
+  }
+
   async release(...args) {
     this.releaseCalls += 1;
     return super.release(...args);
+  }
+
+  async controlWorker(worker, action) {
+    this.controlCalls.push(action);
+    return super.controlWorker(worker, action);
+  }
+}
+
+class RecoveryFailingFakeAdapter extends TrackingFakeAdapter {
+  async recoverPreserved() {
+    this.recoveryCalls += 1;
+    throw Object.assign(
+      new Error(
+        "Preservation proof failed for baloot_client/Packages/manifest.json",
+      ),
+      { code: "WORKSPACE_PRESERVATION_UNPROVEN" },
+    );
   }
 }
 
@@ -542,6 +572,8 @@ test("a message after delivery failure resumes the preserved worker without prep
   );
   assert.equal(adapter.prepareCalls, 1);
   assert.equal(adapter.resumeCalls, 1);
+  assert.equal(adapter.verifyCalls, 1);
+  assert.equal(adapter.recoveryCalls, 0);
   assert.equal(adapter.releaseCalls, 1);
   assert.ok(
     store
@@ -550,8 +582,140 @@ test("a message after delivery failure resumes the preserved worker without prep
         (event) =>
           event.turnId === continued.id &&
           event.type === "turn.resume" &&
-          event.message.includes("without checkpoint restore or Git reset"),
+          event.message.includes(
+            "without checkpoint restore, worker restart, or Git reset",
+          ),
       ),
+  );
+});
+
+test("a pre-Codex prepare failure routes its attention worker through recovery, not verification", async (t) => {
+  const config = createConfig();
+  const adapter = new TrackingFakeAdapter(config);
+  const store = new Store(config);
+  const { project, worker } = seedProjectAndWorker(store);
+  const scheduler = new Scheduler({ config, store, adapter });
+  t.after(async () => {
+    scheduler.stop();
+    await waitUntil(
+      () => scheduler.controllers.size === 0 && scheduler.pumping === false,
+      "scheduler cleanup",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  const created = createTask(store, project.id, {
+    title: "Prepare failed before task branch creation",
+    message: "Initial preparation fails [fake:fail=prepare]",
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention" &&
+      scheduler.status().activeTurns === 0,
+    "the initial preparation failure",
+  );
+  assert.equal(store.getTask(created.task.id).codexThreadId, null);
+  assert.equal(
+    store
+      .listTaskEvents(created.task.id)
+      .some((event) => event.type === "turn.workspace-established"),
+    false,
+  );
+
+  const continued = store.appendTurn(created.task.id, {
+    message: "Recover the preserved main workspace and continue",
+  });
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(continued.id).status === "success" &&
+      scheduler.status().activeTurns === 0,
+    "the non-destructive recovery continuation",
+  );
+
+  assert.equal(adapter.prepareCalls, 1);
+  assert.equal(adapter.resumeCalls, 1);
+  assert.equal(adapter.verifyCalls, 0);
+  assert.equal(adapter.recoveryCalls, 1);
+  assert.deepEqual(adapter.controlCalls, []);
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some(
+        (event) =>
+          event.turnId === continued.id &&
+          event.type === "turn.workspace-recovery",
+      ),
+  );
+});
+
+test("failed recovery keeps attention without checkpoint, reset, restart, or release", async (t) => {
+  const config = createConfig();
+  const adapter = new RecoveryFailingFakeAdapter(config);
+  const store = new Store(config);
+  const { project, worker } = seedProjectAndWorker(store);
+  const scheduler = new Scheduler({ config, store, adapter });
+  t.after(async () => {
+    scheduler.stop();
+    await waitUntil(
+      () => scheduler.controllers.size === 0 && scheduler.pumping === false,
+      "scheduler cleanup",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  const created = createTask(store, project.id, {
+    title: "Recovery proof failure",
+    message: "Initial preparation fails [fake:fail=prepare]",
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention",
+    "the initial preparation failure",
+  );
+  const continued = store.appendTurn(created.task.id, {
+    message: "Attempt evidence-backed recovery",
+  });
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(continued.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention" &&
+      scheduler.status().activeTurns === 0,
+    "the recovery proof failure",
+  );
+
+  assert.equal(
+    store.getTurn(continued.id).errorCode,
+    "WORKSPACE_PRESERVATION_UNPROVEN",
+  );
+  assert.equal(store.getWorker(worker.id).currentTurnId, null);
+  assert.equal(adapter.verifyCalls, 0);
+  assert.equal(adapter.recoveryCalls, 1);
+  assert.equal(adapter.releaseCalls, 0);
+  assert.deepEqual(adapter.controlCalls, []);
+  const recoveryEvents = store
+    .listTaskEvents(created.task.id)
+    .filter((event) => event.turnId === continued.id);
+  assert.equal(
+    recoveryEvents.some((event) =>
+      ["turn.restore", "turn.release", "turn.released"].includes(event.type),
+    ),
+    false,
+  );
+  assert.match(
+    store.getWorker(worker.id).lastError,
+    /baloot_client\/Packages\/manifest\.json/u,
   );
 });
 

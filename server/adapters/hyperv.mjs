@@ -270,14 +270,81 @@ export class HyperVAdapter {
 
   async resumePreserved(context, { signal, onProgress }) {
     onProgress?.(
-      "vm-ready",
-      `Ensuring ${context.worker.vmName} and PowerShell Direct are ready`,
+      "workspace-inspect",
+      `Recording the current guest branch, HEAD, porcelain v2 status, and untracked files on ${context.worker.vmName}`,
     );
-    await this.powershell(
-      "Ensure-WorkerReady.ps1",
-      this.workerArguments(context.worker),
+    const inspection = await this.powershell(
+      "Inspect-PreservedWorkspace.ps1",
+      {
+        ...this.workerArguments(context.worker),
+        GuestProjectPath: required(
+          context.project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+      },
       { signal },
     );
+    if (!inspection.ready || !inspection.repositoryExists) {
+      throw Object.assign(
+        new Error(
+          inspection.message ||
+            `Preserved Git workspace was not found at ${context.project.guestProjectPath}`,
+        ),
+        {
+          code: inspection.code || "PRESERVED_WORKSPACE_NOT_FOUND",
+          details: inspection,
+        },
+      );
+    }
+    onProgress?.(
+      "workspace-inspected",
+      `Recorded guest branch ${inspection.branch || "(detached)"} at ${inspection.head}`,
+      {
+        branch: inspection.branch || null,
+        head: inspection.head || null,
+        porcelainV2: Array.isArray(inspection.porcelainV2)
+          ? inspection.porcelainV2
+          : [],
+        untrackedFiles: Array.isArray(inspection.untrackedFiles)
+          ? inspection.untrackedFiles
+          : [],
+      },
+    );
+
+    const taskBranch = required(context.task.branchName, "task.branchName");
+    const workspaceEstablished = Boolean(
+      context.workspaceEstablished || context.task.codexThreadId,
+    );
+    if (inspection.branch === taskBranch) {
+      if (!workspaceEstablished) {
+        throw Object.assign(
+          new Error(
+            `Guest branch is '${taskBranch}', but Relay has no durable evidence that task workspace preparation completed; refusing preserved verification`,
+          ),
+          {
+            code: "WORKSPACE_ESTABLISHMENT_UNPROVEN",
+            details: {
+              inspection,
+              taskBranch,
+              codexThreadId: context.task.codexThreadId || null,
+              workspaceEstablished: false,
+            },
+          },
+        );
+      }
+      return this.verifyPreserved(context, inspection, {
+        signal,
+        onProgress,
+      });
+    }
+
+    return this.recoverPreserved(context, inspection, {
+      signal,
+      onProgress,
+    });
+  }
+
+  async verifyPreserved(context, inspection, { signal, onProgress }) {
     onProgress?.(
       "workspace",
       `Verifying preserved ${context.task.branchName} workspace without resetting it`,
@@ -294,6 +361,89 @@ export class HyperVAdapter {
       },
       { signal },
     );
+    return this.finishPreservedResume(
+      context,
+      { ...result, inspection, recoveryPrepared: false },
+      { onProgress },
+    );
+  }
+
+  async recoverPreserved(context, inspection, { signal, onProgress }) {
+    onProgress?.(
+      "workspace-recovery",
+      `Guest is on ${inspection.branch || "a detached HEAD"} at ${inspection.head}; preserving it before creating ${context.task.branchName}`,
+    );
+    const result = await this.powershell(
+      "Recover-Workspace.ps1",
+      {
+        ...this.workerArguments(context.worker),
+        GuestProjectPath: required(
+          context.project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+        RepoUrl: required(context.project.repoUrl, "project.repoUrl"),
+        BaseBranch: required(context.task.baseBranch, "task.baseBranch"),
+        TaskBranch: required(context.task.branchName, "task.branchName"),
+        GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
+        GitAuthorEmail:
+          this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
+        SharePath: context.worker.sharePath || context.project.smbPath,
+        UnityHealthUrl: resolveWorkerTemplate(
+          context.project.unityHealthUrl || context.project.unitySkillUrl,
+          context.worker,
+        ),
+      },
+      { signal },
+    );
+    if (
+      !result.preservationVerified ||
+      !result.preservedBranch ||
+      !result.preservedCommit
+    ) {
+      throw Object.assign(
+        new Error(
+          "Recovery preparation did not return complete preservation proof; the worker remains in attention",
+        ),
+        {
+          code: "WORKSPACE_PRESERVATION_UNPROVEN",
+          details: { inspection, recovery: result },
+        },
+      );
+    }
+    onProgress?.(
+      "workspace-preserved",
+      `Verified ${result.preservedBranch} at ${result.preservedCommit} before creating ${context.task.branchName}`,
+      {
+        originalBranch: result.originalBranch || inspection.branch || null,
+        originalHead: result.originalHead || inspection.head || null,
+        porcelainV2: Array.isArray(result.porcelainV2Before)
+          ? result.porcelainV2Before
+          : [],
+        untrackedFiles: Array.isArray(result.untrackedFilesBefore)
+          ? result.untrackedFilesBefore
+          : [],
+        preservedBranch: result.preservedBranch,
+        preservedCommit: result.preservedCommit,
+        preservedTree: result.preservedTree || null,
+        preservedNameStatus: Array.isArray(result.preservedNameStatus)
+          ? result.preservedNameStatus
+          : [],
+        preservedFiles: Array.isArray(result.preservedFiles)
+          ? result.preservedFiles
+          : [],
+        preservationVerified: true,
+        preTargetCheckoutBranch: result.preTargetCheckoutBranch || null,
+        preTargetCheckoutHead: result.preTargetCheckoutHead || null,
+      },
+    );
+    return this.finishPreservedResume(
+      context,
+      { ...result, inspection, recoveryPrepared: true },
+      { onProgress },
+    );
+  }
+
+  async finishPreservedResume(context, result, { onProgress }) {
     const health = await this.probeWorker({
       ...context.worker,
       project: context.project,
@@ -308,7 +458,9 @@ export class HyperVAdapter {
     }
     onProgress?.(
       "unity",
-      "Preserved Git branch, Unity, SMB, and Unity Skill are ready",
+      result.recoveryPrepared
+        ? "Recovered task branch, Unity, SMB, and Unity Skill are ready"
+        : "Preserved Git branch, Unity, SMB, and Unity Skill are ready",
     );
     return { ...result, preserved: true };
   }

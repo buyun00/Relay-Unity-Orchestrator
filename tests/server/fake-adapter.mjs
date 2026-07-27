@@ -51,6 +51,13 @@ export class FakeAdapter {
   }
 
   async resumePreserved(context, { signal, onProgress }) {
+    if (!context.workspaceEstablished && !context.task.codexThreadId) {
+      return this.recoverPreserved(context, { signal, onProgress });
+    }
+    return this.verifyPreserved(context, { signal, onProgress });
+  }
+
+  async verifyPreserved(context, { signal, onProgress }) {
     onProgress?.(
       "workspace",
       `Verifying preserved ${context.task.branchName} workspace`,
@@ -62,6 +69,22 @@ export class FakeAdapter {
       workspace: context.worker.sharePath,
       resumed: true,
       preserved: true,
+    };
+  }
+
+  async recoverPreserved(context, { signal, onProgress }) {
+    onProgress?.(
+      "workspace-recovery",
+      `Safely preserving the pre-Codex workspace before creating ${context.task.branchName}`,
+    );
+    await sleep(this.config.phaseMs, signal);
+    onProgress?.("unity", "Recovered task workspace and Unity are ready");
+    await sleep(this.config.phaseMs, signal);
+    return {
+      workspace: context.worker.sharePath,
+      resumed: false,
+      preserved: true,
+      recoveryPrepared: true,
     };
   }
 
