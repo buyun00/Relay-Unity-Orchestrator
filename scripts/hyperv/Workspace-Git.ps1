@@ -231,6 +231,41 @@ function Get-RelayWorkspaceStatus {
             originalPath = $originalPath
         })
     }
+
+    # A previous interrupted recovery or a sparse checkout can leave tracked
+    # paths marked skip-worktree. Git status deliberately hides those paths,
+    # even when an existing working-tree file no longer matches the audited
+    # commit. Surface only real, present-file drift; absent sparse baseline
+    # entries remain tree context and are not treated as deletions.
+    $knownPaths = New-Object 'System.Collections.Generic.HashSet[string]' (
+        [System.StringComparer]::Ordinal
+    )
+    foreach ($entry in $entries) {
+        [void]$knownPaths.Add((ConvertTo-RelayGitPath ([string]$entry.path)))
+    }
+    $head = Get-RelayGitValue $RepositoryPath @('rev-parse', '--verify', 'HEAD')
+    $literalPathEnvironment = @{ GIT_LITERAL_PATHSPECS = '1' }
+    foreach ($skipPath in @(Get-RelaySkipWorktreePaths $RepositoryPath)) {
+        if ($knownPaths.Contains($skipPath)) { continue }
+        $absolutePath = Join-Path $RepositoryPath $skipPath
+        if (-not (Test-Path -LiteralPath $absolutePath -PathType Leaf)) {
+            continue
+        }
+        $headEntry = Invoke-RelayGit $RepositoryPath @(
+            'ls-tree', '-z', '--format=%(objectname)', $head, '--', $skipPath
+        ) $literalPathEnvironment
+        $headBlobs = @(ConvertFrom-RelayNulFields $headEntry.stdoutBytes)
+        if ($headBlobs.Count -ne 1) {
+            throw "Unable to resolve the audited HEAD blob for skip-worktree path '$skipPath'."
+        }
+        $worktreeBlob = Get-RelayPathBlob $RepositoryPath $skipPath
+        if ($worktreeBlob -eq $headBlobs[0]) { continue }
+        $entries.Add([pscustomobject]@{
+            code = ' M'
+            path = $skipPath
+            originalPath = $null
+        })
+    }
     return $entries.ToArray()
 }
 

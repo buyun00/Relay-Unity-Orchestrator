@@ -526,8 +526,24 @@ if ($shouldPreserve) {
             commit = $fields[1]
         })
     }
-    $validCandidates = New-Object System.Collections.Generic.List[object]
+    $currentCheckpointRefs = New-Object System.Collections.Generic.List[object]
+    $auditCandidateRefs = New-Object System.Collections.Generic.List[object]
     foreach ($candidate in $matchingRefs) {
+        if (
+            $candidate.branch -eq $originalBranch -and
+            $candidate.commit -eq $originalHead -and
+            $originalBranch.StartsWith(
+                $preservationPrefix,
+                [System.StringComparison]::Ordinal
+            )
+        ) {
+            $currentCheckpointRefs.Add($candidate)
+        } else {
+            $auditCandidateRefs.Add($candidate)
+        }
+    }
+    $validCandidates = New-Object System.Collections.Generic.List[object]
+    foreach ($candidate in $auditCandidateRefs) {
         $proof = Test-RelayPreservationCommit `
             $ProjectPath $candidate.commit $originalHead $script:auditedFiles `
             $script:auditFingerprint
@@ -541,11 +557,11 @@ if ($shouldPreserve) {
     }
 
     if ($validCandidates.Count -gt 1 -or (
-        $validCandidates.Count -eq 0 -and $matchingRefs.Count -gt 1
+        $validCandidates.Count -eq 0 -and $auditCandidateRefs.Count -gt 1
     )) {
         $refusalArguments = @{
             Code = 'WORKSPACE_PRESERVATION_AMBIGUOUS'
-            Message = "Recovery found $($matchingRefs.Count) existing preservation refs and $($validCandidates.Count) uniquely valid candidates; none were changed."
+            Message = "Recovery found $($matchingRefs.Count) existing preservation refs, $($currentCheckpointRefs.Count) current checkpoint refs, and $($validCandidates.Count) uniquely valid candidates; none were changed."
             Status = $statusBefore
             BlockedPaths = @()
             DeletionPaths = @()
@@ -865,6 +881,17 @@ if ($preservedCommit) {
         $preservedCheckoutStatus.Count -gt 0
     ) {
         throw "Preserved branch checkout proof failed at '$preservedCheckoutBranch' '$preservedCheckoutHead'; expected '$preservedBranch' '$preservedCommit'."
+    }
+    $auditedSkipWorktreePaths = @(
+        $script:auditedFiles |
+            ForEach-Object { ConvertTo-RelayGitPath ([string]$_.path) } |
+            Where-Object { $skipWorktreePaths -contains $_ }
+    )
+    foreach ($auditedSkipWorktreePath in $auditedSkipWorktreePaths) {
+        Invoke-Git @(
+            'update-index', '--no-skip-worktree', '--',
+            [string]$auditedSkipWorktreePath
+        ) $literalPathEnvironment | Out-Null
     }
 }
 if ($localTaskExists) {

@@ -879,6 +879,7 @@ test("recovery preserves sparse baseline entries while adding only audited paths
   const repository = createRepository(t);
   const project = clone(repository, "guest-sparse-baseline");
   const sparseBaselinePath = "baloot_client/Assets/Tournament/Tracked.asset";
+  const hiddenModifiedPath = "baloot_client/Packages/manifest.json";
   const untrackedPath =
     "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
   const sparseBaselineFile = path.join(
@@ -889,16 +890,23 @@ test("recovery preserves sparse baseline entries while adding only audited paths
     path.join(project, ...untrackedPath.split("/")),
     "fileFormatVersion: 2\nguid: sparse-preservation\n",
   );
+  git(project, "update-index", "--skip-worktree", "--", hiddenModifiedPath);
+  write(
+    path.join(project, ...hiddenModifiedPath.split("/")),
+    '{"base":2,"hidden-by-skip-worktree":true}\n',
+  );
   git(project, "update-index", "--skip-worktree", "--", sparseBaselinePath);
   fs.unlinkSync(sparseBaselineFile);
 
   const inspection = inspect(project);
   assert.deepEqual(
-    inspection.audit.changes.map(({ code, path: auditedPath }) => [
-      code,
-      auditedPath,
-    ]),
-    [["??", untrackedPath]],
+    inspection.audit.changes
+      .map(({ code, path: auditedPath }) => [code, auditedPath])
+      .sort((left, right) => left[1].localeCompare(right[1])),
+    [
+      ["??", untrackedPath],
+      [" M", hiddenModifiedPath],
+    ].sort((left, right) => left[1].localeCompare(right[1])),
   );
 
   const result = prepare(
@@ -912,11 +920,13 @@ test("recovery preserves sparse baseline entries while adding only audited paths
   assert.equal(result.ready, true);
   assert.equal(result.proven, true);
   assert.deepEqual(
-    result.preservedNameStatus.map(({ status, path: changedPath }) => [
-      status[0],
-      changedPath,
-    ]),
-    [["A", untrackedPath]],
+    result.preservedNameStatus
+      .map(({ status, path: changedPath }) => [status[0], changedPath])
+      .sort((left, right) => left[1].localeCompare(right[1])),
+    [
+      ["A", untrackedPath],
+      ["M", hiddenModifiedPath],
+    ].sort((left, right) => left[1].localeCompare(right[1])),
   );
   assert.equal(
     git(
@@ -927,6 +937,119 @@ test("recovery preserves sparse baseline entries while adding only audited paths
     ),
     "",
   );
+});
+
+test("recovery continues from its current preservation checkpoint without rewriting older refs", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-preservation-checkpoint");
+  const untrackedPath =
+    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
+  const hiddenModifiedPath = "baloot_client/Packages/manifest.json";
+  write(
+    path.join(project, ...untrackedPath.split("/")),
+    "fileFormatVersion: 2\nguid: checkpoint-preservation\n",
+  );
+  const originalHead = git(project, "rev-parse", "HEAD");
+  const firstInspection = inspect(project);
+  const alternateIndex = path.join(
+    repository.root,
+    "checkpoint-preserve.index",
+  );
+  const indexEnvironment = { GIT_INDEX_FILE: alternateIndex };
+  gitWithEnvironment(project, indexEnvironment, "read-tree", originalHead);
+  gitWithEnvironment(
+    project,
+    indexEnvironment,
+    "add",
+    "--all",
+    "--",
+    untrackedPath,
+  );
+  const checkpointTree = gitWithEnvironment(
+    project,
+    indexEnvironment,
+    "write-tree",
+  );
+  const checkpointCommit = git(
+    project,
+    "-c",
+    "user.name=Relay Test",
+    "-c",
+    "user.email=relay@test.invalid",
+    "commit-tree",
+    checkpointTree,
+    "-p",
+    originalHead,
+    "-m",
+    `chore(relay): preserve workspace before ${taskBranch}`,
+    "-m",
+    `Relay-Audit-Fingerprint: ${firstInspection.audit.fingerprint}`,
+  );
+  const legacyBranch =
+    "relay/preserved/task-0017-task-20260727T000000000Z-legacy000001";
+  const checkpointBranch =
+    "relay/preserved/task-0017-task-20260727T000000001Z-checkpoint001";
+  git(
+    project,
+    "update-ref",
+    `refs/heads/${legacyBranch}`,
+    originalHead,
+    "0".repeat(40),
+  );
+  git(
+    project,
+    "update-ref",
+    `refs/heads/${checkpointBranch}`,
+    checkpointCommit,
+    "0".repeat(40),
+  );
+  git(project, "read-tree", checkpointCommit);
+  git(project, "checkout", checkpointBranch);
+  git(project, "update-index", "--skip-worktree", "--", hiddenModifiedPath);
+  write(
+    path.join(project, ...hiddenModifiedPath.split("/")),
+    '{"base":2,"checkpoint-hidden-change":true}\n',
+  );
+
+  const secondInspection = inspect(project);
+  assert.deepEqual(
+    secondInspection.audit.changes.map(({ code, path: auditedPath }) => [
+      code,
+      auditedPath,
+    ]),
+    [[" M", hiddenModifiedPath]],
+  );
+
+  const result = prepare(
+    project,
+    repository,
+    taskBranch,
+    "recovery",
+    secondInspection.audit,
+  );
+
+  assert.equal(result.ready, true);
+  assert.equal(result.proven, true);
+  assert.equal(result.preservationParent, checkpointCommit);
+  assert.notEqual(result.preservedBranch, checkpointBranch);
+  assert.equal(
+    git(project, "rev-parse", `refs/heads/${legacyBranch}`),
+    originalHead,
+  );
+  assert.equal(
+    git(project, "rev-parse", `refs/heads/${checkpointBranch}`),
+    checkpointCommit,
+  );
+  assert.equal(
+    git(
+      project,
+      "cat-file",
+      "-e",
+      `${result.preservedCommit}:${untrackedPath}`,
+    ),
+    "",
+  );
+  assert.equal(git(project, "branch", "--show-current"), taskBranch);
 });
 
 test("multiple invalid legacy preservation refs remain ambiguous and unchanged", (t) => {
