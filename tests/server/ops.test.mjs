@@ -169,7 +169,7 @@ class ActionProposingOpsSession {
     options.onEvent?.({
       type: "codex.stderr",
       message:
-        "ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit",
+        "ERROR codex_core::tools::router: collab spawn failed: no thread with id",
     });
     return {
       threadId: "action-policy-codex-thread",
@@ -371,7 +371,7 @@ test("manual diagnosis stays read-only until the operator explicitly authorizes 
   );
   assert.ok(
     diagnosticEvents.every(
-      (event) => !event.message.includes("failed to refresh available models"),
+      (event) => !event.message.includes("collab spawn failed"),
     ),
   );
 

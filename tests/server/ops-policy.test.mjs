@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  isNonFatalCodexStderr,
-  manualActionAuthorized,
-} from "../../server/ops-policy.mjs";
+import { manualActionAuthorized } from "../../server/ops-policy.mjs";
 
 test("manual action authorization distinguishes diagnosis from execution", () => {
   const diagnosticMessages = [
@@ -32,17 +29,4 @@ test("manual action authorization distinguishes diagnosis from execution", () =>
   for (const message of actionMessages) {
     assert.equal(manualActionAuthorized(message), true, message);
   }
-});
-
-test("known model refresh timeout is treated as non-fatal progress noise", () => {
-  assert.equal(
-    isNonFatalCodexStderr(
-      "2026-07-27T07:24:56.148127Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit",
-    ),
-    true,
-  );
-  assert.equal(
-    isNonFatalCodexStderr("codex exited with code 1: authentication failed"),
-    false,
-  );
 });

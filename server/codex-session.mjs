@@ -118,8 +118,13 @@ export class CodexSessionRunner {
   }) {
     fs.mkdirSync(logDirectory, { recursive: true });
     const jsonlPath = path.join(logDirectory, `${logName}.jsonl`);
+    const stderrPath = path.join(logDirectory, `${logName}.stderr.log`);
     const finalPath = path.join(logDirectory, `${logName}.final.json`);
     const stream = fs.createWriteStream(jsonlPath, {
+      flags: "a",
+      encoding: "utf8",
+    });
+    const stderrStream = fs.createWriteStream(stderrPath, {
       flags: "a",
       encoding: "utf8",
     });
@@ -176,8 +181,10 @@ export class CodexSessionRunner {
         signal,
         timeoutMs: this.config.codexTimeoutMs,
         onStdout: consume,
-        onStderr: (text) =>
-          onEvent?.({ type: "codex.stderr", message: text.trim() }),
+        onStderr: (text) => {
+          stderrStream.write(text);
+          onEvent?.({ type: "codex.stderr", message: text.trim() });
+        },
       });
       if (lineBuffer.trim()) {
         const event = parseJson(lineBuffer, null);
@@ -187,7 +194,10 @@ export class CodexSessionRunner {
         }
       }
     } finally {
-      await new Promise((resolve) => stream.end(resolve));
+      await Promise.all([
+        new Promise((resolve) => stream.end(resolve)),
+        new Promise((resolve) => stderrStream.end(resolve)),
+      ]);
     }
 
     if (!currentThreadId) {
@@ -212,6 +222,7 @@ export class CodexSessionRunner {
       threadId: currentThreadId,
       final,
       jsonlPath,
+      stderrPath,
       finalPath,
     };
   }

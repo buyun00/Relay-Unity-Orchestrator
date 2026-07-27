@@ -72,9 +72,3 @@ export function suppressUnauthorizedActions(turn, final) {
     suppressed,
   };
 }
-
-export function isNonFatalCodexStderr(message) {
-  return /codex_models_manager::manager:\s*failed to refresh available models:\s*timeout waiting for child process to exit/iu.test(
-    String(message || ""),
-  );
-}

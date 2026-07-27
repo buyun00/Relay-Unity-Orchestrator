@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 import { CodexSessionRunner } from "./codex-session.mjs";
 import {
   actionPolicyPrompt,
-  isNonFatalCodexStderr,
   suppressUnauthorizedActions,
 } from "./ops-policy.mjs";
 import { HttpError } from "./util.mjs";
@@ -456,13 +455,6 @@ export class OpsEngine {
           }
           const message = codexAgentMessage(event);
           if (message) this.emit(turn, message);
-          else if (
-            event?.type === "codex.stderr" &&
-            event.message &&
-            !isNonFatalCodexStderr(event.message)
-          ) {
-            this.emit(turn, event.message.slice(0, 2_000), "warning");
-          }
         },
       });
       this.store.setOpsCodexThread(turn.threadId, result.threadId);

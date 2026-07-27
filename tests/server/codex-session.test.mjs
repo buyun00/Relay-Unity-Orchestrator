@@ -82,6 +82,7 @@ test("persistent Ops prompts use stdin and resume without Windows command-line o
             thread_id: "ops-thread-from-stdin",
           })}\n`,
         );
+        options.onStderr?.("non-fatal Codex diagnostic\n");
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     },
@@ -105,6 +106,10 @@ test("persistent Ops prompts use stdin and resume without Windows command-line o
   });
 
   assert.equal(resumed.threadId, "ops-thread-from-stdin");
+  assert.match(
+    fs.readFileSync(first.stderrPath, "utf8"),
+    /non-fatal Codex diagnostic/u,
+  );
   assert.equal(calls[0].command, path.join(helperDirectory, "codex.exe"));
   assert.equal(calls[0].args.at(-1), "-");
   assert.equal(calls[0].options.input, longPrompt);
