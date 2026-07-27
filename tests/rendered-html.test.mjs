@@ -58,6 +58,11 @@ test("starter preview is removed and the product shell is durable", async () => 
   assert.match(controlDesk, /自动事故处理/);
   assert.match(controlDesk, /发送给系统 Codex/);
   assert.match(controlDesk, /交给系统 Codex/);
+  assert.match(controlDesk, /消息已接收，正在等待 System Codex 开始/);
+  assert.match(controlDesk, /System Codex 正在思考和处理/);
+  assert.match(controlDesk, /本轮已结束，System Codex 当前已停止/);
+  assert.match(controlDesk, /aria-live="polite"/);
+  assert.match(css, /@keyframes ops-activity-progress/);
   assert.match(controlDesk, /输入使用者名称/);
   assert.match(controlDesk, /identityReady && identityOpen/);
   assert.match(controlDesk, /connectionChecked && !connected/);

@@ -3825,6 +3825,96 @@ kbd {
   min-height: 39px;
 }
 
+.ops-conversation-activity {
+  display: grid;
+  gap: 10px;
+  padding: 13px 21px 14px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.ops-activity-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ops-activity-icon {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--text-2);
+  background: var(--surface-3);
+}
+
+.ops-conversation-activity.active .ops-activity-icon {
+  color: var(--blue);
+  border-color: rgba(116, 167, 255, 0.26);
+  background: rgba(116, 167, 255, 0.09);
+}
+
+.ops-activity-copy > span:last-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ops-activity-copy strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.ops-activity-copy small {
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ops-activity-track {
+  position: relative;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.ops-activity-track > span {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: rgba(148, 158, 178, 0.32);
+}
+
+.ops-conversation-activity.active .ops-activity-track > span {
+  width: 42%;
+  right: auto;
+  background: linear-gradient(
+    90deg,
+    rgba(116, 167, 255, 0.24),
+    var(--blue),
+    rgba(114, 224, 178, 0.72)
+  );
+  animation: ops-activity-progress 1.45s ease-in-out infinite;
+}
+
+@keyframes ops-activity-progress {
+  from {
+    transform: translateX(-105%);
+  }
+  to {
+    transform: translateX(245%);
+  }
+}
+
 .ops-fast-toggle {
   display: flex;
   align-items: center;

@@ -81,6 +81,7 @@ import {
   type HealthState,
   type HostVirtualMachine,
   type OpsThread,
+  type OpsTurn,
   type PipelineEvent,
   type Project,
   type Snapshot,
@@ -1221,16 +1222,20 @@ export default function ControlDesk() {
               snapshot={snapshot}
               busy={busy}
               onTask={(id) => navigate("task", id)}
-              onSend={async (threadId, message) =>
-                runMutation(
-                  () =>
-                    api("/api/ops/messages", {
-                      method: "POST",
-                      body: JSON.stringify({ threadId, message }),
-                    }),
-                  "消息已交给系统 Codex",
-                )
-              }
+              onSend={async (threadId, message) => {
+                let submitted: OpsTurn | null = null;
+                const ok = await runMutation(async () => {
+                  const response = await api<{
+                    ok: boolean;
+                    turn: OpsTurn;
+                  }>("/api/ops/messages", {
+                    method: "POST",
+                    body: JSON.stringify({ threadId, message }),
+                  });
+                  submitted = response.turn;
+                }, "消息已交给系统 Codex");
+                return ok ? submitted : null;
+              }}
               onCreateThread={async (input) => {
                 let created: OpsThread | null = null;
                 const ok = await runMutation(async () => {
@@ -1784,7 +1789,7 @@ function OpsPage({
   snapshot: Snapshot;
   busy: boolean;
   onTask: (id: string) => void;
-  onSend: (threadId: string, message: string) => Promise<boolean>;
+  onSend: (threadId: string, message: string) => Promise<OpsTurn | null>;
   onCreateThread: (input: {
     title: string;
     codexModel: string;
@@ -1806,6 +1811,7 @@ function OpsPage({
 }) {
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
+  const [optimisticTurns, setOptimisticTurns] = useState<OpsTurn[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState(
     snapshot.ops.thread.id,
   );
@@ -1824,8 +1830,14 @@ function OpsPage({
   const threads = ops.threads.length ? ops.threads : [ops.thread];
   const selectedThread =
     threads.find((thread) => thread.id === selectedThreadId) ?? threads[0];
+  const snapshotTurnIds = new Set(ops.turns.map((turn) => turn.id));
   const visibleTurns = selectedThread
-    ? ops.turns.filter((turn) => turn.threadId === selectedThread.id)
+    ? [
+        ...ops.turns,
+        ...optimisticTurns.filter((turn) => !snapshotTurnIds.has(turn.id)),
+      ]
+        .filter((turn) => turn.threadId === selectedThread.id)
+        .sort((left, right) => left.sequence - right.sequence)
     : [];
   const selectedModel =
     CODEX_MODEL_OPTIONS.find(
@@ -1840,17 +1852,60 @@ function OpsPage({
   const newReasoningOptions = CODEX_REASONING_OPTIONS.filter((option) =>
     newModelOption.efforts.includes(option.value as never),
   );
-  const threadActive = ["queued", "running"].includes(
-    selectedThread?.status ?? "idle",
+  const activeTurn = visibleTurns.findLast((turn) =>
+    ["queued", "running"].includes(turn.status),
   );
+  const latestTurn = visibleTurns.at(-1);
+  const latestProgress = activeTurn
+    ? snapshot.events
+        .filter(
+          (event) =>
+            event.opsTurnId === activeTurn.id &&
+            ["ops.codex.message", "ops.repair.progress"].includes(event.type),
+        )
+        .at(-1)
+    : null;
+  const threadActive =
+    sending ||
+    Boolean(activeTurn) ||
+    ["queued", "running"].includes(selectedThread?.status ?? "idle");
+  const activityTitle = sending
+    ? "正在把消息发送给 System Codex"
+    : activeTurn?.status === "queued"
+      ? "消息已接收，正在等待 System Codex 开始"
+      : threadActive
+        ? "System Codex 正在思考和处理"
+        : latestTurn
+          ? "本轮已结束，System Codex 当前已停止"
+          : "System Codex 当前已停止";
+  const activityDetail = sending
+    ? "正在确认消息送达，请不要重复发送。"
+    : activeTurn?.status === "queued"
+      ? `第 ${activeTurn.sequence} 轮已经进入队列，不需要重复发送。`
+      : threadActive
+        ? (latestProgress
+            ? readableCodexMessage(latestProgress.message)
+            : null) ||
+          `第 ${activeTurn?.sequence ?? latestTurn?.sequence ?? 1} 轮仍在继续；收到最终结论前都会保持此状态。`
+        : latestTurn
+          ? `第 ${latestTurn.sequence} 轮已在 ${relativeTime(latestTurn.finishedAt ?? latestTurn.createdAt)}停止。`
+          : "发送消息后，这里会立即显示接收、排队和思考状态。";
   const openIncidents = ops.incidents.filter((item) => !item.resolvedAt);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const content = message.trim();
     if (!content || sending || !selectedThread) return;
     setSending(true);
-    const ok = await onSend(selectedThread.id, content);
-    if (ok) setMessage("");
+    const turn = await onSend(selectedThread.id, content);
+    if (turn) {
+      setOptimisticTurns((current) => [
+        ...current.filter(
+          (item) => item.id !== turn.id && !snapshotTurnIds.has(item.id),
+        ),
+        turn,
+      ]);
+      setMessage("");
+    }
     setSending(false);
   };
   const createThread = async (event: FormEvent) => {
@@ -2129,6 +2184,35 @@ function OpsPage({
               </span>
             </div>
           )}
+          <div
+            className={cx(
+              "ops-conversation-activity",
+              threadActive ? "active" : "stopped",
+            )}
+            role="status"
+            aria-live="polite"
+          >
+            <div className="ops-activity-copy">
+              <span className="ops-activity-icon" aria-hidden="true">
+                {threadActive ? (
+                  <LoaderCircle className="spin" size={17} />
+                ) : (
+                  <Square size={13} />
+                )}
+              </span>
+              <span>
+                <strong>{activityTitle}</strong>
+                <small>{activityDetail}</small>
+              </span>
+            </div>
+            <div
+              className="ops-activity-track"
+              role={threadActive ? "progressbar" : undefined}
+              aria-label={threadActive ? "System Codex 仍在运行" : undefined}
+            >
+              <span />
+            </div>
+          </div>
           <div className="ops-thread">
             {visibleTurns.length === 0 ? (
               <EmptyState
@@ -2217,8 +2301,14 @@ function OpsPage({
             />
             <div>
               <span>
-                <ShieldCheck size={14} />
-                自动动作不可删除数据；代码修改必须经过 Git 与完整验证。
+                {threadActive ? (
+                  <LoaderCircle className="spin" size={14} />
+                ) : (
+                  <ShieldCheck size={14} />
+                )}
+                {threadActive
+                  ? "System Codex 仍在继续处理；上方进度条停止后才表示本轮结束。"
+                  : "自动动作不可删除数据；代码修改必须经过 Git 与完整验证。"}
               </span>
               <button
                 className="primary-action"
