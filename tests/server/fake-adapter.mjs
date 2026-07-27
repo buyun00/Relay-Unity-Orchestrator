@@ -160,10 +160,12 @@ export class FakeAdapter {
         { code: "GIT_PUSH_FAILED" },
       );
     }
+    const commitSha = shortSha(
+      `${context.task.id}:${context.turn.id}:${Date.now()}`,
+    );
     return {
-      commitSha: shortSha(
-        `${context.task.id}:${context.turn.id}:${Date.now()}`,
-      ),
+      commitSha,
+      remoteSha: commitSha,
       pushed: true,
       verified: true,
     };

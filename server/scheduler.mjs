@@ -282,18 +282,8 @@ export class Scheduler {
       this.store.completeTurn(context.turn.id, {
         codexFinal: codexResult.final,
         commitSha: delivery.commitSha,
+        delivery,
       });
-      this.emitProgress(
-        context,
-        "delivered",
-        "Remote branch verified; conversation and commit were saved",
-        "info",
-        {
-          branchName: context.task.branchName,
-          commitSha: delivery.commitSha,
-          threadId: codexResult.threadId,
-        },
-      );
 
       if (!context.task.autoRelease) {
         this.store.assignNextQueuedTurn(context.task.id, context.worker.id);

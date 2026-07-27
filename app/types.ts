@@ -55,9 +55,38 @@ export interface Project {
   unitySaveUrl?: string | null;
   checkpointName: string;
   enabled: boolean;
+  autoBuildEnabled: boolean;
+  buildProjectKey?: string | null;
   compatibleWorkerIds?: string[];
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface BuildDispatch {
+  id: string;
+  turnId: string;
+  turnSequence: number;
+  taskId: string;
+  projectId: string;
+  projectKey: string;
+  repositoryUrl: string;
+  branchName: string;
+  commitSha: string;
+  buildType: "cdn";
+  modules: string[];
+  playerBaseVersion: number;
+  idempotencyKey: string;
+  status: "pending" | "sending" | "retrying" | "accepted" | "failed";
+  attemptCount: number;
+  nextAttemptAt: string;
+  ozdqpJobId?: string | null;
+  lastHttpStatus?: number | null;
+  lastErrorCode?: string | null;
+  lastErrorMessage?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  acceptedAt?: string | null;
+  failedAt?: string | null;
 }
 
 export interface Worker {
@@ -317,6 +346,7 @@ export interface Snapshot {
   workers: Worker[];
   tasks: Task[];
   turns: Turn[];
+  buildDispatches: BuildDispatch[];
   events: PipelineEvent[];
   ops: {
     thread: OpsThread;
@@ -334,6 +364,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   workers: [],
   tasks: [],
   turns: [],
+  buildDispatches: [],
   events: [],
   ops: {
     thread: {

@@ -100,6 +100,7 @@ function projectInput(body, partial = false) {
     "unityHealthUrl",
     "unitySaveUrl",
     "checkpointName",
+    "buildProjectKey",
   ];
   for (const field of stringFields) {
     if (Object.hasOwn(body, field)) {
@@ -126,6 +127,8 @@ function projectInput(body, partial = false) {
   if (result.defaultBranch)
     result.defaultBranch = gitRef(result.defaultBranch, "defaultBranch");
   if (Object.hasOwn(body, "enabled")) result.enabled = Boolean(body.enabled);
+  if (Object.hasOwn(body, "autoBuildEnabled"))
+    result.autoBuildEnabled = Boolean(body.autoBuildEnabled);
   return result;
 }
 
@@ -629,6 +632,21 @@ export class PipelineHttpServer {
           response,
           200,
           { ok: true, projects: this.store.listProjects() },
+          cors,
+        );
+        return;
+      }
+      if (request.method === "GET" && pathname === "/api/build-dispatches") {
+        json(
+          response,
+          200,
+          {
+            ok: true,
+            dispatches: this.store.listBuildDispatches({
+              status: url.searchParams.get("status") || null,
+              limit: integer(url.searchParams.get("limit"), 250, 1, 1_000),
+            }),
+          },
           cors,
         );
         return;

@@ -972,8 +972,22 @@ test("worker start and restart wait for PowerShell Direct before health probing"
 
 test("workspace preparation and finalization receive a repository-local Git identity", async () => {
   const calls = [];
+  const deliveredSha = "9".repeat(40);
   const processRunner = async (command, args) => {
     calls.push({ script: scriptName(args), args });
+    if (scriptName(args) === "Finalize-Workspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          ready: true,
+          commitSha: deliveredSha,
+          remoteSha: deliveredSha,
+          pushed: true,
+          verified: true,
+        }),
+        stderr: "",
+      };
+    }
     return {
       exitCode: 0,
       stdout: JSON.stringify({ ready: true, commitSha: "abc123" }),
@@ -986,7 +1000,14 @@ test("workspace preparation and finalization receive a repository-local Git iden
   });
 
   await adapter.prepare(context(), {});
-  await adapter.finalize(context(), {});
+  const delivery = await adapter.finalize(context(), {});
+  assert.deepEqual(delivery, {
+    ready: true,
+    commitSha: deliveredSha,
+    remoteSha: deliveredSha,
+    pushed: true,
+    verified: true,
+  });
 
   const managedGitCalls = calls.filter((call) =>
     ["Prepare-Workspace.ps1", "Finalize-Workspace.ps1"].includes(call.script),

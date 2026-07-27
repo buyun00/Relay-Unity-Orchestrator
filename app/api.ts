@@ -182,6 +182,7 @@ export function fetchSnapshot(signal?: AbortSignal) {
       },
       projects,
       workers,
+      buildDispatches: snapshot.buildDispatches ?? [],
       tasks: (snapshot.tasks ?? []).map((task) => ({
         ...task,
         number: String(task.number).startsWith("TK-")

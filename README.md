@@ -106,6 +106,10 @@ PIPELINE_CHECKPOINTS_ENABLED=false
 
 准备好 `PROJECT_READY` 后再将 `PIPELINE_CHECKPOINTS_ENABLED` 改为 `true`。完整的宿主机/子机设置、内部交换机、凭据、项目与工位字段、检查点日更策略、Windows 服务部署、canary 验收和故障处理见 [部署与运维](./docs/部署与运维.md)。
 
+OZDQP 项目在远程分支完整 SHA 核验后可通过事务性 outbox 自动提交本地
+Windows CDN 构建；配置、幂等、重试、恢复和审计说明见
+[OZDQP CDN 自动构建](./docs/OZDQP-CDN-自动构建.md)。
+
 ## 主要目录
 
 - `app/`：现代化管理网页，包括任务、队列、对话、工位、项目和系统设置。
@@ -120,5 +124,7 @@ PIPELINE_CHECKPOINTS_ENABLED=false
 - **Task**：长期工作线；固定一个项目、远程分支和 Codex `thread_id`。
 - **Turn**：一次需求或微调；它才是排队和调度单位。
 - **Worker**：可恢复的 Hyper-V + Unity 工位；不拥有对话历史。
+- **Build dispatch**：成功 Turn 同事务写入的异步 CDN 构建意图；Packer
+  故障不反向改变 Turn 或 Worker 状态。
 
 因此，释放或更换 Worker 不会丢掉历史。下一轮会从远程任务分支恢复代码，并通过 `codex exec resume <thread_id>` 恢复同一对话。

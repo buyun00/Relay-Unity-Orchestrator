@@ -28,14 +28,24 @@ function createConfig() {
     schedulerIntervalMs: 5,
     healthIntervalMs: 60_000,
     phaseMs: 1,
+    ozdqpBuildEnabled: true,
+    ozdqpBuildRepositoryUrl: "http://git.dominogm.com/diaoyu/ozdqp.git",
   };
 }
 
-function seedProjectAndWorker(store, { workerStatus = "ready" } = {}) {
+function seedProjectAndWorker(
+  store,
+  {
+    workerStatus = "ready",
+    repoUrl = "https://example.invalid/test-unity.git",
+    autoBuildEnabled = false,
+    buildProjectKey = null,
+  } = {},
+) {
   const project = store.createProject({
     id: "project-test",
     name: "Test Unity Project",
-    repoUrl: "https://example.invalid/test-unity.git",
+    repoUrl,
     defaultBranch: "main",
     guestProjectPath: "D:\\Work\\test-unity",
     smbPath: "\\\\172.30.240.11\\Work\\test-unity",
@@ -44,6 +54,8 @@ function seedProjectAndWorker(store, { workerStatus = "ready" } = {}) {
     unityHealthUrl: "http://{internalIp}:8090/health",
     unitySaveUrl: "http://{internalIp}:8090/api/save",
     checkpointName: "PROJECT_READY",
+    autoBuildEnabled,
+    buildProjectKey,
   });
   const worker = store.createWorker({
     id: "worker-test",
@@ -270,6 +282,73 @@ test("priority/FIFO queue waits without a free worker, then dispatches in order"
     lowSecond.task.id,
   ]);
   assert.equal(store.getWorker(worker.id).status, "ready");
+});
+
+test("verified delivery writes the OZDQP outbox from task.branchName", async (t) => {
+  const { store, scheduler, project, worker } = createHarness(t, {
+    repoUrl: "http://git.dominogm.com/diaoyu/ozdqp.git",
+    autoBuildEnabled: true,
+    buildProjectKey: "ozdqp",
+  });
+  const created = createTask(store, project.id, {
+    title: "OZDQP CDN delivery",
+    message: "Deliver and queue the exact remote commit",
+  });
+
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "the verified delivery",
+  );
+
+  const dispatch = store.getBuildDispatchForTurn(created.turn.id);
+  assert.equal(dispatch.status, "pending");
+  assert.equal(dispatch.branchName, created.task.branchName);
+  assert.notEqual(dispatch.branchName, created.task.baseBranch);
+  assert.match(dispatch.commitSha, /^[0-9a-f]{40}$/u);
+  assert.equal(
+    dispatch.idempotencyKey,
+    `relay:${created.turn.id}:${dispatch.commitSha}`,
+  );
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some((event) => event.type === "build.dispatch.queued"),
+  );
+});
+
+test("push failure does not write the OZDQP outbox", async (t) => {
+  const { store, scheduler, project, worker } = createHarness(t, {
+    repoUrl: "http://git.dominogm.com/diaoyu/ozdqp.git",
+    autoBuildEnabled: true,
+    buildProjectKey: "ozdqp",
+  });
+  const created = createTask(store, project.id, {
+    title: "Failed OZDQP delivery",
+    message: "Simulate a push failure [fake:fail=push]",
+  });
+
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention" &&
+      scheduler.status().activeTurns === 0,
+    "the failed remote push",
+  );
+
+  assert.equal(store.getBuildDispatchForTurn(created.turn.id), null);
+  assert.equal(
+    store
+      .listTaskEvents(created.task.id)
+      .some((event) => event.type === "build.dispatch.queued"),
+    false,
+  );
 });
 
 test("a queued turn automatically starts a stopped compatible worker", async (t) => {

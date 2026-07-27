@@ -3558,6 +3558,11 @@ function ProjectsPage({
                 <span className="cell-sub">
                   配置更新 {relativeTime(project.updatedAt)}
                 </span>
+                <span className="cell-sub">
+                  {project.autoBuildEnabled
+                    ? `${project.buildProjectKey || "未配置"} CDN 自动构建`
+                    : "CDN 自动构建关闭"}
+                </span>
               </div>
               <div className="row-actions">
                 <IconButton label="编辑项目" onClick={() => onEdit(project)}>
@@ -4215,6 +4220,8 @@ function ProjectEditor({
     unitySaveUrl: project?.unitySaveUrl ?? "http://{internalIp}:8090/api/save",
     checkpointName: project?.checkpointName ?? "PROJECT_READY",
     enabled: project?.enabled ?? true,
+    autoBuildEnabled: project?.autoBuildEnabled ?? false,
+    buildProjectKey: project?.buildProjectKey ?? "ozdqp",
   });
   const set = (key: string, value: unknown) =>
     setForm((current) => ({ ...current, [key]: value }));
@@ -4272,6 +4279,28 @@ function ProjectEditor({
               onChange={(event) => set("repoUrl", event.target.value)}
               placeholder="git@github.com:company/project.git"
             />
+          </label>
+          <label className="form-field">
+            <span>构建项目 Key</span>
+            <input
+              value={form.buildProjectKey}
+              onChange={(event) => set("buildProjectKey", event.target.value)}
+              placeholder="ozdqp"
+              disabled={!form.autoBuildEnabled}
+            />
+          </label>
+          <label className="toggle-row">
+            <input
+              type="checkbox"
+              checked={form.autoBuildEnabled}
+              onChange={(event) =>
+                set("autoBuildEnabled", event.target.checked)
+              }
+            />
+            <span>
+              <strong>交付后自动构建 Windows CDN</strong>
+              <small>仅远程完整 SHA 已核验时写入事务性队列</small>
+            </span>
           </label>
           <label className="form-field">
             <span>子机项目路径</span>

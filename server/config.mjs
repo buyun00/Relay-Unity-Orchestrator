@@ -18,6 +18,14 @@ function boolean(value, fallback = false) {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
+function integerList(value, fallback) {
+  const parsed = String(value || "")
+    .split(",")
+    .map((item) => Number.parseInt(item.trim(), 10))
+    .filter((item) => Number.isFinite(item) && item > 0);
+  return parsed.length ? parsed : fallback;
+}
+
 const requestedAdapter = (
   process.env.PIPELINE_ADAPTER || "hyperv"
 ).toLowerCase();
@@ -76,6 +84,24 @@ export const config = Object.freeze({
   gitAuthorEmail:
     process.env.PIPELINE_GIT_AUTHOR_EMAIL?.trim() ||
     "relay-unity-orchestrator@localhost",
+  ozdqpBuildEnabled: boolean(process.env.OZDQP_BUILD_ENABLED, true),
+  ozdqpBuildApiUrl:
+    process.env.OZDQP_BUILD_API_URL?.trim() ||
+    "http://10.100.3.209:8088/api/v1/builds",
+  ozdqpBuildRepositoryUrl:
+    process.env.OZDQP_BUILD_REPOSITORY_URL?.trim() ||
+    "http://git.dominogm.com/diaoyu/ozdqp.git",
+  ozdqpBuildApiKey: process.env.OZDQP_BUILD_API_KEY?.trim() || null,
+  ozdqpBuildTimeoutMs: integer(process.env.OZDQP_BUILD_TIMEOUT_MS, 10_000),
+  ozdqpBuildPollIntervalMs: integer(
+    process.env.OZDQP_BUILD_POLL_INTERVAL_MS,
+    1_000,
+  ),
+  ozdqpBuildRetryScheduleMs: integerList(
+    process.env.OZDQP_BUILD_RETRY_SCHEDULE_MS,
+    [1_000, 2_000, 5_000, 10_000, 30_000, 60_000],
+  ),
+  ozdqpBuildRetryMaxMs: integer(process.env.OZDQP_BUILD_RETRY_MAX_MS, 300_000),
   codexTimeoutMs:
     integer(process.env.PIPELINE_CODEX_TIMEOUT_MINUTES, 90) * 60 * 1000,
   powershellCommand:

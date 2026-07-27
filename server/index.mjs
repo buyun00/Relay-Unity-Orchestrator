@@ -1,13 +1,30 @@
 import { config } from "./config.mjs";
 import { createAdapter } from "./adapters/index.mjs";
+import { BuildDispatcher } from "./build-dispatcher.mjs";
 import { Store } from "./db.mjs";
 import { PipelineHttpServer } from "./http.mjs";
 import { GuardianClient } from "./guardian-client.mjs";
+import { OzdqpBuildClient } from "./ozdqp-build-client.mjs";
 import { OpsEngine } from "./ops-engine.mjs";
 import { RepairManager } from "./repair-manager.mjs";
 import { Scheduler } from "./scheduler.mjs";
 
 const store = new Store(config);
+const buildClient = new OzdqpBuildClient({
+  endpoint: config.ozdqpBuildApiUrl,
+  apiKey: config.ozdqpBuildApiKey,
+  timeoutMs: config.ozdqpBuildTimeoutMs,
+});
+const buildDispatcher = new BuildDispatcher({
+  store,
+  client: buildClient,
+  pollIntervalMs: config.ozdqpBuildPollIntervalMs,
+  retryScheduleMs: config.ozdqpBuildRetryScheduleMs,
+  retryMaxMs: config.ozdqpBuildRetryMaxMs,
+});
+const stopBuildDispatchWakeup = store.onEvent((event) => {
+  if (event.type === "build.dispatch.queued") buildDispatcher.notify();
+});
 const guardian = new GuardianClient(config, {
   onEvent: (event) => store.emit(event),
 });
@@ -35,6 +52,7 @@ const api = new PipelineHttpServer({
 });
 
 await api.listen();
+if (config.ozdqpBuildEnabled) buildDispatcher.start();
 await scheduler.start({ paused: !runtime.ready });
 await ops.start();
 if (!runtime.ready) {
@@ -70,13 +88,23 @@ async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   console.log(`Received ${signal}; stopping pipeline service`);
+  buildDispatcher.stop();
+  stopBuildDispatchWakeup();
   ops.stop();
   guardian.stop();
   scheduler.stop();
   const drained = await scheduler.waitForIdle();
+  const buildDispatchDrained = await buildDispatcher.waitForIdle(
+    Math.max(15_000, config.ozdqpBuildTimeoutMs + 1_000),
+  );
   if (!drained) {
     console.warn(
       "Timed out waiting for active turns to stop; startup reconciliation will preserve their workers",
+    );
+  }
+  if (!buildDispatchDrained) {
+    console.warn(
+      "Timed out waiting for the active OZDQP request; startup reconciliation will retry it idempotently",
     );
   }
   await api.close();

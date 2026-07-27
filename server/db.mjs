@@ -47,6 +47,8 @@ const PROJECT_FIELDS = {
   unitySaveUrl: "unity_save_url",
   checkpointName: "checkpoint_name",
   enabled: "enabled",
+  autoBuildEnabled: "auto_build_enabled",
+  buildProjectKey: "build_project_key",
 };
 
 const WORKER_FIELDS = {
@@ -76,6 +78,8 @@ function projectFromRow(row) {
     unitySaveUrl: row.unity_save_url,
     checkpointName: row.checkpoint_name,
     enabled: asBoolean(row.enabled),
+    autoBuildEnabled: asBoolean(row.auto_build_enabled),
+    buildProjectKey: row.build_project_key || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -184,6 +188,74 @@ function eventFromRow(row) {
     message: row.message,
     data: parseJson(row.data_json, null),
     createdAt: row.created_at,
+  };
+}
+
+function buildDispatchFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    turnId: row.turn_id,
+    turnSequence: Number(row.turn_sequence),
+    taskId: row.task_id,
+    projectId: row.project_id,
+    projectKey: row.project_key,
+    repositoryUrl: row.repository_url,
+    branchName: row.branch_name,
+    commitSha: row.commit_sha,
+    buildType: row.build_type,
+    modules: parseJson(row.modules_json, ["all"]),
+    playerBaseVersion: Number(row.player_base_version),
+    requestedBy: parseJson(row.requested_by_json, null),
+    idempotencyKey: row.idempotency_key,
+    status: row.status,
+    attemptCount: Number(row.attempt_count || 0),
+    nextAttemptAt: row.next_attempt_at,
+    ozdqpJobId: row.ozdqp_job_id,
+    lastHttpStatus:
+      row.last_http_status == null ? null : Number(row.last_http_status),
+    lastErrorCode: row.last_error_code,
+    lastErrorMessage: row.last_error_message,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    acceptedAt: row.accepted_at,
+    failedAt: row.failed_at,
+  };
+}
+
+function isFullCommitSha(value) {
+  return typeof value === "string" && /^[0-9a-f]{40}$/iu.test(value);
+}
+
+function normalizedRepositoryUrl(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\/+$/u, "")
+    .toLowerCase();
+}
+
+function safeBuildDispatchError(error) {
+  const code =
+    typeof error?.code === "string" && error.code
+      ? error.code.slice(0, 120)
+      : "OZDQP_REQUEST_FAILED";
+  const status = Number.isInteger(error?.status) ? error.status : null;
+  const messages = {
+    OZDQP_AUTH_CONFIGURATION_ERROR:
+      "OZDQP API rejected its authentication configuration",
+    OZDQP_HTTP_RETRYABLE: "OZDQP API returned a retryable HTTP response",
+    OZDQP_HTTP_PERMANENT: "OZDQP API returned a permanent HTTP response",
+    OZDQP_INVALID_RESPONSE:
+      "OZDQP API response did not contain an accepted job ID",
+    OZDQP_REQUEST_TIMEOUT: "OZDQP API request timed out",
+    OZDQP_NETWORK_ERROR: "OZDQP API request failed before receiving a response",
+    RELAY_RESTARTED_DURING_DISPATCH:
+      "Relay restarted while the OZDQP request was in flight",
+  };
+  return {
+    code,
+    status,
+    message: messages[code] || "OZDQP build dispatch failed",
   };
 }
 
@@ -349,6 +421,8 @@ export class Store {
         unity_save_url TEXT,
         checkpoint_name TEXT NOT NULL DEFAULT 'PROJECT_READY',
         enabled INTEGER NOT NULL DEFAULT 1,
+        auto_build_enabled INTEGER NOT NULL DEFAULT 0,
+        build_project_key TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -443,6 +517,34 @@ export class Store {
         key TEXT PRIMARY KEY,
         value_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS build_dispatches (
+        id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL UNIQUE REFERENCES turns(id) ON DELETE CASCADE,
+        turn_sequence INTEGER NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+        project_key TEXT NOT NULL,
+        repository_url TEXT NOT NULL,
+        branch_name TEXT NOT NULL,
+        commit_sha TEXT NOT NULL,
+        build_type TEXT NOT NULL DEFAULT 'cdn',
+        modules_json TEXT NOT NULL,
+        player_base_version INTEGER NOT NULL DEFAULT 1,
+        requested_by_json TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        ozdqp_job_id TEXT,
+        last_http_status INTEGER,
+        last_error_code TEXT,
+        last_error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        accepted_at TEXT,
+        failed_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS ops_threads (
@@ -552,10 +654,40 @@ export class Store {
         ON incident_source_event_claims(incident_id);
       CREATE INDEX IF NOT EXISTS ops_actions_turn_idx ON ops_actions(ops_turn_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS repair_runs_status_idx ON repair_runs(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS build_dispatches_queue_idx
+        ON build_dispatches(status, created_at ASC, task_id, turn_sequence, id);
+      CREATE INDEX IF NOT EXISTS build_dispatches_task_idx
+        ON build_dispatches(task_id, created_at ASC);
     `);
     const projectColumns = this.db.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "unity_health_url")) {
       this.db.exec("ALTER TABLE projects ADD COLUMN unity_health_url TEXT");
+    }
+    const addedAutoBuild = !projectColumns.some(
+      (column) => column.name === "auto_build_enabled",
+    );
+    const addedBuildProjectKey = !projectColumns.some(
+      (column) => column.name === "build_project_key",
+    );
+    if (addedAutoBuild) {
+      this.db.exec(
+        "ALTER TABLE projects ADD COLUMN auto_build_enabled INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (addedBuildProjectKey) {
+      this.db.exec("ALTER TABLE projects ADD COLUMN build_project_key TEXT");
+    }
+    if (addedAutoBuild || addedBuildProjectKey) {
+      const repositoryUrl =
+        this.config.ozdqpBuildRepositoryUrl ||
+        "http://git.dominogm.com/diaoyu/ozdqp.git";
+      this.db
+        .prepare(
+          `UPDATE projects
+           SET auto_build_enabled=1, build_project_key='ozdqp'
+           WHERE LOWER(RTRIM(repo_url, '/'))=LOWER(RTRIM(?, '/'))`,
+        )
+        .run(repositoryUrl);
     }
     const taskColumns = this.db.prepare("PRAGMA table_info(tasks)").all();
     if (!taskColumns.some((column) => column.name === "idempotency_key")) {
@@ -693,6 +825,15 @@ export class Store {
 
   reconcileInterruptedWork() {
     const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE build_dispatches
+         SET status='retrying', next_attempt_at=?, updated_at=?,
+           last_error_code='RELAY_RESTARTED_DURING_DISPATCH',
+           last_error_message='Relay restarted while the request was in flight'
+         WHERE status='sending'`,
+      )
+      .run(timestamp, timestamp);
     const active = this.db
       .prepare(
         `
@@ -774,7 +915,7 @@ export class Store {
     return () => this.listeners.delete(listener);
   }
 
-  emit({
+  insertEvent({
     taskId = null,
     turnId = null,
     workerId = null,
@@ -827,6 +968,10 @@ export class Store {
       data,
       createdAt,
     };
+    return event;
+  }
+
+  notifyEvent(event) {
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -834,6 +979,11 @@ export class Store {
         /* disconnected listener */
       }
     }
+  }
+
+  emit(input) {
+    const event = this.insertEvent(input);
+    this.notifyEvent(event);
     return event;
   }
 
@@ -882,8 +1032,8 @@ export class Store {
       INSERT INTO projects (
         id, name, repo_url, default_branch, guest_project_path, smb_path,
         unity_version, unity_skill_url, unity_health_url, unity_save_url, checkpoint_name, enabled,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        auto_build_enabled, build_project_key, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
       )
       .run(
@@ -899,6 +1049,8 @@ export class Store {
         input.unitySaveUrl || null,
         input.checkpointName || "PROJECT_READY",
         input.enabled === false ? 0 : 1,
+        input.autoBuildEnabled === true ? 1 : 0,
+        input.buildProjectKey || null,
         timestamp,
         timestamp,
       );
@@ -921,7 +1073,11 @@ export class Store {
     if (entries.length === 0) return this.getProject(projectId);
     const assignments = entries.map(([, column]) => `${column}=?`);
     const values = entries.map(([key]) =>
-      key === "enabled" ? (changes[key] ? 1 : 0) : changes[key],
+      ["enabled", "autoBuildEnabled"].includes(key)
+        ? changes[key]
+          ? 1
+          : 0
+        : changes[key],
     );
     values.push(now(), projectId);
     this.db
@@ -1604,10 +1760,14 @@ export class Store {
       .run(threadId, now(), taskId);
   }
 
-  completeTurn(turnId, { codexFinal, commitSha }) {
+  completeTurn(turnId, { codexFinal, commitSha, delivery = null }) {
     const turn = this.getTurn(turnId);
     if (!turn) return null;
+    const task = this.getTask(turn.taskId);
+    const project = task ? this.getProject(task.projectId) : null;
+    const deliveredCommitSha = delivery?.commitSha || commitSha || null;
     const timestamp = now();
+    const events = [];
     this.transaction(() => {
       this.db
         .prepare(
@@ -1616,7 +1776,7 @@ export class Store {
           error_code=NULL, error_message=NULL, finished_at=? WHERE id=?
       `,
         )
-        .run(stringifyJson(codexFinal), commitSha || null, timestamp, turnId);
+        .run(stringifyJson(codexFinal), deliveredCommitSha, timestamp, turnId);
       const hasQueuedTurn = Boolean(
         this.db
           .prepare(
@@ -1633,12 +1793,299 @@ export class Store {
         )
         .run(
           hasQueuedTurn ? "queued" : "waiting_user",
-          commitSha || null,
+          deliveredCommitSha,
           timestamp,
           turn.taskId,
         );
+      events.push(
+        this.insertEvent({
+          taskId: task?.id || turn.taskId,
+          turnId,
+          workerId: turn.workerId,
+          type: "turn.delivered",
+          phase: "delivered",
+          message: "Remote branch verified; conversation and commit were saved",
+          data: {
+            branchName: task?.branchName || null,
+            commitSha: deliveredCommitSha,
+            remoteSha: delivery?.remoteSha || null,
+            pushed: delivery?.pushed === true,
+            verified: delivery?.verified === true,
+            threadId: task?.codexThreadId || null,
+          },
+        }),
+      );
+
+      const configuredRepositoryUrl =
+        this.config.ozdqpBuildRepositoryUrl ||
+        "http://git.dominogm.com/diaoyu/ozdqp.git";
+      const eligible =
+        this.config.ozdqpBuildEnabled === true &&
+        project?.autoBuildEnabled === true &&
+        project?.buildProjectKey === "ozdqp" &&
+        normalizedRepositoryUrl(project?.repoUrl) ===
+          normalizedRepositoryUrl(configuredRepositoryUrl) &&
+        typeof task?.branchName === "string" &&
+        task.branchName.trim().length > 0 &&
+        delivery?.pushed === true &&
+        delivery?.verified === true &&
+        delivery?.commitSha === delivery?.remoteSha &&
+        isFullCommitSha(delivery?.commitSha) &&
+        isFullCommitSha(delivery?.remoteSha);
+      if (eligible) {
+        const commit = delivery.commitSha.toLowerCase();
+        const dispatchId = `build-dispatch-${turnId}`;
+        const idempotencyKey = `relay:${turnId}:${commit}`;
+        const requestedBy = {
+          system: "relay-unity-orchestrator",
+          projectId: project.id,
+          taskId: task.id,
+          taskNumber: task.number,
+          turnId,
+          turnSequence: turn.sequence,
+        };
+        const inserted = this.db
+          .prepare(
+            `
+            INSERT INTO build_dispatches (
+              id, turn_id, turn_sequence, task_id, project_id, project_key, repository_url,
+              branch_name, commit_sha, build_type, modules_json,
+              player_base_version, requested_by_json, idempotency_key, status,
+              attempt_count, next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'cdn', ?, 1, ?, ?, 'pending', 0, ?, ?, ?)
+            ON CONFLICT(turn_id) DO NOTHING
+          `,
+          )
+          .run(
+            dispatchId,
+            turnId,
+            turn.sequence,
+            task.id,
+            project.id,
+            project.buildProjectKey,
+            configuredRepositoryUrl,
+            task.branchName,
+            commit,
+            stringifyJson(["all"]),
+            stringifyJson(requestedBy),
+            idempotencyKey,
+            timestamp,
+            timestamp,
+            timestamp,
+          );
+        if (inserted.changes > 0) {
+          events.push(
+            this.insertEvent({
+              taskId: task.id,
+              turnId,
+              workerId: turn.workerId,
+              type: "build.dispatch.queued",
+              phase: "build-dispatch",
+              message: `OZDQP Windows CDN build queued for ${task.branchName}`,
+              data: {
+                dispatchId,
+                projectKey: project.buildProjectKey,
+                branchName: task.branchName,
+                commitSha: commit,
+                buildType: "cdn",
+                status: "pending",
+              },
+            }),
+          );
+        }
+      }
     });
+    for (const event of events) this.notifyEvent(event);
     return this.getTurn(turnId);
+  }
+
+  getBuildDispatch(dispatchId) {
+    return buildDispatchFromRow(
+      this.db
+        .prepare("SELECT * FROM build_dispatches WHERE id=?")
+        .get(dispatchId),
+    );
+  }
+
+  getBuildDispatchForTurn(turnId) {
+    return buildDispatchFromRow(
+      this.db
+        .prepare("SELECT * FROM build_dispatches WHERE turn_id=?")
+        .get(turnId),
+    );
+  }
+
+  listBuildDispatches({ status = null, limit = 250 } = {}) {
+    const boundedLimit = Math.max(1, Math.min(1_000, Number(limit) || 250));
+    const rows = status
+      ? this.db
+          .prepare(
+            "SELECT * FROM build_dispatches WHERE status=? ORDER BY created_at DESC, id DESC LIMIT ?",
+          )
+          .all(status, boundedLimit)
+      : this.db
+          .prepare(
+            "SELECT * FROM build_dispatches ORDER BY created_at DESC, id DESC LIMIT ?",
+          )
+          .all(boundedLimit);
+    return rows.map(buildDispatchFromRow);
+  }
+
+  claimNextBuildDispatch(timestamp = now()) {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare(
+          `SELECT candidate.* FROM build_dispatches AS candidate
+           WHERE candidate.status IN ('pending','retrying')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM build_dispatches AS earlier
+               WHERE earlier.branch_name=candidate.branch_name
+                 AND earlier.status IN ('pending','sending','retrying')
+                 AND earlier.turn_sequence < candidate.turn_sequence
+             )
+           ORDER BY candidate.created_at ASC, candidate.task_id ASC,
+             candidate.turn_sequence ASC, candidate.id ASC
+           LIMIT 1`,
+        )
+        .get();
+      if (!row || row.next_attempt_at > timestamp) return null;
+      const claimed = this.db
+        .prepare(
+          `UPDATE build_dispatches
+           SET status='sending', attempt_count=attempt_count+1, updated_at=?
+           WHERE id=? AND status IN ('pending','retrying')`,
+        )
+        .run(timestamp, row.id);
+      return claimed.changes > 0 ? this.getBuildDispatch(row.id) : null;
+    });
+  }
+
+  acceptBuildDispatch(dispatchId, result) {
+    const dispatch = this.getBuildDispatch(dispatchId);
+    if (!dispatch) return null;
+    const timestamp = now();
+    let event;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE build_dispatches
+           SET status='accepted', ozdqp_job_id=?, last_http_status=?,
+             last_error_code=NULL, last_error_message=NULL, updated_at=?,
+             accepted_at=?, failed_at=NULL
+           WHERE id=?`,
+        )
+        .run(
+          String(result.jobId).slice(0, 240),
+          result.status || null,
+          timestamp,
+          timestamp,
+          dispatchId,
+        );
+      event = this.insertEvent({
+        taskId: dispatch.taskId,
+        turnId: dispatch.turnId,
+        type: "build.dispatch.accepted",
+        phase: "build-dispatch",
+        message: `OZDQP accepted the Windows CDN build for ${dispatch.branchName}`,
+        data: {
+          dispatchId,
+          jobId: String(result.jobId).slice(0, 240),
+          status: "accepted",
+          httpStatus: result.status || null,
+          deduplicated: result.deduplicated === true,
+          attemptCount: dispatch.attemptCount,
+        },
+      });
+    });
+    this.notifyEvent(event);
+    return this.getBuildDispatch(dispatchId);
+  }
+
+  retryBuildDispatch(dispatchId, error, { nextAttemptAt, delayMs } = {}) {
+    const dispatch = this.getBuildDispatch(dispatchId);
+    if (!dispatch) return null;
+    const timestamp = now();
+    const safeError = safeBuildDispatchError(error);
+    let event;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE build_dispatches
+           SET status='retrying', next_attempt_at=?, last_http_status=?,
+             last_error_code=?, last_error_message=?, updated_at=?
+           WHERE id=?`,
+        )
+        .run(
+          nextAttemptAt || timestamp,
+          safeError.status,
+          safeError.code,
+          safeError.message,
+          timestamp,
+          dispatchId,
+        );
+      event = this.insertEvent({
+        taskId: dispatch.taskId,
+        turnId: dispatch.turnId,
+        level: "warning",
+        type: "build.dispatch.retrying",
+        phase: "build-dispatch",
+        message: `OZDQP build dispatch will retry for ${dispatch.branchName}`,
+        data: {
+          dispatchId,
+          status: "retrying",
+          code: safeError.code,
+          httpStatus: safeError.status,
+          attemptCount: dispatch.attemptCount,
+          nextAttemptAt: nextAttemptAt || timestamp,
+          delayMs: Number(delayMs) || 0,
+        },
+      });
+    });
+    this.notifyEvent(event);
+    return this.getBuildDispatch(dispatchId);
+  }
+
+  failBuildDispatch(dispatchId, error) {
+    const dispatch = this.getBuildDispatch(dispatchId);
+    if (!dispatch) return null;
+    const timestamp = now();
+    const safeError = safeBuildDispatchError(error);
+    let event;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE build_dispatches
+           SET status='failed', last_http_status=?, last_error_code=?,
+             last_error_message=?, updated_at=?, failed_at=?
+           WHERE id=?`,
+        )
+        .run(
+          safeError.status,
+          safeError.code,
+          safeError.message,
+          timestamp,
+          timestamp,
+          dispatchId,
+        );
+      event = this.insertEvent({
+        taskId: dispatch.taskId,
+        turnId: dispatch.turnId,
+        level: "error",
+        type: "build.dispatch.failed",
+        phase: "build-dispatch",
+        message: `OZDQP build dispatch permanently failed for ${dispatch.branchName}`,
+        data: {
+          dispatchId,
+          status: "failed",
+          code: safeError.code,
+          httpStatus: safeError.status,
+          attemptCount: dispatch.attemptCount,
+        },
+      });
+    });
+    this.notifyEvent(event);
+    return this.getBuildDispatch(dispatchId);
   }
 
   failTurn(turnId, error, { preserveWorker = true } = {}) {
@@ -2799,6 +3246,7 @@ export class Store {
         repairs: this.listRepairRuns(),
       },
       queue,
+      buildDispatches: this.listBuildDispatches({ limit: 250 }),
       events: this.listEvents({ limit: 120 }),
       stats: {
         projects: projects.length,
@@ -2814,6 +3262,11 @@ export class Store {
         attentionWorkers: workers.filter(
           (worker) => worker.status === "attention",
         ).length,
+        pendingBuildDispatches: this.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM build_dispatches WHERE status IN ('pending','sending','retrying')",
+          )
+          .get().count,
       },
     };
   }
