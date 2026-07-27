@@ -29,6 +29,12 @@ const EXECUTING_TURN_STATUSES = [
   "cancel_requested",
 ];
 
+function sourceEventKey(value) {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
 const PROJECT_FIELDS = {
   name: "name",
   repoUrl: "repo_url",
@@ -490,6 +496,13 @@ export class Store {
         UNIQUE(thread_id, sequence)
       );
 
+      CREATE TABLE IF NOT EXISTS incident_source_event_claims (
+        source_event_id TEXT PRIMARY KEY,
+        incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE RESTRICT,
+        auto_recovery_turn_id TEXT UNIQUE REFERENCES ops_turns(id) ON DELETE RESTRICT,
+        claimed_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS ops_actions (
         id TEXT PRIMARY KEY,
         ops_turn_id TEXT NOT NULL REFERENCES ops_turns(id) ON DELETE CASCADE,
@@ -535,6 +548,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS ops_turns_thread_idx ON ops_turns(thread_id, sequence ASC);
       CREATE INDEX IF NOT EXISTS incidents_status_idx ON incidents(status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS incidents_fingerprint_idx ON incidents(fingerprint, resolved_at);
+      CREATE INDEX IF NOT EXISTS incident_source_event_claims_incident_idx
+        ON incident_source_event_claims(incident_id);
       CREATE INDEX IF NOT EXISTS ops_actions_turn_idx ON ops_actions(ops_turn_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS repair_runs_status_idx ON repair_runs(status, updated_at DESC);
     `);
@@ -614,6 +629,56 @@ export class Store {
     if (!eventColumns.some((column) => column.name === "incident_id")) {
       this.db.exec("ALTER TABLE events ADD COLUMN incident_id TEXT");
     }
+    this.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS incident_source_event_claims (
+          source_event_id TEXT PRIMARY KEY,
+          incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE RESTRICT,
+          auto_recovery_turn_id TEXT UNIQUE REFERENCES ops_turns(id) ON DELETE RESTRICT,
+          claimed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS incident_source_event_claims_incident_idx
+          ON incident_source_event_claims(incident_id);
+      `);
+      this.db.exec(`
+        INSERT INTO incident_source_event_claims (
+          source_event_id, incident_id, auto_recovery_turn_id, claimed_at
+        )
+        SELECT
+          CAST(candidate.source_event_id AS TEXT),
+          candidate.id,
+          (
+            SELECT candidate_turn.id
+            FROM ops_turns AS candidate_turn
+            JOIN incidents AS turn_incident
+              ON turn_incident.id=candidate_turn.incident_id
+            WHERE candidate_turn.trigger='incident'
+              AND CAST(turn_incident.source_event_id AS TEXT)
+                = CAST(candidate.source_event_id AS TEXT)
+            ORDER BY candidate_turn.created_at ASC,
+              candidate_turn.sequence ASC, candidate_turn.id ASC
+            LIMIT 1
+          ),
+          candidate.created_at
+        FROM incidents AS candidate
+        WHERE candidate.source_event_id IS NOT NULL
+          AND LENGTH(TRIM(CAST(candidate.source_event_id AS TEXT))) > 0
+          AND NOT EXISTS (
+            SELECT 1
+            FROM incidents AS earlier
+            WHERE CAST(earlier.source_event_id AS TEXT)
+                = CAST(candidate.source_event_id AS TEXT)
+              AND (
+                earlier.created_at < candidate.created_at
+                OR (
+                  earlier.created_at = candidate.created_at
+                  AND earlier.id < candidate.id
+                )
+              )
+          )
+        ON CONFLICT(source_event_id) DO NOTHING
+      `);
+    });
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_idx
       ON tasks(idempotency_key)
@@ -2102,6 +2167,133 @@ export class Store {
     return turn;
   }
 
+  appendAutoRecoveryTurn({
+    message,
+    incidentId,
+    sourceEventId,
+    authorName = "Relay Auto Recovery",
+    threadId = "ops-system",
+  }) {
+    const sourceKey = sourceEventKey(sourceEventId);
+    if (!sourceKey) {
+      return {
+        turn: this.appendOpsTurn({
+          message,
+          incidentId,
+          authorName,
+          trigger: "incident",
+          threadId,
+        }),
+        created: true,
+      };
+    }
+    this.ensureOpsThread();
+    return this.transaction(() => {
+      const claim = this.db
+        .prepare(
+          `
+          SELECT source_event_id, incident_id, auto_recovery_turn_id
+          FROM incident_source_event_claims
+          WHERE source_event_id=?
+        `,
+        )
+        .get(sourceKey);
+      if (!claim) {
+        throw new Error(
+          `Source event ${sourceKey} must be claimed before auto recovery is queued`,
+        );
+      }
+      if (claim.incident_id !== incidentId) {
+        throw new Error(
+          `Source event ${sourceKey} is claimed by incident ${claim.incident_id}`,
+        );
+      }
+      if (claim.auto_recovery_turn_id) {
+        return {
+          turn: this.getOpsTurn(claim.auto_recovery_turn_id),
+          created: false,
+        };
+      }
+      const incidentRow = this.db
+        .prepare("SELECT resolved_at FROM incidents WHERE id=?")
+        .get(incidentId);
+      if (!incidentRow || incidentRow.resolved_at) {
+        return { turn: null, created: false };
+      }
+      const thread = this.getOpsThread(threadId);
+      if (!thread)
+        throw new HttpError(
+          404,
+          "OPS_THREAD_NOT_FOUND",
+          "System Codex conversation not found",
+        );
+      const timestamp = now();
+      const opsTurnId = id("ops-turn-");
+      const sequence = Number(
+        this.db
+          .prepare(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM ops_turns WHERE thread_id=?",
+          )
+          .get(thread.id).value,
+      );
+      this.db
+        .prepare(
+          `
+          INSERT INTO ops_turns (
+            id, thread_id, sequence, trigger, incident_id, user_message,
+            author_name, status, created_at
+          ) VALUES (?, ?, ?, 'incident', ?, ?, ?, 'queued', ?)
+        `,
+        )
+        .run(
+          opsTurnId,
+          thread.id,
+          sequence,
+          incidentId,
+          message,
+          authorName,
+          timestamp,
+        );
+      const claimed = this.db
+        .prepare(
+          `
+          UPDATE incident_source_event_claims
+          SET auto_recovery_turn_id=?
+          WHERE source_event_id=? AND auto_recovery_turn_id IS NULL
+        `,
+        )
+        .run(opsTurnId, sourceKey);
+      if (!claimed.changes) {
+        throw new Error(
+          `Source event ${sourceKey} auto recovery was claimed concurrently`,
+        );
+      }
+      this.db
+        .prepare(
+          "UPDATE ops_threads SET status='queued', updated_at=? WHERE id=?",
+        )
+        .run(timestamp, thread.id);
+      this.db
+        .prepare(
+          "UPDATE incidents SET status='queued', updated_at=? WHERE id=? AND resolved_at IS NULL",
+        )
+        .run(timestamp, incidentId);
+      const turn = this.getOpsTurn(opsTurnId);
+      queueMicrotask(() =>
+        this.emit({
+          opsTurnId,
+          incidentId,
+          actorName: authorName,
+          type: "ops.turn.queued",
+          phase: "ops",
+          message: `System Codex turn ${sequence} queued`,
+          data: { trigger: "incident", sourceEventId },
+        }),
+      );
+      return { turn, created: true };
+    });
+  }
+
   claimNextOpsTurn() {
     return this.transaction(() => {
       const row = this.db
@@ -2219,40 +2411,88 @@ export class Store {
 
   createIncident(input) {
     const timestamp = now();
+    const sourceKey = sourceEventKey(input.sourceEventId);
     return this.transaction(() => {
-      const existingRow = this.db
-        .prepare(
-          `
-          SELECT * FROM incidents
-          WHERE fingerprint=? AND resolved_at IS NULL
-          ORDER BY created_at DESC LIMIT 1
-        `,
-        )
-        .get(input.fingerprint);
+      if (sourceKey) {
+        const claimedRow = this.db
+          .prepare(
+            `
+            SELECT incidents.*
+            FROM incident_source_event_claims AS claim
+            JOIN incidents ON incidents.id=claim.incident_id
+            WHERE claim.source_event_id=?
+          `,
+          )
+          .get(sourceKey);
+        if (claimedRow) {
+          return {
+            incident: incidentFromRow(claimedRow),
+            created: false,
+            sourceEventClaimed: false,
+          };
+        }
+      }
+      let existingRow = input.canonicalIncidentId
+        ? this.db
+            .prepare(
+              "SELECT * FROM incidents WHERE id=? AND resolved_at IS NULL",
+            )
+            .get(input.canonicalIncidentId)
+        : null;
+      if (!existingRow) {
+        existingRow = this.db
+          .prepare(
+            `
+            SELECT * FROM incidents
+            WHERE fingerprint=? AND resolved_at IS NULL
+            ORDER BY created_at ASC, id ASC LIMIT 1
+          `,
+          )
+          .get(input.fingerprint);
+      }
       if (existingRow) {
         this.db
           .prepare(
             `
             UPDATE incidents
-            SET source_event_id=COALESCE(?, source_event_id),
+            SET source_event_id=COALESCE(source_event_id, ?),
               task_id=COALESCE(?, task_id), turn_id=COALESCE(?, turn_id),
               worker_id=COALESCE(?, worker_id), title=?, error=?,
-              context_json=?, updated_at=?
+              context_json=?, status=CASE WHEN ? THEN 'open' ELSE status END,
+              resolved_at=CASE WHEN ? THEN NULL ELSE resolved_at END,
+              updated_at=?
             WHERE id=?
           `,
           )
           .run(
-            input.sourceEventId || null,
+            sourceKey,
             input.taskId || null,
             input.turnId || null,
             input.workerId || null,
             input.title,
             input.error,
             stringifyJson(input.context || null),
+            input.reopenExisting ? 1 : 0,
+            input.reopenExisting ? 1 : 0,
             timestamp,
             existingRow.id,
           );
-        return { incident: this.getIncident(existingRow.id), created: false };
+        if (sourceKey) {
+          this.db
+            .prepare(
+              `
+              INSERT INTO incident_source_event_claims (
+                source_event_id, incident_id, claimed_at
+              ) VALUES (?, ?, ?)
+            `,
+            )
+            .run(sourceKey, existingRow.id, timestamp);
+        }
+        return {
+          incident: this.getIncident(existingRow.id),
+          created: false,
+          sourceEventClaimed: Boolean(sourceKey),
+        };
       }
       const incidentId = id("incident-");
       this.db
@@ -2268,7 +2508,7 @@ export class Store {
           incidentId,
           input.fingerprint,
           input.severity || "error",
-          input.sourceEventId || null,
+          sourceKey,
           input.taskId || null,
           input.turnId || null,
           input.workerId || null,
@@ -2278,13 +2518,45 @@ export class Store {
           timestamp,
           timestamp,
         );
-      return { incident: this.getIncident(incidentId), created: true };
+      if (sourceKey) {
+        this.db
+          .prepare(
+            `
+            INSERT INTO incident_source_event_claims (
+              source_event_id, incident_id, claimed_at
+            ) VALUES (?, ?, ?)
+          `,
+          )
+          .run(sourceKey, incidentId, timestamp);
+      }
+      return {
+        incident: this.getIncident(incidentId),
+        created: true,
+        sourceEventClaimed: Boolean(sourceKey),
+      };
     });
   }
 
   getIncident(incidentId) {
     return incidentFromRow(
       this.db.prepare("SELECT * FROM incidents WHERE id=?").get(incidentId),
+    );
+  }
+
+  getIncidentBySourceEventId(sourceEventId) {
+    const sourceKey = sourceEventKey(sourceEventId);
+    if (!sourceKey) return null;
+    return incidentFromRow(
+      this.db
+        .prepare(
+          `
+          SELECT incidents.*
+          FROM incident_source_event_claims AS claim
+          JOIN incidents ON incidents.id=claim.incident_id
+          WHERE claim.source_event_id=?
+        `,
+        )
+        .get(sourceKey),
     );
   }
 

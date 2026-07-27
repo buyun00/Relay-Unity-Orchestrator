@@ -22,6 +22,13 @@ const INCIDENT_EVENT_TYPES = new Set([
   "guardian.restart.failed",
 ]);
 
+const INCIDENT_RECOVERY_EVENT_TYPES = new Map([
+  [
+    "guardian.health.recovered",
+    new Set(["guardian.health.failed", "guardian.restart.failed"]),
+  ],
+]);
+
 function normalizedFingerprintPart(value) {
   return String(value || "")
     .toLowerCase()
@@ -159,6 +166,10 @@ export class OpsEngine {
 
   scanExistingProblems() {
     for (const event of this.store.listEvents({ limit: 100 })) {
+      if (INCIDENT_RECOVERY_EVENT_TYPES.has(event.type)) {
+        this.resolveMonitoredIncidents(event);
+        continue;
+      }
       if (
         event.level === "error" &&
         !event.type.startsWith("ops.") &&
@@ -198,7 +209,8 @@ export class OpsEngine {
     if (!this.running) return;
     if (
       event.type === "turn.delivered" ||
-      event.type === "worker.action.completed"
+      event.type === "worker.action.completed" ||
+      INCIDENT_RECOVERY_EVENT_TYPES.has(event.type)
     ) {
       this.resolveMonitoredIncidents(event);
       return;
@@ -211,11 +223,16 @@ export class OpsEngine {
   }
 
   resolveMonitoredIncidents(event) {
+    const recoveredSourceTypes = INCIDENT_RECOVERY_EVENT_TYPES.get(event.type);
     for (const incident of this.store.listIncidents()) {
-      if (incident.status !== "monitoring" || incident.resolvedAt) continue;
+      if (incident.resolvedAt) continue;
+      const sameRecoveryKind = Boolean(
+        recoveredSourceTypes?.has(incident.context?.eventType),
+      );
+      if (incident.status !== "monitoring" && !sameRecoveryKind) continue;
       const sameTask = event.taskId && incident.taskId === event.taskId;
       const sameWorker = event.workerId && incident.workerId === event.workerId;
-      if (!sameTask && !sameWorker) continue;
+      if (!sameTask && !sameWorker && !sameRecoveryKind) continue;
       this.store.updateIncident(incident.id, {
         status: "resolved",
         lastAction: event.type,
@@ -242,53 +259,51 @@ export class OpsEngine {
           ((event.taskId && incident.taskId === event.taskId) ||
             (event.workerId && incident.workerId === event.workerId)),
       );
-    let result;
-    if (monitoring) {
-      result = {
-        incident: this.store.reopenIncident(
-          monitoring.id,
-          event.message || monitoring.error,
-        ),
-        created: false,
-      };
-    } else {
-      result = this.store.createIncident({
-        fingerprint: incidentFingerprint(event),
-        severity: event.level === "warning" ? "warning" : "error",
-        sourceEventId: event.id,
-        taskId: event.taskId,
-        turnId: event.turnId,
-        workerId: event.workerId,
-        title: `${event.type}: ${String(event.message || "Relay incident").slice(0, 180)}`,
-        error: event.message || event.type,
-        context: {
-          eventType: event.type,
-          eventData: event.data || null,
-          observedAt: event.createdAt || new Date().toISOString(),
-        },
+    const result = this.store.createIncident({
+      fingerprint: incidentFingerprint(event),
+      severity: event.level === "warning" ? "warning" : "error",
+      sourceEventId: event.id,
+      canonicalIncidentId: monitoring?.id || null,
+      reopenExisting: Boolean(monitoring),
+      taskId: event.taskId,
+      turnId: event.turnId,
+      workerId: event.workerId,
+      title: `${event.type}: ${String(event.message || "Relay incident").slice(0, 180)}`,
+      error: event.message || event.type,
+      context: {
+        eventType: event.type,
+        eventData: event.data || null,
+        observedAt: event.createdAt || new Date().toISOString(),
+      },
+    });
+    const { incident } = result;
+    const hasSourceEvent =
+      event.id != null && String(event.id).trim().length > 0;
+    const duplicateSourceEvent =
+      hasSourceEvent && result.sourceEventClaimed === false;
+    if (!duplicateSourceEvent) {
+      this.store.emit({
+        taskId: incident.taskId,
+        turnId: incident.turnId,
+        workerId: incident.workerId,
+        incidentId: incident.id,
+        type: result.created ? "ops.incident.created" : "ops.incident.updated",
+        phase: "ops",
+        level: "warning",
+        message: `System Codex captured incident: ${incident.title}`,
       });
     }
-    const { incident } = result;
-    this.store.emit({
-      taskId: incident.taskId,
-      turnId: incident.turnId,
-      workerId: incident.workerId,
-      incidentId: incident.id,
-      type: result.created ? "ops.incident.created" : "ops.incident.updated",
-      phase: "ops",
-      level: "warning",
-      message: `System Codex captured incident: ${incident.title}`,
-    });
     if (
       this.config.opsAutoHandle &&
+      !incident.resolvedAt &&
       incident.attemptCount < this.config.opsMaxAttempts &&
       !["queued", "diagnosing", "acting"].includes(incident.status)
     ) {
-      this.queueIncident(incident);
+      this.queueIncident(incident, null, event.id);
     }
   }
 
-  queueIncident(incident, followup = null) {
+  queueIncident(incident, followup = null, sourceEventId = null) {
     const task = incident.taskId ? this.store.getTask(incident.taskId) : null;
     const worker = incident.workerId
       ? this.store.getWorker(incident.workerId)
@@ -303,12 +318,21 @@ export class OpsEngine {
     ]
       .filter(Boolean)
       .join("\n");
-    this.store.appendOpsTurn({
-      message,
-      trigger: followup ? "followup" : "incident",
-      incidentId: incident.id,
-      authorName: "Relay Auto Recovery",
-    });
+    if (followup) {
+      this.store.appendOpsTurn({
+        message,
+        trigger: "followup",
+        incidentId: incident.id,
+        authorName: "Relay Auto Recovery",
+      });
+    } else {
+      this.store.appendAutoRecoveryTurn({
+        message,
+        incidentId: incident.id,
+        sourceEventId,
+        authorName: "Relay Auto Recovery",
+      });
+    }
     void this.pump();
   }
 
