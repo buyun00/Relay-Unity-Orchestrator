@@ -199,6 +199,9 @@ function opsThreadFromRow(row) {
   if (!row) return null;
   return {
     id: row.id,
+    title: row.title,
+    isSystem: asBoolean(row.is_system),
+    clearedThroughSequence: Number(row.cleared_through_sequence || 0),
     codexThreadId: row.codex_thread_id,
     status: row.status,
     codexModel: row.codex_model,
@@ -438,6 +441,9 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS ops_threads (
         id TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT 'New conversation',
+        is_system INTEGER NOT NULL DEFAULT 0,
+        cleared_through_sequence INTEGER NOT NULL DEFAULT 0,
         codex_thread_id TEXT,
         status TEXT NOT NULL DEFAULT 'idle',
         codex_model TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_MODEL}',
@@ -557,6 +563,36 @@ export class Store {
         `ALTER TABLE tasks ADD COLUMN codex_reasoning_effort TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_REASONING_EFFORT}'`,
       );
     }
+    const opsThreadColumns = this.db
+      .prepare("PRAGMA table_info(ops_threads)")
+      .all();
+    if (!opsThreadColumns.some((column) => column.name === "title")) {
+      this.db.exec(
+        "ALTER TABLE ops_threads ADD COLUMN title TEXT NOT NULL DEFAULT 'New conversation'",
+      );
+    }
+    if (!opsThreadColumns.some((column) => column.name === "is_system")) {
+      this.db.exec(
+        "ALTER TABLE ops_threads ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (
+      !opsThreadColumns.some(
+        (column) => column.name === "cleared_through_sequence",
+      )
+    ) {
+      this.db.exec(
+        "ALTER TABLE ops_threads ADD COLUMN cleared_through_sequence INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    this.db
+      .prepare(
+        "UPDATE ops_threads SET title=?, is_system=1 WHERE id='ops-system'",
+      )
+      .run("系统自动恢复");
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS ops_threads_activity_idx ON ops_threads(is_system DESC, updated_at DESC)",
+    );
     if (!taskColumns.some((column) => column.name === "codex_fast_mode")) {
       this.db.exec(
         `ALTER TABLE tasks ADD COLUMN codex_fast_mode INTEGER NOT NULL DEFAULT ${DEFAULT_CODEX_FAST_MODE ? 1 : 0}`,
@@ -654,6 +690,17 @@ export class Store {
       SET status='interrupted', error='Relay restarted while repair was active',
         updated_at='${timestamp}'
       WHERE status IN ('running','validating','deploying');
+      UPDATE ops_threads
+      SET status=CASE
+        WHEN EXISTS (
+          SELECT 1 FROM ops_turns
+          WHERE ops_turns.thread_id=ops_threads.id
+            AND ops_turns.status='queued'
+        ) THEN 'queued'
+        ELSE 'idle'
+      END,
+      updated_at='${timestamp}'
+      WHERE status IN ('running','queued');
     `);
   }
 
@@ -1752,13 +1799,14 @@ export class Store {
       .prepare(
         `
         INSERT INTO ops_threads (
-          id, status, codex_model, codex_reasoning_effort, codex_fast_mode,
-          created_at, updated_at
-        ) VALUES (?, 'idle', ?, ?, ?, ?, ?)
+          id, title, is_system, status, codex_model,
+          codex_reasoning_effort, codex_fast_mode, created_at, updated_at
+        ) VALUES (?, ?, 1, 'idle', ?, ?, ?, ?, ?)
       `,
       )
       .run(
         threadId,
+        "系统自动恢复",
         this.config.opsCodexModel ||
           this.config.codexModel ||
           DEFAULT_CODEX_MODEL,
@@ -1777,13 +1825,150 @@ export class Store {
     );
   }
 
-  getOpsThread() {
-    return this.ensureOpsThread();
+  listOpsThreads() {
+    this.ensureOpsThread();
+    return this.db
+      .prepare(
+        `
+        SELECT ops_threads.*,
+          (
+            SELECT COUNT(*) FROM ops_turns
+            WHERE ops_turns.thread_id=ops_threads.id
+              AND ops_turns.sequence > ops_threads.cleared_through_sequence
+          ) AS visible_turn_count,
+          (
+            SELECT COUNT(*) FROM ops_turns
+            WHERE ops_turns.thread_id=ops_threads.id
+          ) AS total_turn_count
+        FROM ops_threads
+        ORDER BY is_system DESC, updated_at DESC
+      `,
+      )
+      .all()
+      .map((row) => ({
+        ...opsThreadFromRow(row),
+        visibleTurnCount: Number(row.visible_turn_count || 0),
+        totalTurnCount: Number(row.total_turn_count || 0),
+      }));
   }
 
-  setOpsCodexThread(codexThreadId) {
-    if (!codexThreadId) return this.getOpsThread();
-    const thread = this.ensureOpsThread();
+  getOpsThread(threadId = "ops-system") {
+    if (threadId === "ops-system") this.ensureOpsThread();
+    return opsThreadFromRow(
+      this.db.prepare("SELECT * FROM ops_threads WHERE id=?").get(threadId),
+    );
+  }
+
+  createOpsThread({ title, codexModel, codexReasoningEffort, codexFastMode }) {
+    const timestamp = now();
+    const threadId = id("ops-thread-");
+    this.db
+      .prepare(
+        `
+        INSERT INTO ops_threads (
+          id, title, is_system, status, codex_model,
+          codex_reasoning_effort, codex_fast_mode, created_at, updated_at
+        ) VALUES (?, ?, 0, 'idle', ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        threadId,
+        title,
+        codexModel,
+        codexReasoningEffort,
+        codexFastMode ? 1 : 0,
+        timestamp,
+        timestamp,
+      );
+    return this.getOpsThread(threadId);
+  }
+
+  updateOpsThread(
+    threadId,
+    { title, codexModel, codexReasoningEffort, codexFastMode },
+  ) {
+    const thread = this.getOpsThread(threadId);
+    if (!thread)
+      throw new HttpError(
+        404,
+        "OPS_THREAD_NOT_FOUND",
+        "System Codex conversation not found",
+      );
+    this.db
+      .prepare(
+        `
+        UPDATE ops_threads
+        SET title=?, codex_model=?, codex_reasoning_effort=?,
+          codex_fast_mode=?, updated_at=?
+        WHERE id=?
+      `,
+      )
+      .run(
+        title ?? thread.title,
+        codexModel ?? thread.codexModel,
+        codexReasoningEffort ?? thread.codexReasoningEffort,
+        codexFastMode == null
+          ? thread.codexFastMode
+            ? 1
+            : 0
+          : codexFastMode
+            ? 1
+            : 0,
+        now(),
+        threadId,
+      );
+    return this.getOpsThread(threadId);
+  }
+
+  clearOpsThread(threadId) {
+    return this.transaction(() => {
+      const thread = this.getOpsThread(threadId);
+      if (!thread)
+        throw new HttpError(
+          404,
+          "OPS_THREAD_NOT_FOUND",
+          "System Codex conversation not found",
+        );
+      const active = this.db
+        .prepare(
+          "SELECT 1 FROM ops_turns WHERE thread_id=? AND status IN ('queued','running') LIMIT 1",
+        )
+        .get(threadId);
+      if (active)
+        throw new HttpError(
+          409,
+          "OPS_THREAD_ACTIVE",
+          "Wait for the active System Codex turn before clearing the screen",
+        );
+      const clearedThroughSequence = Number(
+        this.db
+          .prepare(
+            "SELECT COALESCE(MAX(sequence), 0) AS value FROM ops_turns WHERE thread_id=?",
+          )
+          .get(threadId).value,
+      );
+      this.db
+        .prepare(
+          "UPDATE ops_threads SET cleared_through_sequence=?, updated_at=? WHERE id=?",
+        )
+        .run(clearedThroughSequence, now(), threadId);
+      return this.getOpsThread(threadId);
+    });
+  }
+
+  setOpsCodexThread(threadId, codexThreadId) {
+    if (codexThreadId === undefined) {
+      codexThreadId = threadId;
+      threadId = "ops-system";
+    }
+    if (!codexThreadId) return this.getOpsThread(threadId);
+    const thread = this.getOpsThread(threadId);
+    if (!thread)
+      throw new HttpError(
+        404,
+        "OPS_THREAD_NOT_FOUND",
+        "System Codex conversation not found",
+      );
     this.db
       .prepare(
         `
@@ -1793,14 +1978,33 @@ export class Store {
       `,
       )
       .run(codexThreadId, now(), thread.id);
-    return this.getOpsThread();
+    return this.getOpsThread(threadId);
   }
 
-  listOpsTurns() {
+  listOpsTurns({ threadId = null, includeCleared = false } = {}) {
     this.ensureOpsThread();
+    const conditions = [];
+    const values = [];
+    if (threadId) {
+      conditions.push("ops_turns.thread_id=?");
+      values.push(threadId);
+    }
+    if (!includeCleared) {
+      conditions.push(
+        "ops_turns.sequence > ops_threads.cleared_through_sequence",
+      );
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     return this.db
-      .prepare("SELECT * FROM ops_turns ORDER BY sequence ASC")
-      .all()
+      .prepare(
+        `
+        SELECT ops_turns.* FROM ops_turns
+        JOIN ops_threads ON ops_threads.id=ops_turns.thread_id
+        ${where}
+        ORDER BY ops_turns.created_at ASC, ops_turns.sequence ASC
+      `,
+      )
+      .all(...values)
       .map(opsTurnFromRow);
   }
 
@@ -1815,8 +2019,15 @@ export class Store {
     authorName = "Relay",
     trigger = "manual",
     incidentId = null,
+    threadId = "ops-system",
   }) {
-    const thread = this.ensureOpsThread();
+    const thread = this.getOpsThread(threadId);
+    if (!thread)
+      throw new HttpError(
+        404,
+        "OPS_THREAD_NOT_FOUND",
+        "System Codex conversation not found",
+      );
     const timestamp = now();
     const opsTurnId = id("ops-turn-");
     const sequence = Number(
@@ -1876,7 +2087,16 @@ export class Store {
     return this.transaction(() => {
       const row = this.db
         .prepare(
-          "SELECT * FROM ops_turns WHERE status='queued' ORDER BY created_at ASC LIMIT 1",
+          `
+          SELECT queued.* FROM ops_turns AS queued
+          WHERE queued.status='queued'
+            AND NOT EXISTS (
+              SELECT 1 FROM ops_turns AS active
+              WHERE active.thread_id=queued.thread_id
+                AND active.status='running'
+            )
+          ORDER BY queued.created_at ASC LIMIT 1
+        `,
         )
         .get();
       if (!row) return null;
@@ -1921,14 +2141,7 @@ export class Store {
       `,
       )
       .run(stringifyJson(final), timestamp, opsTurnId);
-    const queued = this.db
-      .prepare(
-        "SELECT 1 FROM ops_turns WHERE thread_id=? AND status='queued' LIMIT 1",
-      )
-      .get(turn.threadId);
-    this.db
-      .prepare("UPDATE ops_threads SET status=?, updated_at=? WHERE id=?")
-      .run(queued ? "queued" : "idle", timestamp, turn.threadId);
+    this.refreshOpsThreadStatus(turn.threadId, timestamp);
     return this.getOpsTurn(opsTurnId);
   }
 
@@ -1950,9 +2163,7 @@ export class Store {
         timestamp,
         opsTurnId,
       );
-    this.db
-      .prepare("UPDATE ops_threads SET status='idle', updated_at=? WHERE id=?")
-      .run(timestamp, turn.threadId);
+    this.refreshOpsThreadStatus(turn.threadId, timestamp);
     if (turn.incidentId) {
       this.db
         .prepare(
@@ -1964,6 +2175,27 @@ export class Store {
         .run(error?.message || String(error), timestamp, turn.incidentId);
     }
     return this.getOpsTurn(opsTurnId);
+  }
+
+  refreshOpsThreadStatus(threadId, timestamp = now()) {
+    const running = this.db
+      .prepare(
+        "SELECT 1 FROM ops_turns WHERE thread_id=? AND status='running' LIMIT 1",
+      )
+      .get(threadId);
+    const queued = this.db
+      .prepare(
+        "SELECT 1 FROM ops_turns WHERE thread_id=? AND status='queued' LIMIT 1",
+      )
+      .get(threadId);
+    this.db
+      .prepare("UPDATE ops_threads SET status=?, updated_at=? WHERE id=?")
+      .run(
+        running ? "running" : queued ? "queued" : "idle",
+        timestamp,
+        threadId,
+      );
+    return this.getOpsThread(threadId);
   }
 
   createIncident(input) {
@@ -2269,6 +2501,7 @@ export class Store {
       turns,
       ops: {
         thread: this.getOpsThread(),
+        threads: this.listOpsThreads(),
         turns: this.listOpsTurns(),
         incidents: this.listIncidents(),
         actions: this.listOpsActions(),

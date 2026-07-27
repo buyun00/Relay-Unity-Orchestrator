@@ -2,7 +2,11 @@
 
 ## 目标状态
 
-Relay 不再要求用户先发现 `attention` Worker 或手工进入桌面 Codex。控制服务会把执行失败、Worker 动作失败、健康异常、Relay 运行前置失败和 Guardian 故障记录为持久事故，并自动送入同一条 Ops Codex 会话。网页“系统助手”既显示自动事故对话，也接受远程人工消息。
+Relay 不再要求用户先发现 `attention` Worker 或手工进入桌面 Codex。控制服务会把执行失败、Worker 动作失败、健康异常、Relay 运行前置失败和 Guardian 故障记录为持久事故，并自动送入专用的“系统自动恢复”会话。网页“系统助手”同时支持多个独立人工会话。
+
+每条会话分别保存 Codex thread、模型、推理深度和 Fast 设置。不同会话最多按 `PIPELINE_OPS_MAX_CONCURRENT_SESSIONS` 并行运行，同一会话内的轮次始终串行，所有会改变外部状态的结构化动作还会经过全局串行执行器，避免并发重启或修复相互冲突。
+
+“清屏”会把当前最大轮次写入 `cleared_through_sequence`，只改变网页可见范围；数据库轮次、Codex thread、事故和动作审计均不会删除。需要完全独立上下文时应新建对话，而不是清屏。
 
 Ops Codex 负责理解未知异常并组合动作；实际状态变更由 Relay 执行器完成和审计。当前动作包括：
 
@@ -66,6 +70,7 @@ PIPELINE_OPS_ENABLED=true
 PIPELINE_OPS_AUTO_HANDLE=true
 PIPELINE_OPS_AUTO_DEPLOY=true
 PIPELINE_OPS_MAX_ATTEMPTS=4
+PIPELINE_OPS_MAX_CONCURRENT_SESSIONS=4
 PIPELINE_OPS_CODEX_MODEL=gpt-5.6-sol
 PIPELINE_OPS_CODEX_REASONING_EFFORT=xhigh
 PIPELINE_OPS_CODEX_FAST_MODE=false
@@ -107,7 +112,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Install-RelayGuardianTask.ps1
 
 SQLite 新增以下记录：
 
-- `ops_threads`：系统 Codex 的持久 `thread_id` 和模型配置；
+- `ops_threads`：每条系统 Codex 对话的持久 `thread_id`、标题、模型配置和非破坏清屏位置；
 - `ops_turns`：手工消息、自动事故轮次和结构化结论；
 - `incidents`：错误指纹、关联 Task/Turn/Worker、尝试次数和解决状态；
 - `ops_actions`：每个自动动作的原因、目标、结果与错误；

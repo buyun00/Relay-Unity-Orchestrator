@@ -18,6 +18,7 @@ import {
   Copy,
   Cpu,
   Database,
+  Eraser,
   FileCode2,
   FolderGit2,
   GitBranch,
@@ -31,6 +32,7 @@ import {
   LoaderCircle,
   Menu,
   MessageSquareText,
+  MessageSquarePlus,
   MonitorCog,
   Network,
   OctagonX,
@@ -78,6 +80,7 @@ import {
   EMPTY_SNAPSHOT,
   type HealthState,
   type HostVirtualMachine,
+  type OpsThread,
   type PipelineEvent,
   type Project,
   type Snapshot,
@@ -196,12 +199,14 @@ function StyledSelect({
   options,
   onChange,
   description,
+  disabled = false,
 }: {
   label: string;
   value: string;
   options: ReadonlyArray<{ value: string; label: string; detail?: string }>;
   onChange: (value: string) => void;
   description?: string;
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -234,6 +239,7 @@ function StyledSelect({
           aria-label={label}
           aria-haspopup="listbox"
           aria-expanded={open}
+          disabled={disabled}
           onClick={() => setOpen((value) => !value)}
           onKeyDown={(event) => {
             if (["ArrowDown", "ArrowUp"].includes(event.key)) {
@@ -1215,14 +1221,48 @@ export default function ControlDesk() {
               snapshot={snapshot}
               busy={busy}
               onTask={(id) => navigate("task", id)}
-              onSend={async (message) =>
+              onSend={async (threadId, message) =>
                 runMutation(
                   () =>
                     api("/api/ops/messages", {
                       method: "POST",
-                      body: JSON.stringify({ message }),
+                      body: JSON.stringify({ threadId, message }),
                     }),
                   "消息已交给系统 Codex",
+                )
+              }
+              onCreateThread={async (input) => {
+                let created: OpsThread | null = null;
+                const ok = await runMutation(async () => {
+                  const response = await api<{
+                    ok: boolean;
+                    thread: OpsThread;
+                  }>("/api/ops/threads", {
+                    method: "POST",
+                    body: JSON.stringify(input),
+                  });
+                  created = response.thread;
+                }, "系统对话已创建");
+                return ok ? created : null;
+              }}
+              onUpdateThread={(threadId, input) =>
+                runMutation(
+                  () =>
+                    api(`/api/ops/threads/${encodeURIComponent(threadId)}`, {
+                      method: "PATCH",
+                      body: JSON.stringify(input),
+                    }),
+                  "对话设置已更新",
+                )
+              }
+              onClearThread={(threadId) =>
+                runMutation(
+                  () =>
+                    api(
+                      `/api/ops/threads/${encodeURIComponent(threadId)}/clear`,
+                      { method: "POST" },
+                    ),
+                  "当前对话已清屏，上下文和审计记录仍保留",
                 )
               }
               onDiagnose={(incidentId) =>
@@ -1735,28 +1775,108 @@ function OpsPage({
   busy,
   onTask,
   onSend,
+  onCreateThread,
+  onUpdateThread,
+  onClearThread,
   onDiagnose,
   onResolve,
 }: {
   snapshot: Snapshot;
   busy: boolean;
   onTask: (id: string) => void;
-  onSend: (message: string) => Promise<boolean>;
+  onSend: (threadId: string, message: string) => Promise<boolean>;
+  onCreateThread: (input: {
+    title: string;
+    codexModel: string;
+    codexReasoningEffort: string;
+    codexFastMode: boolean;
+  }) => Promise<OpsThread | null>;
+  onUpdateThread: (
+    threadId: string,
+    input: Partial<{
+      title: string;
+      codexModel: string;
+      codexReasoningEffort: string;
+      codexFastMode: boolean;
+    }>,
+  ) => Promise<boolean>;
+  onClearThread: (threadId: string) => Promise<boolean>;
   onDiagnose: (incidentId: string) => void;
   onResolve: (incidentId: string) => void;
 }) {
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
+  const [selectedThreadId, setSelectedThreadId] = useState(
+    snapshot.ops.thread.id,
+  );
+  const [creatingThread, setCreatingThread] = useState(false);
+  const [newThreadTitle, setNewThreadTitle] = useState("新的系统对话");
+  const [newThreadModel, setNewThreadModel] = useState(
+    snapshot.ops.thread.codexModel,
+  );
+  const [newThreadReasoning, setNewThreadReasoning] = useState(
+    snapshot.ops.thread.codexReasoningEffort,
+  );
+  const [newThreadFast, setNewThreadFast] = useState(
+    snapshot.ops.thread.codexFastMode,
+  );
   const ops = snapshot.ops;
+  const threads = ops.threads.length ? ops.threads : [ops.thread];
+  const selectedThread =
+    threads.find((thread) => thread.id === selectedThreadId) ?? threads[0];
+  const visibleTurns = selectedThread
+    ? ops.turns.filter((turn) => turn.threadId === selectedThread.id)
+    : [];
+  const selectedModel =
+    CODEX_MODEL_OPTIONS.find(
+      (option) => option.value === selectedThread?.codexModel,
+    ) ?? CODEX_MODEL_OPTIONS[0];
+  const selectedReasoningOptions = CODEX_REASONING_OPTIONS.filter((option) =>
+    selectedModel.efforts.includes(option.value as never),
+  );
+  const newModelOption =
+    CODEX_MODEL_OPTIONS.find((option) => option.value === newThreadModel) ??
+    CODEX_MODEL_OPTIONS[0];
+  const newReasoningOptions = CODEX_REASONING_OPTIONS.filter((option) =>
+    newModelOption.efforts.includes(option.value as never),
+  );
+  const threadActive = ["queued", "running"].includes(
+    selectedThread?.status ?? "idle",
+  );
   const openIncidents = ops.incidents.filter((item) => !item.resolvedAt);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const content = message.trim();
-    if (!content || sending) return;
+    if (!content || sending || !selectedThread) return;
     setSending(true);
-    const ok = await onSend(content);
+    const ok = await onSend(selectedThread.id, content);
     if (ok) setMessage("");
     setSending(false);
+  };
+  const createThread = async (event: FormEvent) => {
+    event.preventDefault();
+    const title = newThreadTitle.trim();
+    if (!title) return;
+    const thread = await onCreateThread({
+      title,
+      codexModel: newThreadModel,
+      codexReasoningEffort: newThreadReasoning,
+      codexFastMode: newThreadFast,
+    });
+    if (!thread) return;
+    setSelectedThreadId(thread.id);
+    setCreatingThread(false);
+    setNewThreadTitle("新的系统对话");
+  };
+  const updateSelectedThread = (
+    changes: Partial<{
+      codexModel: string;
+      codexReasoningEffort: string;
+      codexFastMode: boolean;
+    }>,
+  ) => {
+    if (!selectedThread) return;
+    void onUpdateThread(selectedThread.id, changes);
   };
   return (
     <div className="page ops-page">
@@ -1788,7 +1908,9 @@ function OpsPage({
             }
           />
           <span className="ops-thread-meta">
-            {ops.thread.codexModel} · {ops.thread.codexReasoningEffort}
+            {selectedThread
+              ? `${codexModelLabel(selectedThread.codexModel)} · ${codexReasoningLabel(selectedThread.codexReasoningEffort)}${selectedThread.codexFastMode ? " · Fast" : ""}`
+              : "未选择对话"}
           </span>
         </div>
       </section>
@@ -1807,23 +1929,215 @@ function OpsPage({
       )}
 
       <div className="ops-layout">
+        <aside className="ops-session-rail">
+          <div className="ops-session-rail-head">
+            <div>
+              <span className="section-kicker">CONVERSATIONS</span>
+              <h2>系统对话</h2>
+            </div>
+            <button
+              className="icon-button"
+              type="button"
+              aria-label="新建系统对话"
+              title="新建系统对话"
+              onClick={() => setCreatingThread((value) => !value)}
+            >
+              <MessageSquarePlus size={17} />
+            </button>
+          </div>
+          {creatingThread && (
+            <form className="ops-new-session" onSubmit={createThread}>
+              <label className="form-field">
+                <span>对话名称</span>
+                <input
+                  value={newThreadTitle}
+                  maxLength={120}
+                  onChange={(event) => setNewThreadTitle(event.target.value)}
+                  placeholder="例如：网页异常排查"
+                  autoFocus
+                />
+              </label>
+              <StyledSelect
+                label="模型"
+                value={newThreadModel}
+                options={CODEX_MODEL_OPTIONS}
+                onChange={(value) => {
+                  setNewThreadModel(value);
+                  const option =
+                    CODEX_MODEL_OPTIONS.find((item) => item.value === value) ??
+                    CODEX_MODEL_OPTIONS[0];
+                  if (!option.efforts.includes(newThreadReasoning as never)) {
+                    setNewThreadReasoning(
+                      option.efforts.includes("xhigh" as never)
+                        ? "xhigh"
+                        : (option.efforts.at(-1) ?? "high"),
+                    );
+                  }
+                }}
+              />
+              <StyledSelect
+                label="思考深度"
+                value={newThreadReasoning}
+                options={newReasoningOptions}
+                onChange={setNewThreadReasoning}
+              />
+              <label className="ops-fast-toggle">
+                <input
+                  type="checkbox"
+                  checked={newThreadFast}
+                  onChange={(event) => setNewThreadFast(event.target.checked)}
+                />
+                <span>
+                  <Zap size={14} />
+                  Fast 模式
+                </span>
+              </label>
+              <div className="ops-new-session-actions">
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => setCreatingThread(false)}
+                >
+                  取消
+                </button>
+                <button
+                  className="primary-action"
+                  type="submit"
+                  disabled={busy || !newThreadTitle.trim()}
+                >
+                  <Plus size={15} />
+                  创建
+                </button>
+              </div>
+            </form>
+          )}
+          <div className="ops-session-list">
+            {threads.map((thread) => (
+              <button
+                type="button"
+                key={thread.id}
+                className={cx(
+                  "ops-session-item",
+                  selectedThread?.id === thread.id && "active",
+                )}
+                onClick={() => setSelectedThreadId(thread.id)}
+              >
+                <span className="ops-session-icon">
+                  <Bot size={15} />
+                </span>
+                <span>
+                  <strong>{thread.title}</strong>
+                  <small>
+                    {codexModelLabel(thread.codexModel)}
+                    {thread.codexFastMode ? " · Fast" : ""}
+                  </small>
+                </span>
+                <span className={cx("ops-session-state", thread.status)} />
+                <em>{thread.visibleTurnCount ?? 0}</em>
+              </button>
+            ))}
+          </div>
+          <p className="ops-session-note">
+            不同对话可并行执行；同一对话内仍按顺序运行。
+          </p>
+        </aside>
         <section className="ops-conversation">
           <div className="ops-conversation-head">
             <div>
               <span className="section-kicker">SYSTEM THREAD</span>
-              <h2>运维对话</h2>
+              <h2>{selectedThread?.title ?? "系统对话"}</h2>
             </div>
-            <span>{ops.turns.length} 轮</span>
+            <div className="ops-conversation-actions">
+              <span>{visibleTurns.length} 轮</span>
+              <button
+                className="secondary-action compact"
+                type="button"
+                disabled={
+                  busy ||
+                  threadActive ||
+                  visibleTurns.length === 0 ||
+                  !selectedThread
+                }
+                onClick={() =>
+                  selectedThread && void onClearThread(selectedThread.id)
+                }
+                title="只清除当前屏幕记录，Codex 上下文和审计历史仍然保留"
+              >
+                <Eraser size={15} />
+                清屏
+              </button>
+            </div>
           </div>
+          {selectedThread && (
+            <div className="ops-session-settings">
+              <StyledSelect
+                label="模型"
+                value={selectedThread.codexModel}
+                options={CODEX_MODEL_OPTIONS}
+                disabled={busy || threadActive}
+                onChange={(value) => {
+                  const option =
+                    CODEX_MODEL_OPTIONS.find((item) => item.value === value) ??
+                    CODEX_MODEL_OPTIONS[0];
+                  const nextReasoning = option.efforts.includes(
+                    selectedThread.codexReasoningEffort as never,
+                  )
+                    ? selectedThread.codexReasoningEffort
+                    : option.efforts.includes("xhigh" as never)
+                      ? "xhigh"
+                      : (option.efforts.at(-1) ?? "high");
+                  updateSelectedThread({
+                    codexModel: value,
+                    codexReasoningEffort: nextReasoning,
+                  });
+                }}
+              />
+              <StyledSelect
+                label="思考深度"
+                value={selectedThread.codexReasoningEffort}
+                options={selectedReasoningOptions}
+                disabled={busy || threadActive}
+                onChange={(value) =>
+                  updateSelectedThread({ codexReasoningEffort: value })
+                }
+              />
+              <label
+                className={cx(
+                  "ops-fast-toggle",
+                  (busy || threadActive) && "disabled",
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedThread.codexFastMode}
+                  disabled={busy || threadActive}
+                  onChange={(event) =>
+                    updateSelectedThread({
+                      codexFastMode: event.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  <Zap size={14} />
+                  Fast
+                </span>
+              </label>
+              <span className="ops-settings-note">
+                {threadActive
+                  ? "运行中，设置将在本轮结束后可修改"
+                  : "设置仅影响此对话的后续轮次"}
+              </span>
+            </div>
+          )}
           <div className="ops-thread">
-            {ops.turns.length === 0 ? (
+            {visibleTurns.length === 0 ? (
               <EmptyState
                 icon={Bot}
                 title="系统 Codex 已待命"
                 description="异常会自动出现在这里，也可以直接描述要诊断、恢复或改进的内容。"
               />
             ) : (
-              ops.turns.map((turn) => {
+              visibleTurns.map((turn) => {
                 const progress = snapshot.events.filter(
                   (event) =>
                     event.opsTurnId === turn.id &&
@@ -1909,7 +2223,7 @@ function OpsPage({
               <button
                 className="primary-action"
                 type="submit"
-                disabled={busy || sending || !message.trim()}
+                disabled={busy || sending || !message.trim() || !selectedThread}
               >
                 {sending ? (
                   <LoaderCircle className="spin" size={16} />

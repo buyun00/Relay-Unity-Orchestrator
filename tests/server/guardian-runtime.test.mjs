@@ -71,6 +71,45 @@ test("Guardian exposes an independent recovery page and System Codex snapshot wh
   ).json();
   assert.equal(snapshot.server.recoveryMode, true);
   assert.equal(snapshot.ops.thread.id, "guardian-emergency");
+  assert.equal(snapshot.ops.threads.length, 1);
+  const created = await (
+    await fetch(`http://127.0.0.1:${guardianPort}/api/ops/threads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: "Parallel recovery",
+        codexModel: "gpt-5.6-terra",
+        codexReasoningEffort: "medium",
+        codexFastMode: true,
+      }),
+    })
+  ).json();
+  assert.equal(created.thread.title, "Parallel recovery");
+  assert.equal(created.thread.codexModel, "gpt-5.6-terra");
+  assert.equal(created.thread.codexReasoningEffort, "medium");
+  assert.equal(created.thread.codexFastMode, true);
+  const updated = await (
+    await fetch(
+      `http://127.0.0.1:${guardianPort}/api/ops/threads/${created.thread.id}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ codexFastMode: false }),
+      },
+    )
+  ).json();
+  assert.equal(updated.thread.codexFastMode, false);
+  const cleared = await (
+    await fetch(
+      `http://127.0.0.1:${guardianPort}/api/ops/threads/${created.thread.id}/clear`,
+      { method: "POST" },
+    )
+  ).json();
+  assert.equal(cleared.thread.clearedThroughSequence, 0);
+  const updatedSnapshot = await (
+    await fetch(`http://127.0.0.1:${guardianPort}/api/snapshot`)
+  ).json();
+  assert.equal(updatedSnapshot.ops.threads.length, 2);
   const page = await (await fetch(`http://127.0.0.1:${guardianPort}/`)).text();
   assert.match(page, /Guardian 独立恢复入口/u);
   assert.match(page, /Emergency Codex/u);

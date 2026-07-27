@@ -156,6 +156,22 @@ export function fetchSnapshot(signal?: AbortSignal) {
         ).queue ?? []
       ).map((turn) => [turn.id, turn.position]),
     );
+    const rawOps = snapshot.ops ?? EMPTY_SNAPSHOT.ops;
+    const systemThread = {
+      ...EMPTY_SNAPSHOT.ops.thread,
+      ...rawOps.thread,
+      title: rawOps.thread?.title ?? "系统自动恢复",
+      isSystem: rawOps.thread?.isSystem ?? true,
+      clearedThroughSequence: rawOps.thread?.clearedThroughSequence ?? 0,
+    };
+    const opsThreads = (
+      rawOps.threads?.length ? rawOps.threads : [systemThread]
+    ).map((thread) => ({
+      ...thread,
+      title: thread.title || "新对话",
+      isSystem: thread.isSystem ?? thread.id === systemThread.id,
+      clearedThroughSequence: thread.clearedThroughSequence ?? 0,
+    }));
     return {
       ...snapshot,
       server: {
@@ -182,7 +198,15 @@ export function fetchSnapshot(signal?: AbortSignal) {
           turn.queuePosition ?? queuePositions.get(turn.id) ?? null,
       })),
       events,
-      ops: snapshot.ops ?? EMPTY_SNAPSHOT.ops,
+      ops: {
+        ...rawOps,
+        thread: systemThread,
+        threads: opsThreads,
+        turns: rawOps.turns ?? [],
+        incidents: rawOps.incidents ?? [],
+        actions: rawOps.actions ?? [],
+        repairs: rawOps.repairs ?? [],
+      },
     };
   });
 }

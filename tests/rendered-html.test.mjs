@@ -51,6 +51,10 @@ test("starter preview is removed and the product shell is durable", async () => 
   assert.match(controlDesk, /GPT-5\.6 Sol/);
   assert.match(controlDesk, /Extra High/);
   assert.match(controlDesk, /Fast 模式/);
+  assert.match(controlDesk, /CONVERSATIONS/);
+  assert.match(controlDesk, /onCreateThread/);
+  assert.match(controlDesk, /onUpdateThread/);
+  assert.match(controlDesk, /onClearThread/);
   assert.match(controlDesk, /自动事故处理/);
   assert.match(controlDesk, /发送给系统 Codex/);
   assert.match(controlDesk, /交给系统 Codex/);

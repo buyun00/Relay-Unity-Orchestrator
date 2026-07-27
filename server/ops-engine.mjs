@@ -113,7 +113,8 @@ export class OpsEngine {
     this.sessionRunner = sessionRunner || new CodexSessionRunner(config);
     this.running = false;
     this.pumping = false;
-    this.activeTurnId = null;
+    this.activeTurns = new Map();
+    this.actionChain = Promise.resolve();
     this.unsubscribe = null;
   }
 
@@ -124,7 +125,13 @@ export class OpsEngine {
     return {
       enabled: Boolean(this.config.opsEnabled),
       running: this.running,
-      activeTurnId: this.activeTurnId,
+      activeTurnId: this.activeTurns.values().next().value || null,
+      activeTurnIds: [...this.activeTurns.values()],
+      activeSessions: this.activeTurns.size,
+      maxConcurrentSessions: Math.max(
+        1,
+        Number(this.config.opsMaxConcurrentSessions || 4),
+      ),
       openIncidents: openIncidents.length,
       automaticHandling: Boolean(this.config.opsAutoHandle),
       automaticDeployment: Boolean(this.config.opsAutoDeploy),
@@ -137,7 +144,7 @@ export class OpsEngine {
     this.store.ensureOpsThread();
     this.unsubscribe = this.store.onEvent((event) => this.onEvent(event));
     this.scanExistingProblems();
-    await this.pump();
+    this.pump();
   }
 
   stop() {
@@ -301,7 +308,7 @@ export class OpsEngine {
     void this.pump();
   }
 
-  sendMessage(message, authorName = "Relay Operator") {
+  sendMessage(message, authorName = "Relay Operator", threadId = "ops-system") {
     if (!this.config.opsEnabled) {
       throw new HttpError(
         409,
@@ -313,26 +320,44 @@ export class OpsEngine {
       message,
       trigger: "manual",
       authorName,
+      threadId,
     });
-    void this.pump();
+    this.pump();
     return turn;
   }
 
-  async pump() {
+  pump() {
     if (!this.running || this.pumping) return;
     this.pumping = true;
     try {
-      while (this.running) {
+      const maxConcurrentSessions = Math.max(
+        1,
+        Number(this.config.opsMaxConcurrentSessions || 4),
+      );
+      while (this.running && this.activeTurns.size < maxConcurrentSessions) {
         const turn = this.store.claimNextOpsTurn();
         if (!turn) break;
-        this.activeTurnId = turn.id;
-        await this.execute(turn);
-        this.activeTurnId = null;
+        this.activeTurns.set(turn.threadId, turn.id);
+        void this.runTurn(turn);
       }
     } finally {
-      this.activeTurnId = null;
       this.pumping = false;
     }
+  }
+
+  async runTurn(turn) {
+    try {
+      await this.execute(turn);
+    } finally {
+      this.activeTurns.delete(turn.threadId);
+      queueMicrotask(() => this.pump());
+    }
+  }
+
+  serializeAction(operation) {
+    const execution = this.actionChain.then(operation, operation);
+    this.actionChain = execution.catch(() => undefined);
+    return execution;
   }
 
   buildContext(turn) {
@@ -395,7 +420,16 @@ export class OpsEngine {
   }
 
   async execute(turn) {
-    const thread = this.store.getOpsThread();
+    const thread = this.store.getOpsThread(turn.threadId);
+    if (!thread) {
+      this.store.failOpsTurn(
+        turn.id,
+        Object.assign(new Error("System Codex conversation not found"), {
+          code: "OPS_THREAD_NOT_FOUND",
+        }),
+      );
+      return;
+    }
     this.emit(turn, "System Codex is diagnosing the current state");
     try {
       const result = await this.sessionRunner.run({
@@ -406,9 +440,13 @@ export class OpsEngine {
         logDirectory: path.join(this.config.logDirectory, "ops", "turns"),
         logName: `${turn.sequence}-${turn.id}`,
         sandbox: "read-only",
+        model: thread.codexModel,
+        reasoningEffort: thread.codexReasoningEffort,
+        fastMode: thread.codexFastMode,
         onEvent: (event) => {
           if (event?.type === "thread.started") {
             this.store.setOpsCodexThread(
+              turn.threadId,
               event.thread_id || event.threadId || event.thread?.id,
             );
           }
@@ -419,7 +457,7 @@ export class OpsEngine {
           }
         },
       });
-      this.store.setOpsCodexThread(result.threadId);
+      this.store.setOpsCodexThread(turn.threadId, result.threadId);
       const actionResults = [];
       let pending = false;
       let failed = false;
@@ -430,10 +468,8 @@ export class OpsEngine {
         });
       }
       for (const proposed of result.final.actions) {
-        const execution = await this.executeAction(
-          turn,
-          proposed,
-          result.final,
+        const execution = await this.serializeAction(() =>
+          this.executeAction(turn, proposed, result.final),
         );
         actionResults.push(execution);
         pending ||= Boolean(execution.pending);

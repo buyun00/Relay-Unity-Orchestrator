@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.mjs";
+import { codexTaskSettings } from "./codex-settings.mjs";
 import { CodexSessionRunner } from "./codex-session.mjs";
 import { RepairManager } from "./repair-manager.mjs";
 import { runProcess } from "./process.mjs";
@@ -69,7 +70,7 @@ function json(response, status, payload) {
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type, X-Pipeline-User",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
   });
   response.end(body);
 }
@@ -410,11 +411,82 @@ const emergencyRepairManager = new RepairManager(
   { restartCoordinator: localRestartCoordinator },
 );
 const emergencySessionRunner = new CodexSessionRunner(config);
-let emergencyState = readJsonFile(emergencyStatePath, {
-  threadId: null,
-  turns: [],
-});
-let emergencyPumping = false;
+
+function emergencyThreadRecord({
+  id: threadId = id("guardian-thread-"),
+  title = "Emergency recovery",
+  codexThreadId = null,
+  codexModel = config.opsCodexModel,
+  codexReasoningEffort = config.opsCodexReasoningEffort,
+  codexFastMode = config.opsCodexFastMode,
+  clearedThroughSequence = 0,
+  createdAt = now(),
+  updatedAt = createdAt,
+} = {}) {
+  return {
+    id: threadId,
+    title,
+    isSystem: threadId === "guardian-emergency",
+    clearedThroughSequence,
+    codexThreadId,
+    status: "idle",
+    codexModel,
+    codexReasoningEffort,
+    codexFastMode,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function normalizeEmergencyState(raw) {
+  const turns = Array.isArray(raw?.turns)
+    ? raw.turns.map((turn) =>
+        turn.status === "running"
+          ? {
+              ...turn,
+              status: "failed",
+              errorMessage: "Guardian restarted during this turn",
+              finishedAt: now(),
+            }
+          : turn,
+      )
+    : [];
+  if (Array.isArray(raw?.threads) && raw.threads.length) {
+    return {
+      threads: raw.threads.map((thread) =>
+        emergencyThreadRecord({
+          ...thread,
+          codexThreadId: thread.codexThreadId,
+        }),
+      ),
+      turns,
+    };
+  }
+  return {
+    threads: [
+      emergencyThreadRecord({
+        id: "guardian-emergency",
+        title: "Guardian 自动恢复",
+        codexThreadId: raw?.threadId || null,
+        createdAt: raw?.createdAt || startedAt,
+      }),
+    ],
+    turns: turns.map((turn) => ({
+      ...turn,
+      threadId: turn.threadId || "guardian-emergency",
+    })),
+  };
+}
+
+let emergencyState = normalizeEmergencyState(
+  readJsonFile(emergencyStatePath, {
+    threadId: null,
+    turns: [],
+  }),
+);
+const emergencyActiveThreads = new Map();
+let emergencyScheduling = false;
+let emergencyActionChain = Promise.resolve();
 
 function saveEmergencyState() {
   writeJsonFile(emergencyStatePath, emergencyState);
@@ -472,78 +544,176 @@ async function executeEmergencyAction(turn, action, final) {
   }
 }
 
-async function pumpEmergencyTurns() {
-  if (emergencyPumping) return;
-  emergencyPumping = true;
+function getEmergencyThread(threadId = "guardian-emergency") {
+  return (
+    emergencyState.threads.find((thread) => thread.id === threadId) || null
+  );
+}
+
+function refreshEmergencyThread(threadId) {
+  const thread = getEmergencyThread(threadId);
+  if (!thread) return null;
+  const turns = emergencyState.turns.filter(
+    (turn) => turn.threadId === threadId,
+  );
+  thread.status = turns.some((turn) => turn.status === "running")
+    ? "running"
+    : turns.some((turn) => turn.status === "queued")
+      ? "queued"
+      : "idle";
+  thread.updatedAt = now();
+  return thread;
+}
+
+function createEmergencyThread(input) {
+  const thread = emergencyThreadRecord(input);
+  emergencyState.threads.push(thread);
+  saveEmergencyState();
+  return thread;
+}
+
+function updateEmergencyThread(threadId, changes) {
+  const thread = getEmergencyThread(threadId);
+  if (!thread) throw new Error("System Codex conversation not found");
+  if (["queued", "running"].includes(thread.status)) {
+    throw new Error(
+      "Wait for the active System Codex turn before changing settings",
+    );
+  }
+  Object.assign(thread, changes, { updatedAt: now() });
+  saveEmergencyState();
+  return thread;
+}
+
+function clearEmergencyThread(threadId) {
+  const thread = getEmergencyThread(threadId);
+  if (!thread) throw new Error("System Codex conversation not found");
+  if (["queued", "running"].includes(thread.status)) {
+    throw new Error(
+      "Wait for the active System Codex turn before clearing the screen",
+    );
+  }
+  thread.clearedThroughSequence = emergencyState.turns
+    .filter((turn) => turn.threadId === threadId)
+    .reduce((maximum, turn) => Math.max(maximum, turn.sequence), 0);
+  thread.updatedAt = now();
+  saveEmergencyState();
+  return thread;
+}
+
+function serializeEmergencyAction(operation) {
+  const execution = emergencyActionChain.then(operation, operation);
+  emergencyActionChain = execution.catch(() => undefined);
+  return execution;
+}
+
+function pumpEmergencyTurns() {
+  if (emergencyScheduling) return;
+  emergencyScheduling = true;
   try {
-    while (true) {
+    const maximum = Math.max(1, Number(config.opsMaxConcurrentSessions || 4));
+    while (emergencyActiveThreads.size < maximum) {
       const turn = emergencyState.turns.find(
-        (item) => item.status === "queued",
+        (item) =>
+          item.status === "queued" &&
+          !emergencyActiveThreads.has(item.threadId),
       );
       if (!turn) break;
       turn.status = "running";
       turn.startedAt = now();
+      emergencyActiveThreads.set(turn.threadId, turn.id);
+      refreshEmergencyThread(turn.threadId);
       saveEmergencyState();
-      try {
-        const prompt = [
-          "You are the emergency Guardian Codex. The main Relay API is unavailable.",
-          "Diagnose and recover the service without waiting for a user.",
-          "Never delete files, data, logs, branches, worktrees, VMs, checkpoints, tasks, projects, or workers.",
-          "Use relay.restart or web.restart for process faults and relay.repair for code faults.",
-          "Relay repairs run in an isolated worktree, reject file deletions, validate, commit, deploy, and roll back on failed health checks.",
-          "",
-          `Operator request: ${turn.userMessage}`,
-          "",
-          `Guardian state: ${JSON.stringify(guardianState, null, 2)}`,
-          `Deployment state: ${JSON.stringify(readJsonFile(config.deploymentStatePath, null), null, 2)}`,
-          `Recent logs: ${JSON.stringify(emergencyLogs(), null, 2)}`,
-        ].join("\n");
-        const result = await emergencySessionRunner.run({
-          cwd: config.projectRoot,
-          threadId: emergencyState.threadId,
-          prompt,
-          schemaPath: opsSchemaPath,
-          logDirectory: path.join(config.logDirectory, "guardian", "ops-turns"),
-          logName: `${turn.sequence}-${turn.id}`,
-          sandbox: "read-only",
-        });
-        emergencyState.threadId = result.threadId;
-        const actionResults = [];
-        for (const action of result.final.actions) {
-          try {
-            actionResults.push({
-              type: action.type,
-              status: "completed",
-              result: await executeEmergencyAction(turn, action, result.final),
-            });
-          } catch (error) {
-            actionResults.push({
-              type: action.type,
-              status: "failed",
-              error: error.message,
-            });
-          }
-        }
-        turn.status = "completed";
-        turn.final = { ...result.final, actionResults };
-        turn.finishedAt = now();
-      } catch (error) {
-        turn.status = "failed";
-        turn.errorMessage = error.message;
-        turn.finishedAt = now();
-      }
-      saveEmergencyState();
+      void runEmergencyTurn(turn);
     }
   } finally {
-    emergencyPumping = false;
+    emergencyScheduling = false;
   }
 }
 
-function appendEmergencyTurn(message, authorName) {
+async function runEmergencyTurn(turn) {
+  const thread = getEmergencyThread(turn.threadId);
+  try {
+    if (!thread) throw new Error("System Codex conversation not found");
+    const prompt = [
+      "You are the emergency Guardian Codex. The main Relay API is unavailable.",
+      "Diagnose and recover the service without waiting for a user.",
+      "Never delete files, data, logs, branches, worktrees, VMs, checkpoints, tasks, projects, or workers.",
+      "Use relay.restart or web.restart for process faults and relay.repair for code faults.",
+      "Relay repairs run in an isolated worktree, reject file deletions, validate, commit, deploy, and roll back on failed health checks.",
+      "",
+      `Operator request: ${turn.userMessage}`,
+      "",
+      `Guardian state: ${JSON.stringify(guardianState, null, 2)}`,
+      `Deployment state: ${JSON.stringify(readJsonFile(config.deploymentStatePath, null), null, 2)}`,
+      `Recent logs: ${JSON.stringify(emergencyLogs(), null, 2)}`,
+    ].join("\n");
+    const result = await emergencySessionRunner.run({
+      cwd: config.projectRoot,
+      threadId: thread.codexThreadId,
+      prompt,
+      schemaPath: opsSchemaPath,
+      logDirectory: path.join(
+        config.logDirectory,
+        "guardian",
+        "ops-turns",
+        thread.id,
+      ),
+      logName: `${turn.sequence}-${turn.id}`,
+      sandbox: "read-only",
+      model: thread.codexModel,
+      reasoningEffort: thread.codexReasoningEffort,
+      fastMode: thread.codexFastMode,
+    });
+    thread.codexThreadId = result.threadId;
+    const actionResults = [];
+    for (const action of result.final.actions) {
+      try {
+        actionResults.push({
+          type: action.type,
+          status: "completed",
+          result: await serializeEmergencyAction(() =>
+            executeEmergencyAction(turn, action, result.final),
+          ),
+        });
+      } catch (error) {
+        actionResults.push({
+          type: action.type,
+          status: "failed",
+          error: error.message,
+        });
+      }
+    }
+    turn.status = "completed";
+    turn.final = { ...result.final, actionResults };
+    turn.finishedAt = now();
+  } catch (error) {
+    turn.status = "failed";
+    turn.errorMessage = error.message;
+    turn.finishedAt = now();
+  } finally {
+    emergencyActiveThreads.delete(turn.threadId);
+    refreshEmergencyThread(turn.threadId);
+    saveEmergencyState();
+    queueMicrotask(() => pumpEmergencyTurns());
+  }
+}
+
+function appendEmergencyTurn(
+  message,
+  authorName,
+  threadId = "guardian-emergency",
+) {
+  const thread = getEmergencyThread(threadId);
+  if (!thread) throw new Error("System Codex conversation not found");
+  const sequence =
+    emergencyState.turns
+      .filter((item) => item.threadId === threadId)
+      .reduce((maximum, item) => Math.max(maximum, item.sequence), 0) + 1;
   const turn = {
     id: id("guardian-ops-turn-"),
-    threadId: "guardian-emergency",
-    sequence: emergencyState.turns.length + 1,
+    threadId,
+    sequence,
     trigger: "manual",
     incidentId: null,
     userMessage: message,
@@ -556,12 +726,19 @@ function appendEmergencyTurn(message, authorName) {
     finishedAt: null,
   };
   emergencyState.turns.push(turn);
+  refreshEmergencyThread(threadId);
   saveEmergencyState();
-  void pumpEmergencyTurns();
+  pumpEmergencyTurns();
   return turn;
 }
 
 function recoverySnapshot() {
+  const defaultThread =
+    getEmergencyThread("guardian-emergency") || emergencyState.threads[0];
+  const visibleTurns = emergencyState.turns.filter((turn) => {
+    const thread = getEmergencyThread(turn.threadId);
+    return thread && turn.sequence > thread.clearedThroughSequence;
+  });
   return {
     server: {
       mode: "hyperv",
@@ -592,17 +769,17 @@ function recoverySnapshot() {
       attentionWorkers: 0,
     },
     ops: {
-      thread: {
-        id: "guardian-emergency",
-        codexThreadId: emergencyState.threadId,
-        status: emergencyPumping ? "running" : "idle",
-        codexModel: config.opsCodexModel,
-        codexReasoningEffort: config.opsCodexReasoningEffort,
-        codexFastMode: config.opsCodexFastMode,
-        createdAt: startedAt,
-        updatedAt: now(),
-      },
-      turns: emergencyState.turns,
+      thread: defaultThread,
+      threads: emergencyState.threads.map((thread) => ({
+        ...thread,
+        visibleTurnCount: visibleTurns.filter(
+          (turn) => turn.threadId === thread.id,
+        ).length,
+        totalTurnCount: emergencyState.turns.filter(
+          (turn) => turn.threadId === thread.id,
+        ).length,
+      })),
+      turns: visibleTurns,
       incidents: [],
       actions: [],
       repairs: fileRepairStore.state.repairs,
@@ -695,7 +872,7 @@ const server = http.createServer(async (request, response) => {
     response.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type, X-Pipeline-User",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
     });
     response.end();
     return;
@@ -761,6 +938,52 @@ const server = http.createServer(async (request, response) => {
       request.on("close", () => clearInterval(heartbeat));
       return;
     }
+    if (request.method === "POST" && url.pathname === "/api/ops/threads") {
+      const body = await readBody(request);
+      const title = String(body.title || "")
+        .trim()
+        .slice(0, 120);
+      if (!title) throw new Error("title is required");
+      const settings = codexTaskSettings(body, {
+        codexModel: config.opsCodexModel,
+        codexReasoningEffort: config.opsCodexReasoningEffort,
+        codexFastMode: config.opsCodexFastMode,
+      });
+      const thread = createEmergencyThread({ title, ...settings });
+      json(response, 201, { ok: true, thread });
+      return;
+    }
+    const opsThreadMutation = url.pathname.match(
+      /^\/api\/ops\/threads\/([^/]+)(?:\/(clear))?$/,
+    );
+    if (opsThreadMutation) {
+      const threadId = decodeURIComponent(opsThreadMutation[1]);
+      const action = opsThreadMutation[2] || null;
+      const current = getEmergencyThread(threadId);
+      if (!current) throw new Error("System Codex conversation not found");
+      if (request.method === "PATCH" && !action) {
+        const body = await readBody(request);
+        const settings = codexTaskSettings(body, current);
+        const title =
+          body.title == null
+            ? current.title
+            : String(body.title).trim().slice(0, 120);
+        if (!title) throw new Error("title is required");
+        const thread = updateEmergencyThread(threadId, {
+          title,
+          ...settings,
+        });
+        json(response, 200, { ok: true, thread });
+        return;
+      }
+      if (request.method === "POST" && action === "clear") {
+        json(response, 200, {
+          ok: true,
+          thread: clearEmergencyThread(threadId),
+        });
+        return;
+      }
+    }
     if (request.method === "POST" && url.pathname === "/api/ops/messages") {
       const body = await readBody(request);
       const message = String(body.message || "").trim();
@@ -768,6 +991,7 @@ const server = http.createServer(async (request, response) => {
       const turn = appendEmergencyTurn(
         message,
         request.headers["x-pipeline-user"],
+        body.threadId || "guardian-emergency",
       );
       json(response, 201, { ok: true, turn });
       return;
@@ -802,7 +1026,7 @@ const server = http.createServer(async (request, response) => {
     }
     json(response, 404, { ok: false, error: "Not found" });
   } catch (error) {
-    json(response, 500, {
+    json(response, error.status || 500, {
       ok: false,
       error: { code: error.code || "GUARDIAN_ERROR", message: error.message },
     });
@@ -819,6 +1043,11 @@ await new Promise((resolve, reject) => {
 console.log(
   `Relay Guardian listening on http://${config.guardianHost}:${config.guardianPort}`,
 );
+for (const thread of emergencyState.threads) {
+  refreshEmergencyThread(thread.id);
+}
+saveEmergencyState();
+pumpEmergencyTurns();
 await monitor();
 const monitorTimer = setInterval(
   () => void monitor(),

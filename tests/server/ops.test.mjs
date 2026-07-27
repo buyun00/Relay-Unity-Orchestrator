@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { FakeAdapter } from "./fake-adapter.mjs";
 import { Store } from "../../server/db.mjs";
+import { PipelineHttpServer } from "../../server/http.mjs";
 import { OpsEngine } from "../../server/ops-engine.mjs";
 import { Scheduler } from "../../server/scheduler.mjs";
 
@@ -17,6 +18,10 @@ function configFor(dataDirectory) {
     databasePath: path.join(dataDirectory, "pipeline.sqlite"),
     uploadDirectory: path.join(dataDirectory, "uploads"),
     logDirectory: path.join(dataDirectory, "logs"),
+    host: "127.0.0.1",
+    port: 0,
+    allowedOrigins: [],
+    requestBodyLimitBytes: 2 * 1024 * 1024,
     adapter: "test",
     schedulerIntervalMs: 5,
     healthIntervalMs: 60_000,
@@ -25,6 +30,7 @@ function configFor(dataDirectory) {
     opsAutoHandle: true,
     opsAutoDeploy: false,
     opsMaxAttempts: 4,
+    opsMaxConcurrentSessions: 4,
     codexModel: "test-model",
     codexReasoningEffort: "high",
     codexServiceTier: "default",
@@ -115,6 +121,37 @@ class FakeOpsSession {
             ]
           : [],
         verification: "Wait for turn.delivered from the resumed task.",
+      },
+    };
+  }
+}
+
+class ParallelOpsSession {
+  calls = [];
+  active = 0;
+  maxActive = 0;
+
+  async run(options) {
+    const callNumber = this.calls.length + 1;
+    this.calls.push(options);
+    this.active += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    this.active -= 1;
+    const threadId = options.threadId || `parallel-codex-${callNumber}`;
+    options.onEvent?.({
+      type: "thread.started",
+      thread_id: threadId,
+    });
+    return {
+      threadId,
+      final: {
+        status: "resolved",
+        summary: "Parallel conversation completed.",
+        diagnosis: "No fault.",
+        confidence: 1,
+        actions: [],
+        verification: "Conversation result persisted.",
       },
     };
   }
@@ -232,5 +269,206 @@ test("manual System Codex messages resume the same durable Ops thread", async (t
   assert.deepEqual(
     store.listOpsTurns().map((turn) => turn.sequence),
     [1, 2],
+  );
+});
+
+test("multiple System Codex conversations run in parallel with independent settings and non-destructive clear", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-ops-parallel-test-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  seed(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const session = new ParallelOpsSession();
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { sessionRunner: session },
+  );
+  t.after(async () => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  await scheduler.start();
+  await ops.start();
+  const first = store.createOpsThread({
+    title: "Infrastructure",
+    codexModel: "gpt-5.6-sol",
+    codexReasoningEffort: "xhigh",
+    codexFastMode: false,
+  });
+  const second = store.createOpsThread({
+    title: "Web recovery",
+    codexModel: "gpt-5.6-terra",
+    codexReasoningEffort: "medium",
+    codexFastMode: true,
+  });
+
+  ops.sendMessage("Inspect infrastructure", "Remote User", first.id);
+  ops.sendMessage("Inspect the web", "Remote User", second.id);
+  await waitUntil(
+    () =>
+      store.listOpsTurns().length === 2 &&
+      store.listOpsTurns().every((turn) => turn.status === "completed"),
+    "parallel Ops turns",
+  );
+
+  assert.equal(session.maxActive, 2);
+  const callsByModel = new Map(session.calls.map((call) => [call.model, call]));
+  assert.equal(callsByModel.get("gpt-5.6-sol").reasoningEffort, "xhigh");
+  assert.equal(callsByModel.get("gpt-5.6-sol").fastMode, false);
+  assert.equal(callsByModel.get("gpt-5.6-terra").reasoningEffort, "medium");
+  assert.equal(callsByModel.get("gpt-5.6-terra").fastMode, true);
+  assert.notEqual(
+    store.getOpsThread(first.id).codexThreadId,
+    store.getOpsThread(second.id).codexThreadId,
+  );
+
+  session.calls = [];
+  session.maxActive = 0;
+  ops.sendMessage("First serial follow-up", "Remote User", first.id);
+  ops.sendMessage("Second serial follow-up", "Remote User", first.id);
+  await waitUntil(
+    () =>
+      store.listOpsTurns({ threadId: first.id }).length === 3 &&
+      store
+        .listOpsTurns({ threadId: first.id })
+        .every((turn) => turn.status === "completed"),
+    "serial turns within one Ops conversation",
+  );
+  assert.equal(session.maxActive, 1);
+  assert.ok(
+    session.calls.every(
+      (call) => call.threadId === store.getOpsThread(first.id).codexThreadId,
+    ),
+  );
+
+  const codexThreadId = store.getOpsThread(first.id).codexThreadId;
+  const cleared = store.clearOpsThread(first.id);
+  assert.equal(cleared.clearedThroughSequence, 3);
+  assert.equal(store.listOpsTurns({ threadId: first.id }).length, 0);
+  assert.equal(
+    store.listOpsTurns({ threadId: first.id, includeCleared: true }).length,
+    3,
+  );
+  assert.equal(store.getOpsThread(first.id).codexThreadId, codexThreadId);
+});
+
+test("System Codex conversation API creates, configures, sends, and clears a thread", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-ops-api-test-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  seed(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { sessionRunner: new ParallelOpsSession() },
+  );
+  const api = new PipelineHttpServer({ config, store, scheduler, ops });
+  const address = await api.listen();
+  t.after(async () => {
+    ops.stop();
+    scheduler.stop();
+    await api.close();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  await scheduler.start();
+  await ops.start();
+  const base = `http://127.0.0.1:${address.port}`;
+
+  const createdResponse = await fetch(`${base}/api/ops/threads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "API conversation",
+      codexModel: "gpt-5.6-terra",
+      codexReasoningEffort: "high",
+      codexFastMode: true,
+    }),
+  });
+  assert.equal(createdResponse.status, 201);
+  const created = await createdResponse.json();
+  assert.equal(created.thread.title, "API conversation");
+  assert.equal(created.thread.codexFastMode, true);
+
+  const updatedResponse = await fetch(
+    `${base}/api/ops/threads/${created.thread.id}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        codexReasoningEffort: "medium",
+        codexFastMode: false,
+      }),
+    },
+  );
+  assert.equal(updatedResponse.status, 200);
+  const updated = await updatedResponse.json();
+  assert.equal(updated.thread.codexReasoningEffort, "medium");
+  assert.equal(updated.thread.codexFastMode, false);
+
+  const messageResponse = await fetch(`${base}/api/ops/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      threadId: created.thread.id,
+      message: "Inspect this API conversation",
+    }),
+  });
+  assert.equal(messageResponse.status, 201);
+  await waitUntil(
+    () =>
+      store.listOpsTurns({ threadId: created.thread.id })[0]?.status ===
+      "completed",
+    "API Ops turn",
+  );
+
+  const clearResponse = await fetch(
+    `${base}/api/ops/threads/${created.thread.id}/clear`,
+    { method: "POST" },
+  );
+  assert.equal(clearResponse.status, 200);
+  const cleared = await clearResponse.json();
+  assert.equal(cleared.thread.clearedThroughSequence, 1);
+  const opsResponse = await (await fetch(`${base}/api/ops`)).json();
+  assert.ok(
+    opsResponse.threads.some(
+      (thread) =>
+        thread.id === created.thread.id && thread.visibleTurnCount === 0,
+    ),
+  );
+  assert.equal(
+    opsResponse.turns.some((turn) => turn.threadId === created.thread.id),
+    false,
+  );
+  assert.equal(
+    store.listOpsTurns({
+      threadId: created.thread.id,
+      includeCleared: true,
+    }).length,
+    1,
   );
 });

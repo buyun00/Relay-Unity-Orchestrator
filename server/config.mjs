@@ -33,7 +33,7 @@ const dataDirectory = path.resolve(
 );
 
 export const config = Object.freeze({
-  version: "0.2.0",
+  version: "0.3.0",
   projectRoot,
   serverDirectory,
   dataDirectory,
@@ -85,6 +85,10 @@ export const config = Object.freeze({
   opsAutoHandle: boolean(process.env.PIPELINE_OPS_AUTO_HANDLE, true),
   opsAutoDeploy: boolean(process.env.PIPELINE_OPS_AUTO_DEPLOY, true),
   opsMaxAttempts: integer(process.env.PIPELINE_OPS_MAX_ATTEMPTS, 4),
+  opsMaxConcurrentSessions: integer(
+    process.env.PIPELINE_OPS_MAX_CONCURRENT_SESSIONS,
+    4,
+  ),
   opsCodexModel:
     process.env.PIPELINE_OPS_CODEX_MODEL?.trim() ||
     process.env.PIPELINE_CODEX_MODEL?.trim() ||

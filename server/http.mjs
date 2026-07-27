@@ -460,6 +460,7 @@ export class PipelineHttpServer {
               running: false,
             },
             thread: this.store.getOpsThread(),
+            threads: this.store.listOpsThreads(),
             turns: this.store.listOpsTurns(),
             incidents: this.store.listIncidents(),
             actions: this.store.listOpsActions(),
@@ -468,6 +469,81 @@ export class PipelineHttpServer {
           cors,
         );
         return;
+      }
+      if (request.method === "POST" && pathname === "/api/ops/threads") {
+        const body = await readJson(request, this.config.requestBodyLimitBytes);
+        const settings = codexTaskSettings(body, {
+          codexModel: this.config.opsCodexModel || this.config.codexModel,
+          codexReasoningEffort:
+            this.config.opsCodexReasoningEffort ||
+            this.config.codexReasoningEffort,
+          codexFastMode: this.config.opsCodexFastMode,
+        });
+        const thread = this.store.createOpsThread({
+          title: requiredString(body.title, "title", { max: 120 }),
+          ...settings,
+        });
+        this.store.emit({
+          actorName,
+          type: "ops.thread.created",
+          phase: "ops",
+          message: `System Codex conversation created: ${thread.title}`,
+          data: { threadId: thread.id },
+        });
+        json(response, 201, { ok: true, thread }, cors);
+        return;
+      }
+      const opsThreadMutation = pathname.match(
+        /^\/api\/ops\/threads\/([^/]+)(?:\/(clear))?$/,
+      );
+      if (opsThreadMutation) {
+        const threadId = decodeURIComponent(opsThreadMutation[1]);
+        const action = opsThreadMutation[2] || null;
+        const current = this.store.getOpsThread(threadId);
+        if (!current)
+          throw new HttpError(
+            404,
+            "OPS_THREAD_NOT_FOUND",
+            "System Codex conversation not found",
+          );
+        if (request.method === "PATCH" && !action) {
+          const body = await readJson(
+            request,
+            this.config.requestBodyLimitBytes,
+          );
+          if (["queued", "running"].includes(current.status)) {
+            throw new HttpError(
+              409,
+              "OPS_THREAD_ACTIVE",
+              "Wait for the active System Codex turn before changing settings",
+            );
+          }
+          const settings = codexTaskSettings(body, current);
+          const thread = this.store.updateOpsThread(threadId, {
+            title:
+              body.title == null
+                ? current.title
+                : requiredString(body.title, "title", { max: 120 }),
+            ...settings,
+          });
+          json(response, 200, { ok: true, thread }, cors);
+          return;
+        }
+        if (request.method === "POST" && action === "clear") {
+          const thread = this.store.clearOpsThread(threadId);
+          this.store.emit({
+            actorName,
+            type: "ops.thread.cleared",
+            phase: "ops",
+            message: `System Codex screen cleared: ${thread.title}`,
+            data: {
+              threadId,
+              clearedThroughSequence: thread.clearedThroughSequence,
+            },
+          });
+          json(response, 200, { ok: true, thread }, cors);
+          return;
+        }
       }
       if (request.method === "POST" && pathname === "/api/ops/messages") {
         if (!this.ops)
@@ -480,6 +556,9 @@ export class PipelineHttpServer {
         const turn = this.ops.sendMessage(
           requiredString(body.message, "message", { max: 100_000 }),
           actorName,
+          body.threadId == null
+            ? "ops-system"
+            : requiredString(body.threadId, "threadId", { max: 200 }),
         );
         json(response, 201, { ok: true, turn }, cors);
         return;

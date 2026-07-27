@@ -152,6 +152,11 @@ export interface PipelineEvent {
 
 export interface OpsThread {
   id: string;
+  title: string;
+  isSystem: boolean;
+  clearedThroughSequence: number;
+  visibleTurnCount?: number;
+  totalTurnCount?: number;
   codexThreadId?: string | null;
   status: string;
   codexModel: string;
@@ -292,6 +297,9 @@ export interface Snapshot {
       enabled: boolean;
       running: boolean;
       activeTurnId?: string | null;
+      activeTurnIds?: string[];
+      activeSessions?: number;
+      maxConcurrentSessions?: number;
       openIncidents?: number;
       automaticHandling?: boolean;
       automaticDeployment?: boolean;
@@ -312,6 +320,7 @@ export interface Snapshot {
   events: PipelineEvent[];
   ops: {
     thread: OpsThread;
+    threads: OpsThread[];
     turns: OpsTurn[];
     incidents: Incident[];
     actions: OpsAction[];
@@ -329,6 +338,9 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   ops: {
     thread: {
       id: "ops-system",
+      title: "系统自动恢复",
+      isSystem: true,
+      clearedThroughSequence: 0,
       codexThreadId: null,
       status: "idle",
       codexModel: "gpt-5.6-sol",
@@ -337,6 +349,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
       createdAt: "",
       updatedAt: "",
     },
+    threads: [],
     turns: [],
     incidents: [],
     actions: [],
