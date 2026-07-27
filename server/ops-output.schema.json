@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "diagnosis",
+    "confidence",
+    "actions",
+    "verification"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["resolved", "action_required", "monitoring", "blocked"]
+    },
+    "summary": { "type": "string" },
+    "diagnosis": { "type": "string" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "targetId", "message", "reason"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "task.continue",
+              "task.retry",
+              "task.reopen",
+              "worker.probe",
+              "worker.start",
+              "worker.restart",
+              "worker.shutdown",
+              "worker.release",
+              "scheduler.pause",
+              "scheduler.resume",
+              "relay.repair",
+              "relay.restart",
+              "web.restart",
+              "guardian.restart",
+              "incident.resolve"
+            ]
+          },
+          "targetId": { "type": ["string", "null"] },
+          "message": { "type": ["string", "null"] },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "verification": { "type": "string" }
+  }
+}

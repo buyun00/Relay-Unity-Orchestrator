@@ -381,14 +381,43 @@ export class Scheduler {
         if (
           !worker.enabled ||
           worker.currentTurnId ||
-          ["busy", "preparing", "attention", "reserved"].includes(worker.status)
+          ["busy", "preparing", "reserved"].includes(worker.status)
         )
           continue;
         const health = await this.adapter.probeWorker({
           ...worker,
           project: projects.get(worker.projectId) || null,
         });
-        this.store.updateWorkerHealth(worker.id, health);
+        const updated = this.store.updateWorkerHealth(worker.id, health);
+        const wasUnhealthy =
+          ["attention", "offline"].includes(worker.status) ||
+          Object.values(worker.health || {}).includes("error");
+        const isUnhealthy =
+          health.ready === false ||
+          health.vm === false ||
+          health.heartbeat === false ||
+          health.smb === false ||
+          health.unity === false ||
+          health.skill === false ||
+          ["attention", "offline"].includes(updated?.status);
+        if (
+          isUnhealthy &&
+          (!wasUnhealthy || (health.error && health.error !== worker.lastError))
+        ) {
+          this.store.emit({
+            workerId: worker.id,
+            type: "worker.unhealthy",
+            phase: "health",
+            level: "error",
+            message:
+              health.error ||
+              `Worker ${worker.name} failed one or more health checks`,
+            data: {
+              status: updated?.status,
+              health,
+            },
+          });
+        }
       }
     } finally {
       this.probing = false;

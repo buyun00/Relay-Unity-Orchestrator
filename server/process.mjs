@@ -8,6 +8,7 @@ export function runProcess(command, args, options = {}) {
     timeoutMs = 0,
     onStdout,
     onStderr,
+    input,
     acceptExitCodes = [0],
   } = options;
   return new Promise((resolve, reject) => {
@@ -19,7 +20,7 @@ export function runProcess(command, args, options = {}) {
       env: { ...process.env, ...env },
       windowsHide: true,
       shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"],
     });
 
     const finish = (callback) => {
@@ -55,6 +56,12 @@ export function runProcess(command, args, options = {}) {
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
 
+    if (child.stdin) {
+      child.stdin.on("error", () => {
+        // A process that exits before consuming stdin is reported by close.
+      });
+      child.stdin.end(input);
+    }
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString("utf8");
       stdout = (stdout + text).slice(-2_000_000);

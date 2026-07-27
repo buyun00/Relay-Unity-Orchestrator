@@ -1,0 +1,44 @@
+[CmdletBinding()]
+param(
+    [string]$ProjectRoot,
+    [string]$NodePath
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $ProjectRoot = Split-Path -Parent $PSScriptRoot
+}
+$root = [System.IO.Path]::GetFullPath($ProjectRoot)
+$entry = Join-Path $root 'server\guardian.mjs'
+if (-not (Test-Path -LiteralPath $entry)) {
+    throw "Relay Guardian entrypoint was not found: $entry"
+}
+
+$resolvedNode = $null
+if (-not [string]::IsNullOrWhiteSpace($NodePath)) {
+    $resolvedNode = (Resolve-Path -LiteralPath $NodePath -ErrorAction Stop).Path
+} else {
+    $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+    if ($nodeCommand) {
+        $resolvedNode = $nodeCommand.Source
+    } else {
+        $bundledNode = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
+        if (Test-Path -LiteralPath $bundledNode) {
+            $resolvedNode = $bundledNode
+        }
+    }
+}
+if (-not $resolvedNode) {
+    throw 'Node.js was not found in PATH or the bundled Codex runtime. Pass -NodePath explicitly.'
+}
+
+Push-Location $root
+try {
+    & $resolvedNode '--env-file-if-exists=.env.local' $entry
+    if ($LASTEXITCODE -ne 0) {
+        throw "Relay Guardian exited with code $LASTEXITCODE."
+    }
+} finally {
+    Pop-Location
+}

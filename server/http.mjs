@@ -212,10 +212,12 @@ function publicRuntimeStatus(runtime) {
 }
 
 export class PipelineHttpServer {
-  constructor({ config, store, scheduler }) {
+  constructor({ config, store, scheduler, ops = null, guardian = null }) {
     this.config = config;
     this.store = store;
     this.scheduler = scheduler;
+    this.ops = ops;
+    this.guardian = guardian;
     this.sseClients = new Set();
     this.unsubscribe = store.onEvent((event) => this.broadcast(event));
     this.server = http.createServer(
@@ -393,6 +395,14 @@ export class PipelineHttpServer {
             version: this.config.version,
             adapter: this.config.adapter,
             scheduler: this.scheduler.status(),
+            ops: this.ops?.status?.() || {
+              enabled: false,
+              running: false,
+            },
+            guardian: this.guardian?.status?.() || {
+              enabled: false,
+              reachable: false,
+            },
             runtime: publicRuntimeStatus(runtime),
             uptimeSeconds: Math.round(process.uptime()),
             now: new Date().toISOString(),
@@ -430,10 +440,87 @@ export class PipelineHttpServer {
               queuePaused: scheduler.paused,
               schedulerRunning: scheduler.running && !scheduler.paused,
               runtime,
+              ops: this.ops?.status?.() || null,
+              guardian: this.guardian?.status?.() || null,
             },
           },
           cors,
         );
+        return;
+      }
+
+      if (request.method === "GET" && pathname === "/api/ops") {
+        json(
+          response,
+          200,
+          {
+            ok: true,
+            status: this.ops?.status?.() || {
+              enabled: false,
+              running: false,
+            },
+            thread: this.store.getOpsThread(),
+            turns: this.store.listOpsTurns(),
+            incidents: this.store.listIncidents(),
+            actions: this.store.listOpsActions(),
+            repairs: this.store.listRepairRuns(),
+          },
+          cors,
+        );
+        return;
+      }
+      if (request.method === "POST" && pathname === "/api/ops/messages") {
+        if (!this.ops)
+          throw new HttpError(
+            503,
+            "OPS_NOT_RUNNING",
+            "System Codex is not running",
+          );
+        const body = await readJson(request, this.config.requestBodyLimitBytes);
+        const turn = this.ops.sendMessage(
+          requiredString(body.message, "message", { max: 100_000 }),
+          actorName,
+        );
+        json(response, 201, { ok: true, turn }, cors);
+        return;
+      }
+      const incidentMutation = pathname.match(
+        /^\/api\/incidents\/([^/]+)\/(diagnose|resolve)$/,
+      );
+      if (incidentMutation && request.method === "POST") {
+        const incidentId = decodeURIComponent(incidentMutation[1]);
+        const action = incidentMutation[2];
+        const incident = this.store.getIncident(incidentId);
+        if (!incident)
+          throw new HttpError(404, "INCIDENT_NOT_FOUND", "Incident not found");
+        if (action === "resolve") {
+          const resolved = this.store.updateIncident(incidentId, {
+            status: "resolved",
+            lastAction: `resolved by ${actorName}`,
+            resolved: true,
+          });
+          this.store.emit({
+            incidentId,
+            actorName,
+            type: "ops.incident.resolved",
+            phase: "ops",
+            message: `Incident resolved by ${actorName}`,
+          });
+          json(response, 200, { ok: true, incident: resolved }, cors);
+          return;
+        }
+        if (!this.ops)
+          throw new HttpError(
+            503,
+            "OPS_NOT_RUNNING",
+            "System Codex is not running",
+          );
+        const reopened = this.store.reopenIncident(incidentId);
+        this.ops.queueIncident(
+          reopened,
+          `Manual diagnosis requested by ${actorName}`,
+        );
+        json(response, 202, { ok: true, incident: reopened }, cors);
         return;
       }
 

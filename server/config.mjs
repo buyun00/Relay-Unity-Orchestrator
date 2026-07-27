@@ -33,7 +33,7 @@ const dataDirectory = path.resolve(
 );
 
 export const config = Object.freeze({
-  version: "0.1.0",
+  version: "0.2.0",
   projectRoot,
   serverDirectory,
   dataDirectory,
@@ -80,4 +80,39 @@ export const config = Object.freeze({
     integer(process.env.PIPELINE_CODEX_TIMEOUT_MINUTES, 90) * 60 * 1000,
   powershellCommand:
     process.env.PIPELINE_POWERSHELL_COMMAND || "powershell.exe",
+  gitCommand: process.env.PIPELINE_GIT_COMMAND || "git",
+  opsEnabled: boolean(process.env.PIPELINE_OPS_ENABLED, true),
+  opsAutoHandle: boolean(process.env.PIPELINE_OPS_AUTO_HANDLE, true),
+  opsAutoDeploy: boolean(process.env.PIPELINE_OPS_AUTO_DEPLOY, true),
+  opsMaxAttempts: integer(process.env.PIPELINE_OPS_MAX_ATTEMPTS, 4),
+  opsCodexModel:
+    process.env.PIPELINE_OPS_CODEX_MODEL?.trim() ||
+    process.env.PIPELINE_CODEX_MODEL?.trim() ||
+    DEFAULT_CODEX_MODEL,
+  opsCodexReasoningEffort:
+    process.env.PIPELINE_OPS_CODEX_REASONING_EFFORT?.trim() ||
+    process.env.PIPELINE_CODEX_REASONING_EFFORT?.trim() ||
+    DEFAULT_CODEX_REASONING_EFFORT,
+  opsCodexFastMode: boolean(process.env.PIPELINE_OPS_CODEX_FAST_MODE, false),
+  repairDirectory: path.join(dataDirectory, "repairs"),
+  deploymentStatePath: path.join(dataDirectory, "deployment-state.json"),
+  guardianEnabled: boolean(process.env.PIPELINE_GUARDIAN_ENABLED, true),
+  guardianHost: process.env.PIPELINE_GUARDIAN_HOST || "0.0.0.0",
+  guardianPort: integer(process.env.PIPELINE_GUARDIAN_PORT, 4318),
+  guardianIntervalMs: integer(process.env.PIPELINE_GUARDIAN_INTERVAL_MS, 5_000),
+  guardianFailureThreshold: integer(
+    process.env.PIPELINE_GUARDIAN_FAILURE_THRESHOLD,
+    3,
+  ),
+  guardianRestartCooldownMs: integer(
+    process.env.PIPELINE_GUARDIAN_RESTART_COOLDOWN_MS,
+    20_000,
+  ),
+  relayEntry: process.env.PIPELINE_RELAY_ENTRY || "server/index.mjs",
+  webEntry: process.env.PIPELINE_WEB_ENTRY || "server/web.mjs",
+  webPort: integer(process.env.PORT, 3000),
+  internalWebPort: integer(
+    process.env.RELAY_INTERNAL_WEB_PORT,
+    integer(process.env.PORT, 3000) + 1,
+  ),
 });

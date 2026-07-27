@@ -87,7 +87,7 @@ import {
 } from "./types";
 
 type ViewName =
-  "dashboard" | "tasks" | "workers" | "projects" | "settings" | "task";
+  "dashboard" | "ops" | "tasks" | "workers" | "projects" | "settings" | "task";
 type Toast = {
   id: number;
   kind: "success" | "error" | "info";
@@ -418,6 +418,7 @@ const phaseSequence = [
 ];
 
 const navItems: { view: ViewName; label: string; icon: typeof Activity }[] = [
+  { view: "ops", label: "系统助手", icon: Bot },
   { view: "dashboard", label: "调度台", icon: LayoutDashboard },
   { view: "tasks", label: "任务", icon: MessageSquareText },
   { view: "workers", label: "工位", icon: Server },
@@ -799,6 +800,7 @@ export default function ControlDesk() {
       if (
         nextView &&
         [
+          "ops",
           "dashboard",
           "tasks",
           "workers",
@@ -1117,6 +1119,18 @@ export default function ControlDesk() {
               busy={busy}
               onBack={() => navigate("tasks")}
               onRefresh={() => void refresh()}
+              onAskOps={() =>
+                void runMutation(
+                  () =>
+                    api("/api/ops/messages", {
+                      method: "POST",
+                      body: JSON.stringify({
+                        message: `请检查任务 ${selectedTask.number}（${selectedTask.title}）当前的完整状态、最近错误和 Worker 现场；如果存在异常，请立即执行不删除数据的恢复。任务 ID：${selectedTask.id}`,
+                      }),
+                    }),
+                  "任务上下文已交给系统 Codex",
+                )
+              }
               onMessage={async (message) => {
                 const ok = await runMutation(
                   () =>
@@ -1193,6 +1207,41 @@ export default function ControlDesk() {
                 >
                   返回任务列表
                 </button>
+              }
+            />
+          )}
+          {view === "ops" && (
+            <OpsPage
+              snapshot={snapshot}
+              busy={busy}
+              onTask={(id) => navigate("task", id)}
+              onSend={async (message) =>
+                runMutation(
+                  () =>
+                    api("/api/ops/messages", {
+                      method: "POST",
+                      body: JSON.stringify({ message }),
+                    }),
+                  "消息已交给系统 Codex",
+                )
+              }
+              onDiagnose={(incidentId) =>
+                void runMutation(
+                  () =>
+                    api(`/api/incidents/${incidentId}/diagnose`, {
+                      method: "POST",
+                    }),
+                  "事故已重新交给系统 Codex",
+                )
+              }
+              onResolve={(incidentId) =>
+                void runMutation(
+                  () =>
+                    api(`/api/incidents/${incidentId}/resolve`, {
+                      method: "POST",
+                    }),
+                  "事故已标记为解决",
+                )
               }
             />
           )}
@@ -1681,6 +1730,313 @@ function EventStream({
   );
 }
 
+function OpsPage({
+  snapshot,
+  busy,
+  onTask,
+  onSend,
+  onDiagnose,
+  onResolve,
+}: {
+  snapshot: Snapshot;
+  busy: boolean;
+  onTask: (id: string) => void;
+  onSend: (message: string) => Promise<boolean>;
+  onDiagnose: (incidentId: string) => void;
+  onResolve: (incidentId: string) => void;
+}) {
+  const [message, setMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const ops = snapshot.ops;
+  const openIncidents = ops.incidents.filter((item) => !item.resolvedAt);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const content = message.trim();
+    if (!content || sending) return;
+    setSending(true);
+    const ok = await onSend(content);
+    if (ok) setMessage("");
+    setSending(false);
+  };
+  return (
+    <div className="page ops-page">
+      <section className="page-title-row ops-title-row">
+        <div>
+          <span className="eyebrow">AUTONOMOUS OPERATIONS</span>
+          <h1>系统助手</h1>
+          <p>
+            持久化 Codex 会持续接收 Relay、任务和 Worker
+            异常，自动执行不删除数据的恢复动作，并在隔离 worktree
+            中完成代码自修复、验证、提交和部署。
+          </p>
+        </div>
+        <div className="ops-status-cluster">
+          <StatusBadge
+            status={
+              snapshot.server.recoveryMode
+                ? "attention"
+                : snapshot.server.ops?.running
+                  ? "ready"
+                  : "offline"
+            }
+            label={
+              snapshot.server.recoveryMode
+                ? "Guardian 恢复模式"
+                : snapshot.server.ops?.running
+                  ? "自动恢复运行中"
+                  : "系统助手离线"
+            }
+          />
+          <span className="ops-thread-meta">
+            {ops.thread.codexModel} · {ops.thread.codexReasoningEffort}
+          </span>
+        </div>
+      </section>
+
+      {snapshot.server.recoveryMode && (
+        <div className="ops-recovery-banner">
+          <ShieldCheck size={19} />
+          <div>
+            <strong>Relay 主进程当前不可用，已切换到 Guardian。</strong>
+            <span>
+              这里发送的消息由独立 Emergency Codex
+              处理，仍可重启服务或触发隔离代码修复。
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div className="ops-layout">
+        <section className="ops-conversation">
+          <div className="ops-conversation-head">
+            <div>
+              <span className="section-kicker">SYSTEM THREAD</span>
+              <h2>运维对话</h2>
+            </div>
+            <span>{ops.turns.length} 轮</span>
+          </div>
+          <div className="ops-thread">
+            {ops.turns.length === 0 ? (
+              <EmptyState
+                icon={Bot}
+                title="系统 Codex 已待命"
+                description="异常会自动出现在这里，也可以直接描述要诊断、恢复或改进的内容。"
+              />
+            ) : (
+              ops.turns.map((turn) => {
+                const progress = snapshot.events.filter(
+                  (event) =>
+                    event.opsTurnId === turn.id &&
+                    event.type === "ops.codex.message",
+                );
+                return (
+                  <article className="ops-turn" key={turn.id}>
+                    <div className="ops-user-message">
+                      <div className="message-head">
+                        <span className="avatar small">
+                          {userInitial(turn.authorName)}
+                        </span>
+                        <strong>{turn.authorName}</strong>
+                        <span className="message-kind">{turn.trigger}</span>
+                        <time>{relativeTime(turn.createdAt)}</time>
+                        <StatusBadge status={turn.status} />
+                      </div>
+                      <p>{turn.userMessage}</p>
+                    </div>
+                    {progress.map((event) => (
+                      <div
+                        className="ops-agent-message progress"
+                        key={event.id}
+                      >
+                        <div className="message-head">
+                          <span className="bot-avatar">
+                            <Bot size={16} />
+                          </span>
+                          <strong>System Codex</strong>
+                          <span className="message-kind">进度</span>
+                          <time>{relativeTime(event.createdAt)}</time>
+                        </div>
+                        <p>{event.message}</p>
+                      </div>
+                    ))}
+                    {turn.final?.summary && (
+                      <div className="ops-agent-message final">
+                        <div className="message-head">
+                          <span className="bot-avatar">
+                            <Bot size={16} />
+                          </span>
+                          <strong>System Codex</strong>
+                          <span className="message-kind">结论</span>
+                        </div>
+                        <p>{turn.final.summary}</p>
+                        {turn.final.diagnosis && (
+                          <div className="ops-diagnosis">
+                            <strong>诊断</strong>
+                            <span>{turn.final.diagnosis}</span>
+                          </div>
+                        )}
+                        {turn.final.verification && (
+                          <div className="ops-diagnosis">
+                            <strong>验证</strong>
+                            <span>{turn.final.verification}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {turn.errorMessage && (
+                      <div className="ops-turn-error">
+                        <AlertTriangle size={15} />
+                        {turn.errorMessage}
+                      </div>
+                    )}
+                  </article>
+                );
+              })
+            )}
+          </div>
+          <form className="ops-composer" onSubmit={submit}>
+            <textarea
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder="直接要求系统 Codex 检查任务、恢复 Worker、重启服务或修复 Relay 自身问题…"
+              rows={4}
+            />
+            <div>
+              <span>
+                <ShieldCheck size={14} />
+                自动动作不可删除数据；代码修改必须经过 Git 与完整验证。
+              </span>
+              <button
+                className="primary-action"
+                type="submit"
+                disabled={busy || sending || !message.trim()}
+              >
+                {sending ? (
+                  <LoaderCircle className="spin" size={16} />
+                ) : (
+                  <Bot size={16} />
+                )}
+                发送给系统 Codex
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <aside className="ops-sidebar">
+          <section className="ops-panel">
+            <div className="ops-panel-head">
+              <div>
+                <span className="section-kicker">INCIDENTS</span>
+                <h2>自动事故处理</h2>
+              </div>
+              <em>{openIncidents.length}</em>
+            </div>
+            <div className="incident-list">
+              {openIncidents.length === 0 ? (
+                <p className="ops-empty-copy">当前没有未解决事故。</p>
+              ) : (
+                openIncidents.map((incident) => (
+                  <article className="incident-card" key={incident.id}>
+                    <div>
+                      <StatusBadge status={incident.status} />
+                      <time>{relativeTime(incident.updatedAt)}</time>
+                    </div>
+                    <strong>{incident.title}</strong>
+                    <p>{incident.error}</p>
+                    <dl>
+                      <div>
+                        <dt>自动尝试</dt>
+                        <dd>{incident.attemptCount}</dd>
+                      </div>
+                      <div>
+                        <dt>最后动作</dt>
+                        <dd>{incident.lastAction ?? "正在诊断"}</dd>
+                      </div>
+                    </dl>
+                    <div className="incident-actions">
+                      {incident.taskId && (
+                        <button
+                          className="text-button"
+                          onClick={() => onTask(incident.taskId!)}
+                        >
+                          查看任务
+                        </button>
+                      )}
+                      <button
+                        className="text-button"
+                        onClick={() => onDiagnose(incident.id)}
+                      >
+                        立即重诊
+                      </button>
+                      <button
+                        className="text-button"
+                        onClick={() => onResolve(incident.id)}
+                      >
+                        标记解决
+                      </button>
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+          </section>
+
+          <section className="ops-panel">
+            <div className="ops-panel-head">
+              <div>
+                <span className="section-kicker">REPAIR HISTORY</span>
+                <h2>自修复提交</h2>
+              </div>
+              <GitCommitHorizontal size={18} />
+            </div>
+            <div className="repair-list">
+              {ops.repairs.length === 0 ? (
+                <p className="ops-empty-copy">尚未触发 Relay 代码修复。</p>
+              ) : (
+                ops.repairs.slice(0, 8).map((repair) => (
+                  <article key={repair.id}>
+                    <div>
+                      <StatusBadge status={repair.status} />
+                      <time>{relativeTime(repair.updatedAt)}</time>
+                    </div>
+                    <strong>{repair.branchName ?? repair.id}</strong>
+                    {repair.commitSha && (
+                      <code>{compactSha(repair.commitSha)}</code>
+                    )}
+                    {repair.error && <p>{repair.error}</p>}
+                  </article>
+                ))
+              )}
+            </div>
+          </section>
+
+          <section className="ops-panel">
+            <div className="ops-panel-head">
+              <div>
+                <span className="section-kicker">AUDIT</span>
+                <h2>最近自动动作</h2>
+              </div>
+              <History size={18} />
+            </div>
+            <div className="ops-action-list">
+              {ops.actions.slice(0, 12).map((action) => (
+                <div key={action.id}>
+                  <StatusBadge status={action.status} />
+                  <code>{action.type}</code>
+                  <span>{action.reason}</span>
+                </div>
+              ))}
+              {ops.actions.length === 0 && (
+                <p className="ops-empty-copy">尚无自动动作记录。</p>
+              )}
+            </div>
+          </section>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
 function TasksPage({
   snapshot,
   onTask,
@@ -1832,6 +2188,7 @@ function TaskDetail({
   busy,
   onBack,
   onRefresh,
+  onAskOps,
   onMessage,
   onCancel,
   onRetry,
@@ -1844,6 +2201,7 @@ function TaskDetail({
   busy: boolean;
   onBack: () => void;
   onRefresh: () => void;
+  onAskOps: () => void;
   onMessage: (message: string) => Promise<boolean>;
   onCancel: () => void;
   onRetry: () => void;
@@ -1910,6 +2268,10 @@ function TaskDetail({
           </div>
         </div>
         <div className="task-head-actions">
+          <button className="secondary-action" onClick={onAskOps}>
+            <Bot size={15} />
+            交给系统 Codex
+          </button>
           <IconButton label="刷新" onClick={onRefresh}>
             <RefreshCw size={17} />
           </IconButton>
@@ -2892,7 +3254,9 @@ function SettingsPage({
           <p>网页只管理结构化任务和白名单操作，不提供任意 PowerShell 入口。</p>
         </div>
         <StatusBadge
-          status={connected ? "ready" : connectionChecked ? "offline" : "preparing"}
+          status={
+            connected ? "ready" : connectionChecked ? "offline" : "preparing"
+          }
           label={
             connected
               ? "实时连接正常"

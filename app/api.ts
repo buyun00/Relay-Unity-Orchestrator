@@ -1,4 +1,4 @@
-import type { PipelineEvent, Snapshot } from "./types";
+import { EMPTY_SNAPSHOT, type PipelineEvent, type Snapshot } from "./types";
 
 const API_KEY = "relay-api-base";
 const USER_NAME_KEY = "relay-user-name";
@@ -182,6 +182,7 @@ export function fetchSnapshot(signal?: AbortSignal) {
           turn.queuePosition ?? queuePositions.get(turn.id) ?? null,
       })),
       events,
+      ops: snapshot.ops ?? EMPTY_SNAPSHOT.ops,
     };
   });
 }

@@ -339,7 +339,7 @@ test("Codex turns pin the Relay model, reasoning effort, and standard speed", as
 
   assert.equal(result.threadId, "thread-model-defaults");
   assert.equal(calls.length, 1);
-  const [{ args }] = calls;
+  const [{ args, options }] = calls;
   const execIndex = args.indexOf("exec");
   assert.ok(execIndex > 0);
   assert.ok(args.indexOf("--model") < execIndex);
@@ -347,7 +347,8 @@ test("Codex turns pin the Relay model, reasoning effort, and standard speed", as
   assert.ok(args.indexOf('model_reasoning_effort="xhigh"') < execIndex);
   assert.ok(args.indexOf('service_tier="default"') < execIndex);
   assert.ok(args.indexOf("features.fast_mode=false") < execIndex);
-  const prompt = args.at(-1);
+  assert.equal(args.at(-1), "-");
+  const prompt = options.input;
   assert.match(prompt, /Get-UnityDialogGuardState\.ps1/);
   assert.match(prompt, /Invoke-UnityDialogGuardAction\.ps1/);
   assert.match(prompt, /VMName unity-worker-01/);
@@ -417,13 +418,14 @@ test("Codex image arguments cannot consume the positional prompt", async (t) => 
 
   await runner.run(imageContext, {});
 
-  const [{ args }] = calls;
+  const [{ args, options }] = calls;
   const imageIndex = args.indexOf("--image");
   const delimiterIndex = args.indexOf("--");
   assert.ok(imageIndex > args.indexOf("exec"));
   assert.equal(args[imageIndex + 1], imageContext.attachments[0].path);
   assert.ok(delimiterIndex > imageIndex);
   assert.equal(args.length, delimiterIndex + 2);
-  assert.match(args[delimiterIndex + 1], /Perform a real integration test/);
-  assert.match(args[delimiterIndex + 1], /reference\.png/);
+  assert.equal(args[delimiterIndex + 1], "-");
+  assert.match(options.input, /Perform a real integration test/);
+  assert.match(options.input, /reference\.png/);
 });

@@ -2,16 +2,51 @@ import { config } from "./config.mjs";
 import { createAdapter } from "./adapters/index.mjs";
 import { Store } from "./db.mjs";
 import { PipelineHttpServer } from "./http.mjs";
+import { GuardianClient } from "./guardian-client.mjs";
+import { OpsEngine } from "./ops-engine.mjs";
+import { RepairManager } from "./repair-manager.mjs";
 import { Scheduler } from "./scheduler.mjs";
 
 const store = new Store(config);
+const guardian = new GuardianClient(config, {
+  onEvent: (event) => store.emit(event),
+});
+guardian.start();
 const adapter = createAdapter(config);
 const runtime = await adapter.initialize();
 const scheduler = new Scheduler({ config, store, adapter });
-const api = new PipelineHttpServer({ config, store, scheduler });
+const repairManager = new RepairManager(
+  { config, store },
+  { restartCoordinator: guardian },
+);
+const ops = new OpsEngine({
+  config,
+  store,
+  scheduler,
+  repairManager,
+  restartCoordinator: guardian,
+});
+const api = new PipelineHttpServer({
+  config,
+  store,
+  scheduler,
+  ops,
+  guardian,
+});
 
 await api.listen();
 await scheduler.start({ paused: !runtime.ready });
+await ops.start();
+if (!runtime.ready) {
+  store.emit({
+    type: "system.runtime.unhealthy",
+    phase: "system",
+    level: "error",
+    message:
+      "Relay host preflight is not ready; System Codex will diagnose recovery",
+    data: { runtime },
+  });
+}
 
 console.log(
   `Relay pipeline API listening on http://${config.host}:${config.port}`,
@@ -35,6 +70,8 @@ async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   console.log(`Received ${signal}; stopping pipeline service`);
+  ops.stop();
+  guardian.stop();
   scheduler.stop();
   const drained = await scheduler.waitForIdle();
   if (!drained) {

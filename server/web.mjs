@@ -21,6 +21,10 @@ const publicHost = process.env.HOST || "0.0.0.0";
 const internalHost = "127.0.0.1";
 const controlHost = process.env.RELAY_CONTROL_HOST || "127.0.0.1";
 const controlPort = Number.parseInt(process.env.PIPELINE_PORT || "4317", 10);
+const guardianPort = Number.parseInt(
+  process.env.PIPELINE_GUARDIAN_PORT || "4318",
+  10,
+);
 const controlProxyPrefix = "/relay-control";
 let server;
 let shuttingDown = false;
@@ -127,6 +131,67 @@ function proxyRequest(
   request.pipe(upstream);
 }
 
+function proxyControlRequest(request, response, upstreamPath) {
+  const chunks = [];
+  request.on("data", (chunk) => chunks.push(chunk));
+  request.on("error", (error) => {
+    if (!response.headersSent) {
+      response.writeHead(400, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+    }
+    response.end(error.message);
+  });
+  request.on("end", () => {
+    const body = Buffer.concat(chunks);
+    const attempt = (port, guardianFallback = false) => {
+      const upstream = http.request(
+        {
+          host: controlHost,
+          port,
+          path: upstreamPath,
+          method: request.method,
+          headers: {
+            ...request.headers,
+            host: request.headers.host || `${controlHost}:${port}`,
+            "content-length": String(body.length),
+          },
+        },
+        (upstreamResponse) => {
+          response.writeHead(upstreamResponse.statusCode || 502, {
+            ...upstreamResponse.headers,
+            [guardianFallback
+              ? "x-relay-guardian-proxy"
+              : "x-relay-control-proxy"]: "1",
+          });
+          upstreamResponse.pipe(response);
+        },
+      );
+      upstream.once("error", (error) => {
+        if (!guardianFallback && !response.headersSent) {
+          attempt(guardianPort, true);
+          return;
+        }
+        if (response.headersSent) {
+          response.destroy(error);
+          return;
+        }
+        response.writeHead(503, {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        response.end(
+          "Relay and Guardian are both unavailable. Retry after the mutual watchdog restarts them.",
+        );
+      });
+      if (body.length) upstream.end(body);
+      else upstream.end();
+    };
+    attempt(controlPort);
+  });
+}
+
 function waitForRenderer(timeoutMs = 15_000) {
   const startedAt = Date.now();
   return new Promise((resolve, reject) => {
@@ -187,13 +252,11 @@ server = http.createServer((request, response) => {
     pathname === `${controlProxyPrefix}/api` ||
     pathname.startsWith(`${controlProxyPrefix}/api/`)
   ) {
-    proxyRequest(request, response, {
-      upstreamHost: controlHost,
-      upstreamPort: controlPort,
-      upstreamPath: rawUrl.slice(controlProxyPrefix.length),
-      proxyHeader: "x-relay-control-proxy",
-      preserveHost: true,
-    });
+    proxyControlRequest(
+      request,
+      response,
+      rawUrl.slice(controlProxyPrefix.length),
+    );
     return;
   }
   if (!["GET", "HEAD"].includes(request.method || "GET")) {

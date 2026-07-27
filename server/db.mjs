@@ -169,6 +169,8 @@ function eventFromRow(row) {
     taskId: row.task_id,
     turnId: row.turn_id,
     workerId: row.worker_id,
+    opsTurnId: row.ops_turn_id || null,
+    incidentId: row.incident_id || null,
     actorName: row.actor_name,
     level: row.level,
     type: row.type,
@@ -190,6 +192,105 @@ function attachmentFromRow(row) {
     contentType: row.content_type,
     size: row.size,
     createdAt: row.created_at,
+  };
+}
+
+function opsThreadFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    codexThreadId: row.codex_thread_id,
+    status: row.status,
+    codexModel: row.codex_model,
+    codexReasoningEffort: row.codex_reasoning_effort,
+    codexFastMode: asBoolean(row.codex_fast_mode),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function opsTurnFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    threadId: row.thread_id,
+    sequence: Number(row.sequence),
+    trigger: row.trigger,
+    incidentId: row.incident_id,
+    userMessage: row.user_message,
+    authorName: row.author_name,
+    status: row.status,
+    final: parseJson(row.final_json, row.final_json),
+    errorCode: row.error_code,
+    errorMessage: row.error_message,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+  };
+}
+
+function incidentFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    fingerprint: row.fingerprint,
+    status: row.status,
+    severity: row.severity,
+    sourceEventId:
+      row.source_event_id == null ? null : Number(row.source_event_id),
+    taskId: row.task_id,
+    turnId: row.turn_id,
+    workerId: row.worker_id,
+    title: row.title,
+    error: row.error,
+    context: parseJson(row.context_json, null),
+    attemptCount: Number(row.attempt_count || 0),
+    lastAction: row.last_action,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    resolvedAt: row.resolved_at,
+  };
+}
+
+function opsActionFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    opsTurnId: row.ops_turn_id,
+    incidentId: row.incident_id,
+    type: row.type,
+    targetId: row.target_id,
+    message: row.message,
+    reason: row.reason,
+    status: row.status,
+    reversible: asBoolean(row.reversible),
+    result: parseJson(row.result_json, null),
+    error: row.error,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+  };
+}
+
+function repairRunFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    opsTurnId: row.ops_turn_id,
+    incidentId: row.incident_id,
+    status: row.status,
+    instructions: row.instructions,
+    branchName: row.branch_name,
+    worktreePath: row.worktree_path,
+    baseSha: row.base_sha,
+    commitSha: row.commit_sha,
+    codexThreadId: row.codex_thread_id,
+    validation: parseJson(row.validation_json, null),
+    error: row.error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deployedAt: row.deployed_at,
+    rolledBackAt: row.rolled_back_at,
   };
 }
 
@@ -335,11 +436,101 @@ export class Store {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS ops_threads (
+        id TEXT PRIMARY KEY,
+        codex_thread_id TEXT,
+        status TEXT NOT NULL DEFAULT 'idle',
+        codex_model TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_MODEL}',
+        codex_reasoning_effort TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_REASONING_EFFORT}',
+        codex_fast_mode INTEGER NOT NULL DEFAULT ${DEFAULT_CODEX_FAST_MODE ? 1 : 0},
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS incidents (
+        id TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        severity TEXT NOT NULL DEFAULT 'error',
+        source_event_id INTEGER,
+        task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+        worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        error TEXT NOT NULL,
+        context_json TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_action TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS ops_turns (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES ops_threads(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        trigger TEXT NOT NULL DEFAULT 'manual',
+        incident_id TEXT REFERENCES incidents(id) ON DELETE SET NULL,
+        user_message TEXT NOT NULL,
+        author_name TEXT NOT NULL DEFAULT 'Relay',
+        status TEXT NOT NULL DEFAULT 'queued',
+        final_json TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        UNIQUE(thread_id, sequence)
+      );
+
+      CREATE TABLE IF NOT EXISTS ops_actions (
+        id TEXT PRIMARY KEY,
+        ops_turn_id TEXT NOT NULL REFERENCES ops_turns(id) ON DELETE CASCADE,
+        incident_id TEXT REFERENCES incidents(id) ON DELETE SET NULL,
+        type TEXT NOT NULL,
+        target_id TEXT,
+        message TEXT,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'queued',
+        reversible INTEGER NOT NULL DEFAULT 1,
+        result_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS repair_runs (
+        id TEXT PRIMARY KEY,
+        ops_turn_id TEXT REFERENCES ops_turns(id) ON DELETE SET NULL,
+        incident_id TEXT REFERENCES incidents(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        instructions TEXT NOT NULL,
+        branch_name TEXT,
+        worktree_path TEXT,
+        base_sha TEXT,
+        commit_sha TEXT,
+        codex_thread_id TEXT,
+        validation_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        deployed_at TEXT,
+        rolled_back_at TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS turns_queue_idx ON turns(status, priority DESC, created_at ASC);
       CREATE INDEX IF NOT EXISTS turns_task_idx ON turns(task_id, sequence DESC);
       CREATE INDEX IF NOT EXISTS events_created_idx ON events(id DESC);
       CREATE INDEX IF NOT EXISTS events_task_idx ON events(task_id, id ASC);
       CREATE INDEX IF NOT EXISTS workers_ready_idx ON workers(enabled, status, project_id);
+      CREATE INDEX IF NOT EXISTS ops_turns_queue_idx ON ops_turns(status, created_at ASC);
+      CREATE INDEX IF NOT EXISTS ops_turns_thread_idx ON ops_turns(thread_id, sequence ASC);
+      CREATE INDEX IF NOT EXISTS incidents_status_idx ON incidents(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS incidents_fingerprint_idx ON incidents(fingerprint, resolved_at);
+      CREATE INDEX IF NOT EXISTS ops_actions_turn_idx ON ops_actions(ops_turn_id, created_at ASC);
+      CREATE INDEX IF NOT EXISTS repair_runs_status_idx ON repair_runs(status, updated_at DESC);
     `);
     const projectColumns = this.db.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "unity_health_url")) {
@@ -381,6 +572,12 @@ export class Store {
     if (!eventColumns.some((column) => column.name === "actor_name")) {
       this.db.exec("ALTER TABLE events ADD COLUMN actor_name TEXT");
     }
+    if (!eventColumns.some((column) => column.name === "ops_turn_id")) {
+      this.db.exec("ALTER TABLE events ADD COLUMN ops_turn_id TEXT");
+    }
+    if (!eventColumns.some((column) => column.name === "incident_id")) {
+      this.db.exec("ALTER TABLE events ADD COLUMN incident_id TEXT");
+    }
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_idx
       ON tasks(idempotency_key)
@@ -403,46 +600,61 @@ export class Store {
     `,
       )
       .all();
-    if (active.length === 0) return;
-    this.transaction(() => {
-      for (const turn of active) {
-        this.db
-          .prepare(
-            `
+    if (active.length > 0) {
+      this.transaction(() => {
+        for (const turn of active) {
+          this.db
+            .prepare(
+              `
           UPDATE turns SET status='interrupted', error_code='SERVER_RESTARTED',
             error_message='Backend restarted while this turn was active', finished_at=?
           WHERE id=?
         `,
-          )
-          .run(timestamp, turn.id);
-        const queued = this.db
-          .prepare(
-            "SELECT id FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence LIMIT 1",
-          )
-          .get(turn.task_id);
-        this.db
-          .prepare(`UPDATE tasks SET status=?, updated_at=? WHERE id=?`)
-          .run(queued ? "queued" : "failed", timestamp, turn.task_id);
-        if (turn.worker_id) {
-          if (queued) {
+            )
+            .run(timestamp, turn.id);
+          const queued = this.db
+            .prepare(
+              "SELECT id FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence LIMIT 1",
+            )
+            .get(turn.task_id);
+          this.db
+            .prepare(`UPDATE tasks SET status=?, updated_at=? WHERE id=?`)
+            .run(queued ? "queued" : "failed", timestamp, turn.task_id);
+          if (turn.worker_id) {
+            if (queued) {
+              this.db
+                .prepare(
+                  "UPDATE turns SET worker_id=? WHERE id=? AND worker_id IS NULL",
+                )
+                .run(turn.worker_id, queued.id);
+            }
             this.db
               .prepare(
-                "UPDATE turns SET worker_id=? WHERE id=? AND worker_id IS NULL",
-              )
-              .run(turn.worker_id, queued.id);
-          }
-          this.db
-            .prepare(
-              `
+                `
             UPDATE workers SET status='attention', current_turn_id=NULL,
               last_error='Backend restarted during active work; inspect preserved workspace', updated_at=?
             WHERE id=?
           `,
-            )
-            .run(timestamp, turn.worker_id);
+              )
+              .run(timestamp, turn.worker_id);
+          }
         }
-      }
-    });
+      });
+    }
+    this.db.exec(`
+      UPDATE ops_turns
+      SET status='interrupted', error_code='SERVER_RESTARTED',
+        error_message='Relay restarted while this Ops turn was active',
+        finished_at='${timestamp}'
+      WHERE status='running';
+      UPDATE incidents
+      SET status='open', updated_at='${timestamp}'
+      WHERE status IN ('diagnosing','acting');
+      UPDATE repair_runs
+      SET status='interrupted', error='Relay restarted while repair was active',
+        updated_at='${timestamp}'
+      WHERE status IN ('running','validating','deploying');
+    `);
   }
 
   onEvent(listener) {
@@ -454,6 +666,8 @@ export class Store {
     taskId = null,
     turnId = null,
     workerId = null,
+    opsTurnId = null,
+    incidentId = null,
     actorName = null,
     level = "info",
     type,
@@ -466,15 +680,18 @@ export class Store {
       .prepare(
         `
       INSERT INTO events (
-        task_id, turn_id, worker_id, actor_name, level, type, phase, message, data_json, created_at
+        task_id, turn_id, worker_id, ops_turn_id, incident_id, actor_name,
+        level, type, phase, message, data_json, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
       )
       .run(
         taskId,
         turnId,
         workerId,
+        opsTurnId,
+        incidentId,
         actorName,
         level,
         type,
@@ -488,6 +705,8 @@ export class Store {
       taskId,
       turnId,
       workerId,
+      opsTurnId,
+      incidentId,
       actorName,
       level,
       type,
@@ -1522,6 +1741,483 @@ export class Store {
     return this.getTask(taskId);
   }
 
+  ensureOpsThread() {
+    const threadId = "ops-system";
+    const existing = this.db
+      .prepare("SELECT * FROM ops_threads WHERE id=?")
+      .get(threadId);
+    if (existing) return opsThreadFromRow(existing);
+    const timestamp = now();
+    this.db
+      .prepare(
+        `
+        INSERT INTO ops_threads (
+          id, status, codex_model, codex_reasoning_effort, codex_fast_mode,
+          created_at, updated_at
+        ) VALUES (?, 'idle', ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        threadId,
+        this.config.opsCodexModel ||
+          this.config.codexModel ||
+          DEFAULT_CODEX_MODEL,
+        this.config.opsCodexReasoningEffort ||
+          this.config.codexReasoningEffort ||
+          DEFAULT_CODEX_REASONING_EFFORT,
+        (this.config.opsCodexFastMode ??
+          this.config.codexServiceTier === "fast")
+          ? 1
+          : 0,
+        timestamp,
+        timestamp,
+      );
+    return opsThreadFromRow(
+      this.db.prepare("SELECT * FROM ops_threads WHERE id=?").get(threadId),
+    );
+  }
+
+  getOpsThread() {
+    return this.ensureOpsThread();
+  }
+
+  setOpsCodexThread(codexThreadId) {
+    if (!codexThreadId) return this.getOpsThread();
+    const thread = this.ensureOpsThread();
+    this.db
+      .prepare(
+        `
+        UPDATE ops_threads
+        SET codex_thread_id=COALESCE(codex_thread_id, ?), updated_at=?
+        WHERE id=?
+      `,
+      )
+      .run(codexThreadId, now(), thread.id);
+    return this.getOpsThread();
+  }
+
+  listOpsTurns() {
+    this.ensureOpsThread();
+    return this.db
+      .prepare("SELECT * FROM ops_turns ORDER BY sequence ASC")
+      .all()
+      .map(opsTurnFromRow);
+  }
+
+  getOpsTurn(opsTurnId) {
+    return opsTurnFromRow(
+      this.db.prepare("SELECT * FROM ops_turns WHERE id=?").get(opsTurnId),
+    );
+  }
+
+  appendOpsTurn({
+    message,
+    authorName = "Relay",
+    trigger = "manual",
+    incidentId = null,
+  }) {
+    const thread = this.ensureOpsThread();
+    const timestamp = now();
+    const opsTurnId = id("ops-turn-");
+    const sequence = Number(
+      this.db
+        .prepare(
+          "SELECT COALESCE(MAX(sequence), 0) + 1 AS value FROM ops_turns WHERE thread_id=?",
+        )
+        .get(thread.id).value,
+    );
+    this.db
+      .prepare(
+        `
+        INSERT INTO ops_turns (
+          id, thread_id, sequence, trigger, incident_id, user_message,
+          author_name, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+      `,
+      )
+      .run(
+        opsTurnId,
+        thread.id,
+        sequence,
+        trigger,
+        incidentId,
+        message,
+        authorName,
+        timestamp,
+      );
+    this.db
+      .prepare(
+        "UPDATE ops_threads SET status='queued', updated_at=? WHERE id=?",
+      )
+      .run(timestamp, thread.id);
+    if (incidentId) {
+      this.db
+        .prepare(
+          "UPDATE incidents SET status='queued', updated_at=? WHERE id=? AND resolved_at IS NULL",
+        )
+        .run(timestamp, incidentId);
+    }
+    const turn = this.getOpsTurn(opsTurnId);
+    queueMicrotask(() =>
+      this.emit({
+        opsTurnId,
+        incidentId,
+        actorName: authorName,
+        type: "ops.turn.queued",
+        phase: "ops",
+        message: `System Codex turn ${sequence} queued`,
+        data: { trigger },
+      }),
+    );
+    return turn;
+  }
+
+  claimNextOpsTurn() {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare(
+          "SELECT * FROM ops_turns WHERE status='queued' ORDER BY created_at ASC LIMIT 1",
+        )
+        .get();
+      if (!row) return null;
+      const timestamp = now();
+      const claimed = this.db
+        .prepare(
+          "UPDATE ops_turns SET status='running', started_at=? WHERE id=? AND status='queued'",
+        )
+        .run(timestamp, row.id);
+      if (!claimed.changes) return null;
+      this.db
+        .prepare(
+          "UPDATE ops_threads SET status='running', updated_at=? WHERE id=?",
+        )
+        .run(timestamp, row.thread_id);
+      if (row.incident_id) {
+        this.db
+          .prepare(
+            `
+            UPDATE incidents
+            SET status='diagnosing', attempt_count=attempt_count+1, updated_at=?
+            WHERE id=? AND resolved_at IS NULL
+          `,
+          )
+          .run(timestamp, row.incident_id);
+      }
+      return this.getOpsTurn(row.id);
+    });
+  }
+
+  completeOpsTurn(opsTurnId, final) {
+    const turn = this.getOpsTurn(opsTurnId);
+    if (!turn) return null;
+    const timestamp = now();
+    this.db
+      .prepare(
+        `
+        UPDATE ops_turns
+        SET status='completed', final_json=?, error_code=NULL,
+          error_message=NULL, finished_at=?
+        WHERE id=?
+      `,
+      )
+      .run(stringifyJson(final), timestamp, opsTurnId);
+    const queued = this.db
+      .prepare(
+        "SELECT 1 FROM ops_turns WHERE thread_id=? AND status='queued' LIMIT 1",
+      )
+      .get(turn.threadId);
+    this.db
+      .prepare("UPDATE ops_threads SET status=?, updated_at=? WHERE id=?")
+      .run(queued ? "queued" : "idle", timestamp, turn.threadId);
+    return this.getOpsTurn(opsTurnId);
+  }
+
+  failOpsTurn(opsTurnId, error) {
+    const turn = this.getOpsTurn(opsTurnId);
+    if (!turn) return null;
+    const timestamp = now();
+    this.db
+      .prepare(
+        `
+        UPDATE ops_turns
+        SET status='failed', error_code=?, error_message=?, finished_at=?
+        WHERE id=?
+      `,
+      )
+      .run(
+        error?.code || "OPS_TURN_FAILED",
+        error?.message || String(error),
+        timestamp,
+        opsTurnId,
+      );
+    this.db
+      .prepare("UPDATE ops_threads SET status='idle', updated_at=? WHERE id=?")
+      .run(timestamp, turn.threadId);
+    if (turn.incidentId) {
+      this.db
+        .prepare(
+          `
+          UPDATE incidents SET status='failed', error=?, updated_at=?
+          WHERE id=? AND resolved_at IS NULL
+        `,
+        )
+        .run(error?.message || String(error), timestamp, turn.incidentId);
+    }
+    return this.getOpsTurn(opsTurnId);
+  }
+
+  createIncident(input) {
+    const timestamp = now();
+    return this.transaction(() => {
+      const existingRow = this.db
+        .prepare(
+          `
+          SELECT * FROM incidents
+          WHERE fingerprint=? AND resolved_at IS NULL
+          ORDER BY created_at DESC LIMIT 1
+        `,
+        )
+        .get(input.fingerprint);
+      if (existingRow) {
+        this.db
+          .prepare(
+            `
+            UPDATE incidents
+            SET source_event_id=COALESCE(?, source_event_id),
+              task_id=COALESCE(?, task_id), turn_id=COALESCE(?, turn_id),
+              worker_id=COALESCE(?, worker_id), title=?, error=?,
+              context_json=?, updated_at=?
+            WHERE id=?
+          `,
+          )
+          .run(
+            input.sourceEventId || null,
+            input.taskId || null,
+            input.turnId || null,
+            input.workerId || null,
+            input.title,
+            input.error,
+            stringifyJson(input.context || null),
+            timestamp,
+            existingRow.id,
+          );
+        return { incident: this.getIncident(existingRow.id), created: false };
+      }
+      const incidentId = id("incident-");
+      this.db
+        .prepare(
+          `
+          INSERT INTO incidents (
+            id, fingerprint, status, severity, source_event_id, task_id,
+            turn_id, worker_id, title, error, context_json, created_at, updated_at
+          ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        )
+        .run(
+          incidentId,
+          input.fingerprint,
+          input.severity || "error",
+          input.sourceEventId || null,
+          input.taskId || null,
+          input.turnId || null,
+          input.workerId || null,
+          input.title,
+          input.error,
+          stringifyJson(input.context || null),
+          timestamp,
+          timestamp,
+        );
+      return { incident: this.getIncident(incidentId), created: true };
+    });
+  }
+
+  getIncident(incidentId) {
+    return incidentFromRow(
+      this.db.prepare("SELECT * FROM incidents WHERE id=?").get(incidentId),
+    );
+  }
+
+  listIncidents({ limit = 100 } = {}) {
+    return this.db
+      .prepare("SELECT * FROM incidents ORDER BY updated_at DESC LIMIT ?")
+      .all(limit)
+      .map(incidentFromRow);
+  }
+
+  updateIncident(
+    incidentId,
+    { status, lastAction, error, context, resolved = false } = {},
+  ) {
+    const incident = this.getIncident(incidentId);
+    if (!incident) return null;
+    const timestamp = now();
+    this.db
+      .prepare(
+        `
+        UPDATE incidents
+        SET status=COALESCE(?, status), last_action=COALESCE(?, last_action),
+          error=COALESCE(?, error), context_json=COALESCE(?, context_json),
+          updated_at=?, resolved_at=CASE WHEN ? THEN ? ELSE resolved_at END
+        WHERE id=?
+      `,
+      )
+      .run(
+        status || null,
+        lastAction || null,
+        error || null,
+        context === undefined ? null : stringifyJson(context),
+        timestamp,
+        resolved ? 1 : 0,
+        timestamp,
+        incidentId,
+      );
+    return this.getIncident(incidentId);
+  }
+
+  reopenIncident(incidentId, error = null) {
+    const timestamp = now();
+    this.db
+      .prepare(
+        `
+        UPDATE incidents SET status='open', error=COALESCE(?, error),
+          resolved_at=NULL, updated_at=? WHERE id=?
+      `,
+      )
+      .run(error, timestamp, incidentId);
+    return this.getIncident(incidentId);
+  }
+
+  createOpsAction({
+    opsTurnId,
+    incidentId = null,
+    type,
+    targetId = null,
+    message = null,
+    reason = null,
+    reversible = true,
+  }) {
+    const actionId = id("ops-action-");
+    this.db
+      .prepare(
+        `
+        INSERT INTO ops_actions (
+          id, ops_turn_id, incident_id, type, target_id, message, reason,
+          status, reversible, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+      `,
+      )
+      .run(
+        actionId,
+        opsTurnId,
+        incidentId,
+        type,
+        targetId,
+        message,
+        reason,
+        reversible ? 1 : 0,
+        now(),
+      );
+    return this.getOpsAction(actionId);
+  }
+
+  getOpsAction(actionId) {
+    return opsActionFromRow(
+      this.db.prepare("SELECT * FROM ops_actions WHERE id=?").get(actionId),
+    );
+  }
+
+  listOpsActions() {
+    return this.db
+      .prepare("SELECT * FROM ops_actions ORDER BY created_at DESC LIMIT 250")
+      .all()
+      .map(opsActionFromRow);
+  }
+
+  updateOpsAction(actionId, status, { result = null, error = null } = {}) {
+    const timestamp = now();
+    const terminal = ["completed", "failed", "skipped"].includes(status);
+    this.db
+      .prepare(
+        `
+        UPDATE ops_actions
+        SET status=?, result_json=?, error=?,
+          started_at=CASE WHEN ?='running' THEN COALESCE(started_at, ?) ELSE started_at END,
+          finished_at=CASE WHEN ? THEN ? ELSE finished_at END
+        WHERE id=?
+      `,
+      )
+      .run(
+        status,
+        stringifyJson(result),
+        error,
+        status,
+        timestamp,
+        terminal ? 1 : 0,
+        timestamp,
+        actionId,
+      );
+    return this.getOpsAction(actionId);
+  }
+
+  createRepairRun({ opsTurnId = null, incidentId = null, instructions }) {
+    const repairId = id("repair-");
+    const timestamp = now();
+    this.db
+      .prepare(
+        `
+        INSERT INTO repair_runs (
+          id, ops_turn_id, incident_id, status, instructions, created_at, updated_at
+        ) VALUES (?, ?, ?, 'queued', ?, ?, ?)
+      `,
+      )
+      .run(repairId, opsTurnId, incidentId, instructions, timestamp, timestamp);
+    return this.getRepairRun(repairId);
+  }
+
+  getRepairRun(repairId) {
+    return repairRunFromRow(
+      this.db.prepare("SELECT * FROM repair_runs WHERE id=?").get(repairId),
+    );
+  }
+
+  listRepairRuns() {
+    return this.db
+      .prepare("SELECT * FROM repair_runs ORDER BY created_at DESC LIMIT 100")
+      .all()
+      .map(repairRunFromRow);
+  }
+
+  updateRepairRun(repairId, changes = {}) {
+    const fields = {
+      status: "status",
+      branchName: "branch_name",
+      worktreePath: "worktree_path",
+      baseSha: "base_sha",
+      commitSha: "commit_sha",
+      codexThreadId: "codex_thread_id",
+      validation: "validation_json",
+      error: "error",
+      deployedAt: "deployed_at",
+      rolledBackAt: "rolled_back_at",
+    };
+    const assignments = [];
+    const values = [];
+    for (const [key, column] of Object.entries(fields)) {
+      if (!(key in changes)) continue;
+      assignments.push(`${column}=?`);
+      values.push(
+        key === "validation" ? stringifyJson(changes[key]) : changes[key],
+      );
+    }
+    if (!assignments.length) return this.getRepairRun(repairId);
+    assignments.push("updated_at=?");
+    values.push(now(), repairId);
+    this.db
+      .prepare(`UPDATE repair_runs SET ${assignments.join(", ")} WHERE id=?`)
+      .run(...values);
+    return this.getRepairRun(repairId);
+  }
+
   snapshot() {
     const projects = this.listProjects();
     const workers = this.listWorkers();
@@ -1571,6 +2267,13 @@ export class Store {
       workers,
       tasks: enrichedTasks,
       turns,
+      ops: {
+        thread: this.getOpsThread(),
+        turns: this.listOpsTurns(),
+        incidents: this.listIncidents(),
+        actions: this.listOpsActions(),
+        repairs: this.listRepairRuns(),
+      },
       queue,
       events: this.listEvents({ limit: 120 }),
       stats: {

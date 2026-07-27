@@ -139,6 +139,8 @@ export interface PipelineEvent {
   taskId?: string | null;
   turnId?: string | null;
   workerId?: string | null;
+  opsTurnId?: string | null;
+  incidentId?: string | null;
   actorName?: string | null;
   level: "info" | "success" | "warning" | "error";
   type: string;
@@ -146,6 +148,97 @@ export interface PipelineEvent {
   message: string;
   data?: Record<string, unknown> | null;
   createdAt: string;
+}
+
+export interface OpsThread {
+  id: string;
+  codexThreadId?: string | null;
+  status: string;
+  codexModel: string;
+  codexReasoningEffort: string;
+  codexFastMode: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OpsTurn {
+  id: string;
+  threadId: string;
+  sequence: number;
+  trigger: "manual" | "incident" | "followup" | string;
+  incidentId?: string | null;
+  userMessage: string;
+  authorName: string;
+  status: string;
+  final?: {
+    status?: string;
+    summary?: string;
+    diagnosis?: string;
+    confidence?: number;
+    verification?: string;
+    actions?: Array<Record<string, unknown>>;
+    actionResults?: Array<Record<string, unknown>>;
+  } | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  createdAt: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+export interface Incident {
+  id: string;
+  fingerprint: string;
+  status: string;
+  severity: string;
+  sourceEventId?: number | null;
+  taskId?: string | null;
+  turnId?: string | null;
+  workerId?: string | null;
+  title: string;
+  error: string;
+  context?: Record<string, unknown> | null;
+  attemptCount: number;
+  lastAction?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string | null;
+}
+
+export interface OpsAction {
+  id: string;
+  opsTurnId: string;
+  incidentId?: string | null;
+  type: string;
+  targetId?: string | null;
+  message?: string | null;
+  reason?: string | null;
+  status: string;
+  reversible: boolean;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+  createdAt: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+export interface RepairRun {
+  id: string;
+  opsTurnId?: string | null;
+  incidentId?: string | null;
+  status: string;
+  instructions: string;
+  branchName?: string | null;
+  worktreePath?: string | null;
+  baseSha?: string | null;
+  commitSha?: string | null;
+  codexThreadId?: string | null;
+  validation?: Array<Record<string, unknown>> | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deployedAt?: string | null;
+  rolledBackAt?: string | null;
 }
 
 export interface HostVirtualMachine {
@@ -194,12 +287,36 @@ export interface Snapshot {
     startedAt?: string;
     schedulerRunning?: boolean;
     runtime?: HostRuntime | null;
+    recoveryMode?: boolean;
+    ops?: {
+      enabled: boolean;
+      running: boolean;
+      activeTurnId?: string | null;
+      openIncidents?: number;
+      automaticHandling?: boolean;
+      automaticDeployment?: boolean;
+    } | null;
+    guardian?: {
+      enabled?: boolean;
+      reachable?: boolean;
+      failures?: number;
+      lastSeenAt?: string | null;
+      port?: number;
+      [key: string]: unknown;
+    } | null;
   };
   projects: Project[];
   workers: Worker[];
   tasks: Task[];
   turns: Turn[];
   events: PipelineEvent[];
+  ops: {
+    thread: OpsThread;
+    turns: OpsTurn[];
+    incidents: Incident[];
+    actions: OpsAction[];
+    repairs: RepairRun[];
+  };
 }
 
 export const EMPTY_SNAPSHOT: Snapshot = {
@@ -209,4 +326,20 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   tasks: [],
   turns: [],
   events: [],
+  ops: {
+    thread: {
+      id: "ops-system",
+      codexThreadId: null,
+      status: "idle",
+      codexModel: "gpt-5.6-sol",
+      codexReasoningEffort: "xhigh",
+      codexFastMode: false,
+      createdAt: "",
+      updatedAt: "",
+    },
+    turns: [],
+    incidents: [],
+    actions: [],
+    repairs: [],
+  },
 };

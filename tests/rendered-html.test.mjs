@@ -25,6 +25,7 @@ test("server renders the Relay control desk", async () => {
   assert.match(html, /发起任务/);
   assert.match(html, /实时任务轨道/);
   assert.match(html, /工位池/);
+  assert.match(html, /系统助手/);
   assert.doesNotMatch(html, /Your site is taking shape|react-loading-skeleton/);
 });
 
@@ -50,6 +51,9 @@ test("starter preview is removed and the product shell is durable", async () => 
   assert.match(controlDesk, /GPT-5\.6 Sol/);
   assert.match(controlDesk, /Extra High/);
   assert.match(controlDesk, /Fast 模式/);
+  assert.match(controlDesk, /自动事故处理/);
+  assert.match(controlDesk, /发送给系统 Codex/);
+  assert.match(controlDesk, /交给系统 Codex/);
   assert.match(controlDesk, /输入使用者名称/);
   assert.match(controlDesk, /identityReady && identityOpen/);
   assert.match(controlDesk, /connectionChecked && !connected/);
@@ -58,14 +62,13 @@ test("starter preview is removed and the product shell is durable", async () => 
   assert.match(controlDesk, /fetchSnapshot\(controller\.signal\)/);
   assert.doesNotMatch(controlDesk, /管理令牌/);
   assert.match(apiClient, /X-Pipeline-User/);
-  assert.match(
-    apiClient,
-    /window\.location\.origin\}\$\{HTTPS_API_PREFIX\}/,
-  );
+  assert.match(apiClient, /window\.location\.origin\}\$\{HTTPS_API_PREFIX\}/);
   assert.match(apiClient, /HTTPS_API_PREFIX = "\/relay-control"/);
   assert.match(apiClient, /!\["GET", "HEAD", "OPTIONS"\]\.includes\(method\)/);
   assert.match(webServer, /controlProxyPrefix = "\/relay-control"/);
   assert.match(webServer, /"x-relay-control-proxy"/);
+  assert.match(webServer, /"x-relay-guardian-proxy"/);
+  assert.match(webServer, /guardianPort/);
   assert.doesNotMatch(apiClient, /relay-admin-token|Authorization/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
   assert.match(css, /--signal:\s*#72e0b2/);

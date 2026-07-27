@@ -1,10 +1,22 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectRoot
+    [string]$ProjectRoot,
+    [string]$ResultPath
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+trap {
+    if (-not [string]::IsNullOrWhiteSpace($ResultPath)) {
+        [pscustomobject]@{
+            ok = $false
+            error = $_.Exception.Message
+        } | ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -Encoding UTF8
+    } else {
+        [Console]::Error.WriteLine($_.Exception.Message)
+    }
+    exit 1
+}
 if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
     $ProjectRoot = Split-Path -Parent $PSScriptRoot
 }
@@ -16,19 +28,45 @@ $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.Win
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 if (-not $isAdministrator) {
+    $elevationId = [Guid]::NewGuid().ToString('N')
+    $elevationResultPath = Join-Path ([IO.Path]::GetTempPath()) "relay-backend-restart-$elevationId.json"
     $arguments = @(
         '-NoLogo',
         '-NoProfile',
         '-ExecutionPolicy',
         'Bypass',
         '-File',
-        $PSCommandPath,
+        "`"$PSCommandPath`"",
         '-ProjectRoot',
-        $root
+        "`"$root`"",
+        '-ResultPath',
+        "`"$elevationResultPath`""
     )
     $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden `
-        -ArgumentList $arguments -Wait -PassThru
-    exit $process.ExitCode
+        -ArgumentList $arguments -PassThru
+    $elevationDeadline = [DateTime]::UtcNow.AddSeconds(90)
+    do {
+        Start-Sleep -Milliseconds 250
+        $process.Refresh()
+    } while (
+        -not (Test-Path -LiteralPath $elevationResultPath) -and
+        -not $process.HasExited -and
+        [DateTime]::UtcNow -lt $elevationDeadline
+    )
+    $elevatedResult = if (Test-Path -LiteralPath $elevationResultPath) {
+        Get-Content -LiteralPath $elevationResultPath -Raw | ConvertFrom-Json
+    } else {
+        $null
+    }
+    Remove-Item -LiteralPath $elevationResultPath -Force -ErrorAction SilentlyContinue
+    if (-not $elevatedResult) {
+        throw 'Elevated Relay backend restart did not return a result within 90 seconds.'
+    }
+    if (-not $elevatedResult.ok) {
+        throw "Elevated Relay backend restart failed. $($elevatedResult.error)"
+    }
+    Write-Output $elevatedResult.output
+    exit 0
 }
 
 if (-not (Test-Path -LiteralPath $startScript)) {
@@ -122,7 +160,7 @@ if (-not $runtime) {
     throw "Relay backend did not start within 45 seconds. $stderr"
 }
 
-[pscustomobject]@{
+$output = [pscustomobject]@{
     ready = [bool]$runtime.runtime.ready
     checkpointsEnabled = [bool]$runtime.runtime.checkpointsEnabled
     hyperVCanManage = [bool]$runtime.runtime.hyperv.canManage
@@ -130,3 +168,11 @@ if (-not $runtime) {
     stdoutPath = $stdoutPath
     stderrPath = $stderrPath
 } | ConvertTo-Json -Compress
+if (-not [string]::IsNullOrWhiteSpace($ResultPath)) {
+    [pscustomobject]@{
+        ok = $true
+        output = $output
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -Encoding UTF8
+} else {
+    Write-Output $output
+}

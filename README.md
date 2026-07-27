@@ -2,6 +2,10 @@
 
 Relay 是一个运行在 Hyper-V 宿主机上的自建调度与管理系统，不依赖 Sites 或其他托管网页服务。它把一个长期任务拆成可排队的多轮执行：没有空闲虚拟机时自动等待；工位释放后，Codex 对话、Git 分支、提交锚点和完整历史仍然保留。用户可以在同一任务中继续追加微调，而不必重新描述上下文。
 
+Relay 同时内置持久化“系统助手”对话。任务、Worker、Git 交付、Relay 进程或网页出现异常时，系统会自动创建事故并唤醒 Ops Codex；它可以继续保留中的任务、探测或重启 Worker、控制调度器、拉起服务，并在判断为 Relay 自身缺陷时进入隔离 Git worktree 完成修复、全量验证、提交、部署与失败回滚。自动动作不提供删除数据的入口。独立 Guardian 与 Relay 相互探活和拉起，主 API 不可用时仍可从 Guardian 恢复页继续与 Emergency Codex 对话。
+
+完整权限边界、数据模型、恢复流程和部署方式见 [`docs/系统Codex与Guardian.md`](./docs/系统Codex与Guardian.md)。
+
 ## 已实现的闭环
 
 ```text
@@ -84,6 +88,7 @@ npm run typecheck    # TypeScript
 npm test             # 后端状态机测试 + 生产构建 + HTML 冒烟测试
 npm run build        # 生产构建
 npm start            # 启动生产构建与控制服务
+npm run start:guardian # 单独启动 Guardian 恢复平面
 powershell -ExecutionPolicy Bypass -File .\scripts\Restart-RelayWeb.ps1
 # 仅重启网页服务，并确保 3000 端口运行生产构建而不是 vinext dev
 ```

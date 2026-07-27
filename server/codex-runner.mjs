@@ -191,8 +191,8 @@ export class CodexRunner {
     // `--image` accepts one or more paths, so terminate option parsing before
     // appending the positional session id and prompt.
     args.push("--");
-    if (threadId) args.push(threadId, prompt);
-    else args.push(prompt);
+    if (threadId) args.push(threadId, "-");
+    else args.push("-");
 
     const consumeLines = (text) => {
       logStream.write(text);
@@ -211,6 +211,7 @@ export class CodexRunner {
       await this.processRunner(this.config.codexCommand, args, {
         cwd: workspace,
         env: this.environment(),
+        input: prompt,
         signal,
         timeoutMs: this.config.codexTimeoutMs,
         onStdout: consumeLines,
