@@ -242,6 +242,77 @@ test("checkpoint-disabled preparation starts the real VM without restoring a sna
   );
 });
 
+test("worker probing and preparation omit Skill health endpoints", async () => {
+  const calls = [];
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push({ name, args });
+    const payload =
+      name === "Get-WorkerHealth.ps1"
+        ? {
+            ready: true,
+            vm: true,
+            heartbeat: true,
+            smb: true,
+            unity: true,
+            skill: null,
+            dialogGuard: null,
+          }
+        : { ready: true };
+    return { exitCode: 0, stdout: JSON.stringify(payload), stderr: "" };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+  const workerContext = context();
+
+  await adapter.probeWorker({
+    ...workerContext.worker,
+    project: workerContext.project,
+  });
+  await adapter.prepare(workerContext, {});
+
+  const healthProbe = calls.find(
+    (call) => call.name === "Get-WorkerHealth.ps1",
+  );
+  const preparation = calls.find(
+    (call) => call.name === "Prepare-Workspace.ps1",
+  );
+  assert.ok(healthProbe);
+  assert.ok(preparation);
+  assert.equal(healthProbe.args.includes("-HealthUrl"), false);
+  assert.equal(preparation.args.includes("-UnityHealthUrl"), false);
+});
+
+test("PowerShell readiness scripts do not probe Skill or DialogGuard", () => {
+  const healthScript = fs.readFileSync(
+    new URL("../../scripts/hyperv/Get-WorkerHealth.ps1", import.meta.url),
+    "utf8",
+  );
+  const preparationScript = fs.readFileSync(
+    new URL("../../scripts/hyperv/Prepare-Workspace.ps1", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(healthScript, /Invoke-WebRequest/u);
+  assert.doesNotMatch(healthScript, /Name='UnityDialogGuard\.exe'/u);
+  assert.doesNotMatch(healthScript, /UnityDialogGuard\\control\\state\.json/u);
+  assert.match(
+    healthScript,
+    /ready = \$vmRunning -and \$heartbeat -and \$smb -and \$unity/u,
+  );
+  assert.match(healthScript, /skill = \$null/u);
+  assert.match(healthScript, /dialogGuard = \$null/u);
+
+  assert.doesNotMatch(preparationScript, /Invoke-WebRequest/u);
+  assert.doesNotMatch(
+    preparationScript,
+    /Unity health endpoint .* did not become reachable/u,
+  );
+  assert.match(preparationScript, /skillReady = \$null/u);
+});
+
 test("workspace preparation surfaces structured refusal paths from PowerShell", async () => {
   const refusal = {
     ready: false,

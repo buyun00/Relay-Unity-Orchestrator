@@ -594,10 +594,6 @@ export class HyperVAdapter {
         {
           ...this.workerArguments(worker, { requireCredential: false }),
           SharePath: worker.sharePath,
-          HealthUrl: resolveWorkerTemplate(
-            worker.project?.unityHealthUrl || worker.project?.unitySkillUrl,
-            worker,
-          ),
           TimeoutSeconds: 60,
         },
         { timeoutMs: 90_000 },
@@ -609,8 +605,8 @@ export class HyperVAdapter {
         heartbeat: false,
         smb: false,
         unity: false,
-        skill: false,
-        dialogGuard: false,
+        skill: null,
+        dialogGuard: null,
         error: error.message,
       };
     }
@@ -664,10 +660,6 @@ export class HyperVAdapter {
         GitAuthorEmail:
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
         SharePath: context.worker.sharePath || context.project.smbPath,
-        UnityHealthUrl: resolveWorkerTemplate(
-          context.project.unityHealthUrl || context.project.unitySkillUrl,
-          context.worker,
-        ),
       },
       { signal },
     );
@@ -680,10 +672,7 @@ export class HyperVAdapter {
           result.preservedCommit,
       );
     }
-    onProgress?.(
-      "unity",
-      "Guest Git branch, Unity, SMB, and Unity Skill are ready",
-    );
+    onProgress?.("unity", "Guest Git branch, Unity, and SMB are ready");
     return result;
   }
 
@@ -862,10 +851,6 @@ export class HyperVAdapter {
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
         AuditJson: JSON.stringify(audit),
         SharePath: context.worker.sharePath || context.project.smbPath,
-        UnityHealthUrl: resolveWorkerTemplate(
-          context.project.unityHealthUrl || context.project.unitySkillUrl,
-          context.worker,
-        ),
       },
       { signal, responseContract: "recovery-proof" },
     );
@@ -934,7 +919,7 @@ export class HyperVAdapter {
     if (!health.ready) {
       throw Object.assign(
         new Error(
-          `Preserved workspace is intact, but the worker is not ready: ${health.error || "Unity or Unity Skill is unavailable"}`,
+          `Preserved workspace is intact, but the worker is not ready: ${health.error || "a core worker prerequisite is unavailable"}`,
         ),
         { code: "PRESERVED_WORKSPACE_NOT_READY" },
       );
@@ -942,8 +927,8 @@ export class HyperVAdapter {
     onProgress?.(
       "unity",
       result.recoveryPrepared
-        ? "Recovered task branch, Unity, SMB, and Unity Skill are ready"
-        : "Preserved Git branch, Unity, SMB, and Unity Skill are ready",
+        ? "Recovered task branch, Unity, and SMB are ready"
+        : "Preserved Git branch, Unity, and SMB are ready",
     );
     return { ...result, preserved: true };
   }

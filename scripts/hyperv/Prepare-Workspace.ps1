@@ -11,6 +11,8 @@ param(
     [ValidateNotNullOrEmpty()][string]$GitAuthorEmail = 'relay-unity-orchestrator@localhost',
     [string]$AuditJson,
     [string]$SharePath,
+    # Retained for compatibility. Workspace preparation intentionally does not
+    # probe or wait for the Unity Skill health endpoint.
     [string]$UnityHealthUrl,
     [ValidateRange(30, 900)][int]$TimeoutSeconds = 300,
     [switch]$OutputObject
@@ -108,27 +110,15 @@ if (-not [bool]$gitResult.ready) {
 
 $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 $unityReady = $false
-$skillReady = [string]::IsNullOrWhiteSpace($UnityHealthUrl)
 do {
     $unityReady = [bool](Invoke-Command -VMName $VMName -Credential $credential -ScriptBlock {
         @(Get-Process -Name 'Unity' -ErrorAction SilentlyContinue).Count -gt 0
     })
-    $skillReady = [string]::IsNullOrWhiteSpace($UnityHealthUrl)
-    if (-not $skillReady) {
-        try {
-            $healthResponse = Invoke-WebRequest -Uri $UnityHealthUrl -Method Get -UseBasicParsing `
-                -TimeoutSec 5 -ErrorAction Stop
-            $skillReady = $healthResponse.StatusCode -ge 200 -and $healthResponse.StatusCode -lt 300
-        } catch {
-            $skillReady = $false
-        }
-    }
-    if ($unityReady -and $skillReady) { break }
+    if ($unityReady) { break }
     Start-Sleep -Seconds 3
 } while ([DateTime]::UtcNow -lt $deadline)
 
 if (-not $unityReady) { throw "Unity did not become ready inside '$VMName'." }
-if (-not $skillReady) { throw "Unity health endpoint '$UnityHealthUrl' did not become reachable from the host for '$VMName'." }
 if (-not [string]::IsNullOrWhiteSpace($SharePath) -and -not (Test-Path -LiteralPath $SharePath)) {
     throw "Host SMB workspace '$SharePath' is not reachable."
 }
@@ -173,7 +163,7 @@ $result = [pscustomobject]@{
     taskBranchCreated = $gitResult.taskBranchCreated
     currentBranch = $gitResult.currentBranch
     unityReady = $unityReady
-    skillReady = $skillReady
+    skillReady = $null
     smbReady = [string]::IsNullOrWhiteSpace($SharePath) -or (Test-Path -LiteralPath $SharePath)
 }
 if ($OutputObject) {

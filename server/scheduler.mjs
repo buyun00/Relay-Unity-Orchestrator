@@ -393,14 +393,15 @@ export class Scheduler {
         const updated = this.store.updateWorkerHealth(worker.id, health);
         const wasUnhealthy =
           ["attention", "offline"].includes(worker.status) ||
-          Object.values(worker.health || {}).includes("error");
+          ["vm", "heartbeat", "smb", "unity"].some(
+            (key) => worker.health?.[key] === "error",
+          );
         const isUnhealthy =
           health.ready === false ||
           health.vm === false ||
           health.heartbeat === false ||
           health.smb === false ||
           health.unity === false ||
-          health.skill === false ||
           ["attention", "offline"].includes(updated?.status);
         if (
           isUnhealthy &&
@@ -413,7 +414,7 @@ export class Scheduler {
             level: "error",
             message:
               health.error ||
-              `Worker ${worker.name} failed one or more health checks`,
+              `Worker ${worker.name} failed one or more core health checks`,
             data: {
               status: updated?.status,
               health,

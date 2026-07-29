@@ -23,8 +23,8 @@ export class FakeAdapter {
       heartbeat: running,
       smb: running,
       unity: running,
-      skill: running,
-      dialogGuard: running,
+      skill: null,
+      dialogGuard: null,
       adapter: "test",
     };
   }
@@ -42,7 +42,7 @@ export class FakeAdapter {
       `Checking out ${context.task.branchName} inside the guest`,
     );
     await sleep(this.config.phaseMs, signal);
-    onProgress?.("unity", "Unity and Unity Skill are ready");
+    onProgress?.("unity", "Unity is ready");
     await sleep(this.config.phaseMs, signal);
     return {
       workspace: context.worker.sharePath,

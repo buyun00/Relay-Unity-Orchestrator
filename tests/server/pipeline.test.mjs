@@ -284,6 +284,44 @@ test("priority/FIFO queue waits without a free worker, then dispatches in order"
   assert.equal(store.getWorker(worker.id).status, "ready");
 });
 
+test("Skill and DialogGuard health never block a worker or queued turn", async (t) => {
+  const { store, scheduler, project, worker, adapter } = createHarness(t, {
+    workerStatus: "offline",
+  });
+  const unhealthyEvents = [];
+  store.onEvent((event) => {
+    if (event.type === "worker.unhealthy") unhealthyEvents.push(event);
+  });
+  adapter.probeWorker = async () => ({
+    ready: true,
+    vm: true,
+    heartbeat: true,
+    smb: true,
+    unity: true,
+    skill: false,
+    dialogGuard: false,
+    error: null,
+    adapter: "test",
+  });
+
+  await scheduler.probeAll();
+
+  assert.equal(store.getWorker(worker.id).status, "ready");
+  assert.equal(unhealthyEvents.length, 0);
+
+  const created = createTask(store, project.id, {
+    title: "Auxiliary health is informational",
+    message: "Run even when Skill and DialogGuard are unavailable",
+  });
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+
+  await waitUntil(
+    () => store.getTurn(created.turn.id).status === "success",
+    "the turn to ignore auxiliary health",
+  );
+});
+
 test("verified delivery writes the OZDQP outbox from task.branchName", async (t) => {
   const { store, scheduler, project, worker } = createHarness(t, {
     repoUrl: "http://git.dominogm.com/diaoyu/ozdqp.git",

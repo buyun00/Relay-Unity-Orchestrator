@@ -1171,8 +1171,8 @@ export class Store {
           heartbeat: false,
           smb: false,
           unity: false,
-          skill: false,
-          dialogGuard: false,
+          skill: null,
+          dialogGuard: null,
         }),
         timestamp,
         timestamp,
@@ -1254,9 +1254,7 @@ export class Store {
       nextStatus =
         health.vm === false
           ? "stopped"
-          : health.ready === false ||
-              health.skill === false ||
-              health.unity === false
+          : health.ready === false || health.unity === false
             ? "offline"
             : "ready";
     }

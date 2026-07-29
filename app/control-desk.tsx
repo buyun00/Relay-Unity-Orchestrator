@@ -391,8 +391,8 @@ const phaseLabel: Record<string, string> = {
   guest_check: "检查来宾服务",
   git_prepare: "同步任务分支",
   workspace: "同步任务分支",
-  unity_prepare: "等待 Unity 与 Skill",
-  unity: "等待 Unity 与 Skill",
+  unity_prepare: "等待 Unity",
+  unity: "等待 Unity",
   codex: "Codex 执行中",
   unity_settle: "Unity 保存与刷新",
   "unity-save": "保存 Unity 资产",
@@ -607,8 +607,6 @@ function HealthStrip({
     ["heartbeat", "Heartbeat"],
     ["smb", "SMB"],
     ["unity", "Unity"],
-    ["skill", "Skill"],
-    ["dialogGuard", "Dialog Guard"],
   ];
   return (
     <div className={cx("health-strip", detailed && "health-detailed")}>
@@ -3315,8 +3313,6 @@ function WorkerInspector({
       ["heartbeat", "Heartbeat", HeartPulse],
       ["smb", "SMB 共享", HardDrive],
       ["unity", "Unity 进程", Box],
-      ["skill", "Unity Skill", Zap],
-      ["dialogGuard", "弹窗守护", ShieldCheck],
     ];
   return (
     <>
@@ -4215,8 +4211,6 @@ function ProjectEditor({
     smbPath: project?.smbPath ?? "\\\\172.30.240.11\\Work\\Project",
     unityVersion: project?.unityVersion ?? "2022.3",
     unitySkillUrl: project?.unitySkillUrl ?? "http://{internalIp}:8090/mcp",
-    unityHealthUrl:
-      project?.unityHealthUrl ?? "http://{internalIp}:8090/health",
     unitySaveUrl: project?.unitySaveUrl ?? "http://{internalIp}:8090/api/save",
     checkpointName: project?.checkpointName ?? "PROJECT_READY",
     enabled: project?.enabled ?? true,
@@ -4344,14 +4338,6 @@ function ProjectEditor({
               Codex 连接此 MCP 端点。支持 {"{internalIp}"}、{"{corporateIp}"}、
               {"{workerName}"} 占位符。
             </small>
-          </label>
-          <label className="form-field">
-            <span>Unity Skill 探活 URL</span>
-            <input
-              value={form.unityHealthUrl}
-              onChange={(event) => set("unityHealthUrl", event.target.value)}
-              placeholder="http://{internalIp}:8090/health"
-            />
           </label>
           <label className="form-field">
             <span>Unity 保存 URL</span>
