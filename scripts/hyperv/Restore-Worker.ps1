@@ -11,6 +11,7 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 Import-Module Hyper-V -ErrorAction Stop
+. (Join-Path $PSScriptRoot 'Saved-State-Recovery.ps1')
 
 $vm = Get-VM -Name $VMName -ErrorAction Stop
 $checkpoint = @(Get-VMSnapshot -VM $vm -Name $CheckpointName -ErrorAction Stop)
@@ -22,11 +23,15 @@ if ($credential -isnot [System.Management.Automation.PSCredential]) {
     throw 'CredentialPath did not contain a PSCredential exported with Export-Clixml.'
 }
 
-if ($vm.State -ne [Microsoft.HyperV.PowerShell.VMState]::Off) {
+if ($vm.State -eq [Microsoft.HyperV.PowerShell.VMState]::Saved) {
+    $null = Remove-RelayVMSavedStatePreservingStorage `
+        -VMName $VMName `
+        -Reason "Applying checkpoint '$CheckpointName' replaces the current saved state"
+} elseif ($vm.State -ne [Microsoft.HyperV.PowerShell.VMState]::Off) {
     Stop-VM -VM $vm -TurnOff -Force -Confirm:$false
 }
 Restore-VMCheckpoint -Name $CheckpointName -VMName $VMName -Confirm:$false
-Start-VM -VM $vm | Out-Null
+$startResult = Start-RelayVMWithSavedStateFallback -VMName $VMName
 
 $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 $guestReady = $false
@@ -47,6 +52,9 @@ if (-not $guestReady) {
 [pscustomobject]@{
     vmName = $VMName
     checkpointName = $CheckpointName
+    checkpointRestored = $true
     state = (Get-VM -Name $VMName).State.ToString()
     guestReady = $true
+    savedStateDiscarded = [bool]$startResult.savedStateDiscarded
+    resumeError = $startResult.resumeError
 } | ConvertTo-Json -Compress

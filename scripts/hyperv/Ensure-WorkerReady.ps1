@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 Import-Module Hyper-V -ErrorAction Stop
+. (Join-Path $PSScriptRoot 'Saved-State-Recovery.ps1')
 
 $credentialFile = [System.IO.Path]::GetFullPath($CredentialPath)
 if (-not (Test-Path -LiteralPath $credentialFile -PathType Leaf)) {
@@ -20,12 +21,7 @@ if ($credential -isnot [System.Management.Automation.PSCredential]) {
     throw 'CredentialPath did not contain a PSCredential exported with Export-Clixml.'
 }
 
-$vm = Get-VM -Name $VMName -ErrorAction Stop
-if ($vm.State -eq [Microsoft.HyperV.PowerShell.VMState]::Off) {
-    Start-VM -VM $vm -ErrorAction Stop | Out-Null
-} elseif ($vm.State -ne [Microsoft.HyperV.PowerShell.VMState]::Running) {
-    throw "VM '$VMName' is in state '$($vm.State)' and cannot be prepared automatically."
-}
+$startResult = Start-RelayVMWithSavedStateFallback -VMName $VMName
 
 $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 $guestComputerName = $null
@@ -49,4 +45,6 @@ if ([string]::IsNullOrWhiteSpace($guestComputerName)) {
     guestReady = $true
     guestComputerName = $guestComputerName.ToString().Trim()
     checkpointRestored = $false
+    savedStateDiscarded = [bool]$startResult.savedStateDiscarded
+    resumeError = $startResult.resumeError
 } | ConvertTo-Json -Compress
