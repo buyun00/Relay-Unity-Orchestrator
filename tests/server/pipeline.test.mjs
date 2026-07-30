@@ -129,6 +129,9 @@ class TrackingFakeAdapter extends FakeAdapter {
   verifyCalls = 0;
   recoveryCalls = 0;
   releaseCalls = 0;
+  auditCalls = 0;
+  deliveryRetryVerifyCalls = 0;
+  finalizeCalls = 0;
   controlCalls = [];
   codexContexts = [];
 
@@ -158,6 +161,21 @@ class TrackingFakeAdapter extends FakeAdapter {
       codexThreadId: context.task.codexThreadId,
     });
     return super.runCodex(context, ...args);
+  }
+
+  async auditDeliveryWorkspace(...args) {
+    this.auditCalls += 1;
+    return super.auditDeliveryWorkspace(...args);
+  }
+
+  async verifyDeliveryRetryWorkspace(...args) {
+    this.deliveryRetryVerifyCalls += 1;
+    return super.verifyDeliveryRetryWorkspace(...args);
+  }
+
+  async finalize(...args) {
+    this.finalizeCalls += 1;
+    return super.finalize(...args);
   }
 
   async release(...args) {
@@ -215,6 +233,35 @@ class WorkspaceRefusingFakeAdapter extends FakeAdapter {
         details,
       },
     );
+  }
+}
+
+class BlockedResultFakeAdapter extends TrackingFakeAdapter {
+  async runCodex(...args) {
+    const result = await super.runCodex(...args);
+    result.final = {
+      ...result.final,
+      status: "blocked",
+      summary: "Unity requires operator attention",
+      risks: ["Workspace must remain preserved"],
+    };
+    return result;
+  }
+}
+
+class FailFirstDeliveryFakeAdapter extends TrackingFakeAdapter {
+  shouldFailDelivery = true;
+
+  async finalize(...args) {
+    this.finalizeCalls += 1;
+    if (this.shouldFailDelivery) {
+      this.shouldFailDelivery = false;
+      throw Object.assign(
+        new Error("Transient Unity save infrastructure failure"),
+        { code: "UNITY_SAVE_FAILED" },
+      );
+    }
+    return FakeAdapter.prototype.finalize.apply(this, args);
   }
 }
 
@@ -387,6 +434,421 @@ test("push failure does not write the OZDQP outbox", async (t) => {
       .some((event) => event.type === "build.dispatch.queued"),
     false,
   );
+});
+
+test("structured blocked result preserves attention and suppresses every delivery step", async (t) => {
+  const config = createConfig();
+  const adapter = new BlockedResultFakeAdapter(config);
+  const { store, scheduler, project, worker } = createHarness(t, { adapter });
+  const created = createTask(store, project.id, {
+    title: "Blocked Codex result",
+    message: "Stop before delivery when Codex is blocked",
+  });
+
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention" &&
+      scheduler.status().activeTurns === 0,
+    "the blocked result to preserve attention",
+  );
+
+  const turn = store.getTurn(created.turn.id);
+  assert.equal(turn.errorCode, "CODEX_BLOCKED");
+  assert.equal(turn.codexFinal.status, "blocked");
+  assert.equal(adapter.auditCalls, 0);
+  assert.equal(adapter.finalizeCalls, 0);
+  assert.equal(adapter.releaseCalls, 0);
+  assert.equal(store.getBuildDispatchForTurn(created.turn.id), null);
+  assert.equal(
+    store
+      .listTaskEvents(created.task.id)
+      .some((event) =>
+        ["turn.delivery", "turn.unity-save", "turn.delivered"].includes(
+          event.type,
+        ),
+      ),
+    false,
+  );
+});
+
+test("task.retry reuses the original completed turn for exact-audit delivery only", async (t) => {
+  const config = createConfig();
+  const adapter = new FailFirstDeliveryFakeAdapter(config);
+  const { store, scheduler, project, worker } = createHarness(t, { adapter });
+  const created = createTask(store, project.id, {
+    title: "Delivery-only retry",
+    message: "Codex finishes before a transient save failure",
+  });
+
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      store.getWorker(worker.id).status === "attention" &&
+      scheduler.status().activeTurns === 0,
+    "the initial delivery failure",
+  );
+
+  const failed = store.getTurn(created.turn.id);
+  assert.equal(failed.codexFinal.status, "completed");
+  assert.equal(failed.deliveryAudit.safeForDeliveryRetry, true);
+  assert.equal(adapter.codexContexts.length, 1);
+  assert.equal(adapter.finalizeCalls, 1);
+
+  const retried = scheduler.retryTask(created.task.id, "Operator");
+  assert.equal(retried.id, created.turn.id);
+  assert.equal(retried.executionMode, "delivery_only");
+  assert.deepEqual(
+    store.listTaskTurns(created.task.id).map((turn) => turn.id),
+    [created.turn.id],
+    "delivery retry must not create a continuation turn",
+  );
+
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "the delivery-only retry",
+  );
+
+  assert.equal(adapter.codexContexts.length, 1, "Codex must not relaunch");
+  assert.equal(adapter.auditCalls, 1, "the original audit must be reused");
+  assert.equal(adapter.deliveryRetryVerifyCalls, 1);
+  assert.equal(adapter.finalizeCalls, 2);
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some(
+        (event) =>
+          event.turnId === created.turn.id &&
+          event.type === "turn.delivery-retry.queued",
+      ),
+  );
+});
+
+test("legacy completed turn uses matching final/JSONL evidence and immutable hashes without creating a continuation", async (t) => {
+  const { config, store, scheduler, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Legacy delivery retry evidence",
+  });
+  store.claimNextTurn();
+  const threadId = "019fad77-3213-7513-b665-5daf2c007987";
+  store.setTaskThread(created.task.id, threadId);
+  store.setTurnPhase(created.turn.id, "running");
+  store.failTurn(
+    created.turn.id,
+    Object.assign(new Error("Legacy Unity save failed"), {
+      code: "HYPERV_COMMAND_FAILED",
+    }),
+    { preserveWorker: true },
+  );
+
+  const final = {
+    status: "completed",
+    summary: "Legacy Codex work completed",
+    changedFiles: ["Assets/Only.cs"],
+    validation: ["Recorded validation output"],
+    risks: [],
+  };
+  const logDirectory = path.join(config.logDirectory, created.task.id);
+  fs.mkdirSync(logDirectory, { recursive: true });
+  const basename = `${created.turn.sequence}-${created.turn.id}`;
+  fs.writeFileSync(
+    path.join(logDirectory, `${basename}.final.json`),
+    JSON.stringify(final),
+  );
+  fs.writeFileSync(
+    path.join(logDirectory, `${basename}.jsonl`),
+    [
+      JSON.stringify({ type: "thread.started", thread_id: threadId }),
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "agent_message",
+          text: JSON.stringify(final),
+        },
+      }),
+      "",
+    ].join("\n"),
+  );
+  config.legacyDeliveryRetryManifests = [
+    {
+      taskId: created.task.id,
+      turnId: created.turn.id,
+      threadId,
+      workerName: worker.name,
+      branch: created.task.branchName,
+      head: "1".repeat(40),
+      files: [
+        {
+          code: " M",
+          path: "Assets/Only.cs",
+          originalPath: null,
+          gitBlob: "2".repeat(40),
+          sha256: "3".repeat(64),
+          unsafeReason: null,
+        },
+      ],
+    },
+  ];
+
+  const retried = store.retryTask(created.task.id, "Operator");
+  assert.equal(retried.id, created.turn.id);
+  assert.equal(retried.executionMode, "delivery_only");
+  assert.equal(retried.codexFinal.status, "completed");
+  assert.equal(retried.deliveryAudit.safeForDeliveryRetry, true);
+  assert.equal(store.listTaskTurns(created.task.id).length, 1);
+  const event = store
+    .listTaskEvents(created.task.id)
+    .find((candidate) => candidate.type === "turn.delivery-retry.queued");
+  assert.equal(event.data.protectedLegacyEvidence, true);
+  scheduler.start();
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
+      scheduler.status().activeTurns === 0,
+    "the legacy delivery-only retry",
+  );
+});
+
+test("delivery-only retry refuses altered recorded output without queuing or appending", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Unsafe delivery retry audit",
+  });
+  const claimed = store.claimNextTurn();
+  store.setTurnPhase(claimed.turn.id, "running");
+  const codexFinal = {
+    status: "completed",
+    summary: "Completed",
+    changedFiles: ["Assets/Only.cs"],
+    validation: ["Exact validation output"],
+    risks: [],
+  };
+  const audit = {
+    version: 1,
+    safeForDeliveryRetry: true,
+    completeFileSet: true,
+    branch: created.task.branchName,
+    head: "1".repeat(40),
+    changedFiles: ["Assets/Only.cs"],
+    validation: ["Different validation output"],
+    files: [
+      {
+        code: " M",
+        path: "Assets/Only.cs",
+        originalPath: null,
+        gitBlob: "2".repeat(40),
+        sha256: "3".repeat(64),
+        unsafeReason: null,
+      },
+    ],
+    blockedPaths: [],
+    fingerprint: "4".repeat(64),
+  };
+  store.recordCodexCompletion(created.turn.id, codexFinal);
+  store.recordDeliveryAudit(created.turn.id, audit);
+  store.failTurn(
+    created.turn.id,
+    Object.assign(new Error("Transient save failure"), {
+      code: "UNITY_SAVE_FAILED",
+    }),
+    { preserveWorker: true },
+  );
+
+  assert.throws(
+    () => store.retryTask(created.task.id, "Operator"),
+    (error) => error.code === "DELIVERY_RETRY_AUDIT_UNSAFE",
+  );
+  assert.equal(store.getTurn(created.turn.id).status, "failed");
+  assert.equal(store.getWorker(worker.id).status, "attention");
+  assert.deepEqual(
+    store.listTaskTurns(created.task.id).map((turn) => turn.id),
+    [created.turn.id],
+  );
+});
+
+test("delivery-only retry rejects every unsafe recorded audit category before queuing", async (t) => {
+  const cases = [
+    {
+      name: "branch",
+      mutate: (audit) => {
+        audit.branch = "codex/other-branch";
+      },
+    },
+    {
+      name: "complete file set",
+      mutate: (audit) => {
+        audit.changedFiles.push("Assets/Extra.cs");
+      },
+    },
+    {
+      name: "recorded validation",
+      mutate: (audit) => {
+        audit.validation = ["different validation"];
+      },
+    },
+    {
+      name: "untracked file",
+      mutate: (audit) => {
+        audit.files[0].code = "??";
+        audit.files[0].unsafeReason = "untracked";
+      },
+    },
+    {
+      name: "deleted file",
+      mutate: (audit) => {
+        audit.files[0].code = " D";
+        audit.files[0].unsafeReason = "deleted";
+      },
+    },
+    {
+      name: "renamed file",
+      mutate: (audit) => {
+        audit.files[0].code = " R";
+        audit.files[0].originalPath = "Assets/Old.cs";
+        audit.files[0].unsafeReason = "renamed-or-copied";
+      },
+    },
+    {
+      name: "extra file",
+      mutate: (audit) => {
+        audit.files.push({
+          ...audit.files[0],
+          path: "Assets/Extra.cs",
+        });
+      },
+    },
+    {
+      name: "Git blob hash",
+      mutate: (audit) => {
+        audit.files[0].gitBlob = "not-a-hash";
+      },
+    },
+    {
+      name: "SHA-256 hash",
+      mutate: (audit) => {
+        audit.files[0].sha256 = "not-a-hash";
+      },
+    },
+    {
+      name: "blocked path",
+      mutate: (audit) => {
+        audit.blockedPaths = ["Assets/Only.cs"];
+      },
+    },
+  ];
+
+  for (const current of cases) {
+    await t.test(current.name, (subtest) => {
+      const { store, project, worker } = createHarness(subtest);
+      const created = createTask(store, project.id, {
+        title: `Reject ${current.name} mismatch`,
+      });
+      store.claimNextTurn();
+      store.setTurnPhase(created.turn.id, "running");
+      const codexFinal = {
+        status: "completed",
+        summary: "Completed",
+        changedFiles: ["Assets/Only.cs"],
+        validation: ["Exact validation"],
+        risks: [],
+      };
+      const audit = {
+        version: 1,
+        safeForDeliveryRetry: true,
+        completeFileSet: true,
+        branch: created.task.branchName,
+        head: "1".repeat(40),
+        changedFiles: [...codexFinal.changedFiles],
+        validation: [...codexFinal.validation],
+        files: [
+          {
+            code: " M",
+            path: "Assets/Only.cs",
+            originalPath: null,
+            gitBlob: "2".repeat(40),
+            sha256: "3".repeat(64),
+            unsafeReason: null,
+          },
+        ],
+        blockedPaths: [],
+        fingerprint: "4".repeat(64),
+      };
+      current.mutate(audit);
+      store.recordCodexCompletion(created.turn.id, codexFinal);
+      store.recordDeliveryAudit(created.turn.id, audit);
+      store.failTurn(
+        created.turn.id,
+        Object.assign(new Error("Transient delivery failure"), {
+          code: "UNITY_SAVE_FAILED",
+        }),
+        { preserveWorker: true },
+      );
+
+      assert.throws(
+        () => store.retryTask(created.task.id, "Operator"),
+        (error) => error.code === "DELIVERY_RETRY_AUDIT_UNSAFE",
+      );
+      assert.equal(store.getTurn(created.turn.id).status, "failed");
+      assert.equal(store.getWorker(worker.id).status, "attention");
+      assert.equal(store.listTaskTurns(created.task.id).length, 1);
+    });
+  }
+});
+
+test("delivery-only retry rejects valid-looking HEAD and content-hash drift before finalize", async (t) => {
+  for (const field of ["head", "hash"]) {
+    await t.test(field, async (subtest) => {
+      const config = createConfig();
+      const adapter = new FailFirstDeliveryFakeAdapter(config);
+      const { store, scheduler, project, worker } = createHarness(subtest, {
+        adapter,
+      });
+      const created = createTask(store, project.id, {
+        title: `Reject ${field} drift`,
+      });
+      scheduler.start();
+      scheduler.notifyQueueChanged();
+      await waitUntil(
+        () =>
+          store.getTurn(created.turn.id).status === "failed" &&
+          scheduler.status().activeTurns === 0,
+        "the initial delivery failure",
+      );
+      const audit = store.getTurn(created.turn.id).deliveryAudit;
+      if (field === "head") audit.head = "9".repeat(40);
+      else audit.files[0].sha256 = "9".repeat(64);
+      store.db
+        .prepare("UPDATE turns SET delivery_audit_json=? WHERE id=?")
+        .run(JSON.stringify(audit), created.turn.id);
+
+      const retried = scheduler.retryTask(created.task.id, "Operator");
+      assert.equal(retried.id, created.turn.id);
+      await waitUntil(
+        () =>
+          store.getTurn(created.turn.id).status === "failed" &&
+          scheduler.status().activeTurns === 0,
+        `the ${field} mismatch refusal`,
+      );
+
+      assert.equal(
+        store.getTurn(created.turn.id).errorCode,
+        "DELIVERY_RETRY_AUDIT_MISMATCH",
+      );
+      assert.equal(store.getWorker(worker.id).status, "attention");
+      assert.equal(adapter.codexContexts.length, 1);
+      assert.equal(adapter.finalizeCalls, 1);
+      assert.equal(store.listTaskTurns(created.task.id).length, 1);
+    });
+  }
 });
 
 test("a queued turn automatically starts a stopped compatible worker", async (t) => {

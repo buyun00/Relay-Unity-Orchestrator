@@ -1118,6 +1118,54 @@ test("workspace preparation and finalization receive a repository-local Git iden
   }
 });
 
+test("Unity save receives only an explicit guest-loopback request URL instead of the corporate authority", async () => {
+  const calls = [];
+  const deliveredSha = "8".repeat(40);
+  const processRunner = async (command, args) => {
+    calls.push({ script: scriptName(args), args });
+    if (scriptName(args) === "Finalize-Workspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          commitSha: deliveredSha,
+          remoteSha: deliveredSha,
+          pushed: true,
+          verified: true,
+        }),
+        stderr: "",
+      };
+    }
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({ saved: true }),
+      stderr: "",
+    };
+  };
+  const adapter = new HyperVAdapter(
+    config({
+      allowUnitySaveSkip: false,
+      unityGuestLocalEndpoint: "http://127.0.0.1:8090",
+    }),
+    { processRunner, codex: { inspect: async () => ({}) } },
+  );
+  const deliveryContext = context();
+  deliveryContext.worker.corporateIp = "10.100.3.44";
+  deliveryContext.project.unitySaveUrl =
+    "http://{corporateIp}:8090/skill/editor_execute_menu";
+
+  await adapter.finalize(deliveryContext, {});
+
+  const save = calls.find((call) => call.script === "Save-UnityProject.ps1");
+  assert.ok(save);
+  const configuredIndex = save.args.indexOf("-UnitySaveUrl");
+  const guestIndex = save.args.indexOf("-GuestUnitySkillsEndpoint");
+  assert.equal(
+    save.args[configuredIndex + 1],
+    "http://127.0.0.1:8090/skill/editor_execute_menu",
+  );
+  assert.equal(save.args[guestIndex + 1], "http://127.0.0.1:8090");
+});
+
 test("Codex preflight uses the configured executable and persistent CODEX_HOME", async () => {
   const calls = [];
   const runtimeDirectory = fs.mkdtempSync(

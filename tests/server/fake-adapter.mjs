@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { id, shortSha, sleep } from "../../server/util.mjs";
 
 function fakeFailure(message, phase) {
@@ -137,6 +138,97 @@ export class FakeAdapter {
       jsonlPath: null,
       finalPath: null,
     };
+  }
+
+  async auditDeliveryWorkspace(context, codexFinal, { onProgress } = {}) {
+    onProgress?.(
+      "delivery-audit",
+      "Recording fake exact delivery audit without mutation",
+    );
+    const changedFiles = [...(codexFinal?.changedFiles || [])];
+    const validation = [...(codexFinal?.validation || [])];
+    const audit = {
+      version: 1,
+      ready: true,
+      exact: true,
+      safeForDeliveryRetry: true,
+      completeFileSet: true,
+      branch: context.task.branchName,
+      head: "1".repeat(40),
+      changedFiles,
+      validation,
+      files: changedFiles.map((path, index) => ({
+        code: " M",
+        path,
+        originalPath: null,
+        gitBlob: String(index + 2)
+          .repeat(40)
+          .slice(0, 40),
+        sha256: String(index + 3)
+          .repeat(64)
+          .slice(0, 64),
+        unsafeReason: null,
+      })),
+      blockedPaths: [],
+      message: "Recorded fake exact delivery audit",
+    };
+    const records = audit.files
+      .map(
+        (file) =>
+          `${file.code}\0${file.originalPath || ""}\0${file.path}\0${file.gitBlob}\0${file.sha256}`,
+      )
+      .sort();
+    const payload = [
+      "relay-delivery-audit-v1",
+      audit.branch,
+      audit.head,
+      [...audit.changedFiles].sort().join("\0"),
+      audit.validation.join("\0"),
+      records.join("\0"),
+    ].join("\0");
+    audit.fingerprint = createHash("sha256")
+      .update(payload, "utf8")
+      .digest("hex");
+    return audit;
+  }
+
+  async verifyDeliveryRetryWorkspace(
+    context,
+    expectedAudit,
+    { onProgress } = {},
+  ) {
+    onProgress?.(
+      "delivery-retry-audit",
+      "Verified fake preserved output without mutation",
+    );
+    const currentAudit =
+      await FakeAdapter.prototype.auditDeliveryWorkspace.call(
+        this,
+        context,
+        context.turn.codexFinal,
+      );
+    const exactFields = [
+      "branch",
+      "head",
+      "changedFiles",
+      "validation",
+      "files",
+      "blockedPaths",
+      "fingerprint",
+    ];
+    if (
+      expectedAudit?.safeForDeliveryRetry !== true ||
+      exactFields.some(
+        (field) =>
+          JSON.stringify(expectedAudit?.[field]) !==
+          JSON.stringify(currentAudit[field]),
+      )
+    ) {
+      throw Object.assign(new Error("Fake delivery audit mismatch"), {
+        code: "DELIVERY_RETRY_AUDIT_MISMATCH",
+      });
+    }
+    return { ...expectedAudit, ready: true, exact: true };
   }
 
   async finalize(context, { signal, onProgress }) {

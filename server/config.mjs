@@ -71,6 +71,9 @@ export const config = Object.freeze({
     process.env.PIPELINE_ALLOW_UNITY_SAVE_SKIP,
     false,
   ),
+  unityGuestLocalEndpoint:
+    process.env.PIPELINE_UNITY_GUEST_LOCAL_ENDPOINT?.trim() ||
+    "http://127.0.0.1:8090",
   codexCommand: process.env.PIPELINE_CODEX_COMMAND || "codex",
   codexHome: process.env.CODEX_HOME?.trim() || null,
   codexModel: process.env.PIPELINE_CODEX_MODEL?.trim() || DEFAULT_CODEX_MODEL,

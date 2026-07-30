@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   asBoolean,
@@ -29,10 +31,177 @@ const EXECUTING_TURN_STATUSES = [
   "cancel_requested",
 ];
 
+const PROTECTED_LEGACY_DELIVERY_RETRIES = [
+  {
+    taskId: "task-0c378492-19ee-45be-8397-ff85af8cdf1d",
+    turnId: "turn-85d5b579-2f9f-4c18-b5fc-be11c940cac4",
+    threadId: "019fad77-3213-7513-b665-5daf2c007987",
+    workerName: "lin-worker-01",
+    branch: "codex/task-0019-hall-3-empty-top-left-gifts-grid",
+    head: "35a58db626a789df10b98cdf4a554ff029ab37df",
+    files: [
+      {
+        code: " M",
+        path: "baloot_client/Assets/AppAssets/hall/scripts/Systems/Hall/View/GiftPackEntryBar.cs",
+        originalPath: null,
+        gitBlob: "c70ac045e25981f17e42f5ed73dcb7fe0010bc19",
+        sha256:
+          "b26b9b9a3d718cd6e1be171dc0eb3498a0834587f82953f9324c21c49b72c3f0",
+        unsafeReason: null,
+      },
+    ],
+  },
+];
+
 function sourceEventKey(value) {
   if (value == null) return null;
   const normalized = String(value).trim();
   return normalized || null;
+}
+
+function stringArray(value) {
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+function exactJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function deliveryAuditFingerprint({
+  branch,
+  head,
+  changedFiles,
+  validation,
+  files,
+}) {
+  const records = files
+    .map(
+      (file) =>
+        `${file.code}\0${file.originalPath || ""}\0${file.path}\0${file.gitBlob.toLowerCase()}\0${file.sha256.toLowerCase()}`,
+    )
+    .sort();
+  const payload = [
+    "relay-delivery-audit-v1",
+    branch,
+    head.toLowerCase(),
+    [...changedFiles].sort().join("\0"),
+    validation.join("\0"),
+    records.join("\0"),
+  ].join("\0");
+  return createHash("sha256").update(payload, "utf8").digest("hex");
+}
+
+function parseLegacyCodexJsonl(jsonlPath) {
+  let threadId = null;
+  let final = null;
+  const content = fs.readFileSync(jsonlPath, "utf8");
+  for (const line of content.split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    const event = parseJson(line, null);
+    if (!event) continue;
+    if (event.type === "thread.started") {
+      threadId =
+        event.thread_id || event.threadId || event.thread?.id || threadId;
+    }
+    if (
+      event.type === "item.completed" &&
+      event.item?.type === "agent_message"
+    ) {
+      const text =
+        typeof event.item.text === "string"
+          ? event.item.text
+          : typeof event.item.message === "string"
+            ? event.item.message
+            : "";
+      const candidate = parseJson(text.trim(), null);
+      if (candidate && typeof candidate === "object") final = candidate;
+    }
+  }
+  return { threadId, final };
+}
+
+function legacyDeliveryRetryEvidence(config, task, turn, worker) {
+  const manifests = [
+    ...PROTECTED_LEGACY_DELIVERY_RETRIES,
+    ...(Array.isArray(config.legacyDeliveryRetryManifests)
+      ? config.legacyDeliveryRetryManifests
+      : []),
+  ];
+  const manifest = manifests.find(
+    (candidate) => candidate.taskId === task.id && candidate.turnId === turn.id,
+  );
+  if (!manifest) return null;
+  const refusal = (message) => {
+    throw new HttpError(
+      409,
+      "DELIVERY_RETRY_LEGACY_EVIDENCE_MISMATCH",
+      message,
+    );
+  };
+  if (
+    task.branchName !== manifest.branch ||
+    task.codexThreadId !== manifest.threadId ||
+    worker?.name !== manifest.workerName ||
+    turn.workerId !== worker?.id
+  ) {
+    refusal(
+      "The protected legacy turn no longer matches its recorded task branch, Codex thread, or attention worker",
+    );
+  }
+  const basename = `${turn.sequence}-${turn.id}`;
+  const logDirectory = path.join(config.logDirectory, task.id);
+  const finalPath = path.join(logDirectory, `${basename}.final.json`);
+  const jsonlPath = path.join(logDirectory, `${basename}.jsonl`);
+  if (
+    !fs.existsSync(finalPath) ||
+    !fs.statSync(finalPath).isFile() ||
+    !fs.existsSync(jsonlPath) ||
+    !fs.statSync(jsonlPath).isFile()
+  ) {
+    refusal(
+      "The protected legacy turn is missing its original final or JSONL Codex log",
+    );
+  }
+  const final = parseJson(fs.readFileSync(finalPath, "utf8").trim(), null);
+  const jsonl = parseLegacyCodexJsonl(jsonlPath);
+  if (
+    final?.status !== "completed" ||
+    jsonl.threadId !== manifest.threadId ||
+    !exactJson(final, jsonl.final)
+  ) {
+    refusal(
+      "The protected legacy turn final output does not exactly match its JSONL record and durable Codex thread",
+    );
+  }
+  const changedFiles = stringArray(final.changedFiles);
+  const validation = stringArray(final.validation);
+  const manifestPaths = manifest.files.map((file) => file.path);
+  if (
+    changedFiles.length !== manifestPaths.length ||
+    !exactJson([...changedFiles].sort(), [...manifestPaths].sort()) ||
+    !Array.isArray(final.validation)
+  ) {
+    refusal(
+      "The protected legacy turn final output does not match its immutable complete file set or recorded validation output",
+    );
+  }
+  const audit = {
+    version: 1,
+    ready: true,
+    exact: true,
+    safeForDeliveryRetry: true,
+    completeFileSet: true,
+    branch: manifest.branch,
+    head: manifest.head,
+    changedFiles,
+    validation,
+    files: manifest.files.map((file) => ({ ...file })),
+    blockedPaths: [],
+    message:
+      "Recovered exact delivery-only evidence from the protected turn final/JSONL logs and immutable workspace manifest",
+  };
+  audit.fingerprint = deliveryAuditFingerprint(audit);
+  return { final, audit, protectedLegacyEvidence: true };
 }
 
 const PROJECT_FIELDS = {
@@ -163,6 +332,8 @@ function turnFromRow(row) {
     workerId: row.worker_id,
     codexFinal: result,
     result,
+    executionMode: row.execution_mode || "full",
+    deliveryAudit: parseJson(row.delivery_audit_json, null),
     commitSha: row.commit_sha,
     errorCode: row.error_code,
     errorMessage: row.error_message,
@@ -479,6 +650,8 @@ export class Store {
         priority INTEGER NOT NULL DEFAULT 0,
         worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
         codex_final_json TEXT,
+        execution_mode TEXT NOT NULL DEFAULT 'full',
+        delivery_audit_json TEXT,
         commit_sha TEXT,
         error_code TEXT,
         error_message TEXT,
@@ -750,6 +923,14 @@ export class Store {
       this.db.exec(
         "ALTER TABLE turns ADD COLUMN author_name TEXT NOT NULL DEFAULT '未记录用户'",
       );
+    }
+    if (!turnColumns.some((column) => column.name === "execution_mode")) {
+      this.db.exec(
+        "ALTER TABLE turns ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'full'",
+      );
+    }
+    if (!turnColumns.some((column) => column.name === "delivery_audit_json")) {
+      this.db.exec("ALTER TABLE turns ADD COLUMN delivery_audit_json TEXT");
     }
     const eventColumns = this.db.prepare("PRAGMA table_info(events)").all();
     if (!eventColumns.some((column) => column.name === "actor_name")) {
@@ -1701,7 +1882,11 @@ export class Store {
           .run(timestamp, candidate.task_id);
         return {
           ...this.getExecutionContext(candidate.id),
-          resumePreservedWorkspace: resumesPreservedWorkspace,
+          resumePreservedWorkspace:
+            resumesPreservedWorkspace &&
+            (candidate.execution_mode || "full") !== "delivery_only",
+          deliveryOnlyRetry:
+            (candidate.execution_mode || "full") === "delivery_only",
         };
       }
       return null;
@@ -1756,6 +1941,69 @@ export class Store {
     `,
       )
       .run(threadId, now(), taskId);
+  }
+
+  recordCodexCompletion(turnId, codexFinal) {
+    const turn = this.getTurn(turnId);
+    if (!turn) return null;
+    const timestamp = now();
+    let event;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          "UPDATE turns SET codex_final_json=? WHERE id=? AND status IN ('running','saving')",
+        )
+        .run(stringifyJson(codexFinal), turnId);
+      event = this.insertEvent({
+        taskId: turn.taskId,
+        turnId,
+        workerId: turn.workerId,
+        type: "turn.codex.completed",
+        phase: "codex",
+        message: `Codex returned structured status '${codexFinal?.status || "unknown"}'`,
+        data: {
+          status: codexFinal?.status || null,
+          changedFiles: Array.isArray(codexFinal?.changedFiles)
+            ? codexFinal.changedFiles.map(String)
+            : [],
+          validation: Array.isArray(codexFinal?.validation)
+            ? codexFinal.validation.map(String)
+            : [],
+        },
+      });
+      this.db
+        .prepare("UPDATE tasks SET updated_at=? WHERE id=?")
+        .run(timestamp, turn.taskId);
+    });
+    this.notifyEvent(event);
+    return this.getTurn(turnId);
+  }
+
+  recordDeliveryAudit(turnId, audit) {
+    const turn = this.getTurn(turnId);
+    if (!turn) return null;
+    let event;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          "UPDATE turns SET delivery_audit_json=? WHERE id=? AND status IN ('running','saving')",
+        )
+        .run(stringifyJson(audit), turnId);
+      event = this.insertEvent({
+        taskId: turn.taskId,
+        turnId,
+        workerId: turn.workerId,
+        type: "turn.delivery-audit.recorded",
+        phase: "delivery-audit",
+        level: audit?.safeForDeliveryRetry === true ? "info" : "warning",
+        message:
+          audit?.message ||
+          "Recorded the exact post-Codex workspace state before delivery",
+        data: audit,
+      });
+    });
+    this.notifyEvent(event);
+    return this.getTurn(turnId);
   }
 
   completeTurn(turnId, { codexFinal, commitSha, delivery = null }) {
@@ -2266,6 +2514,163 @@ export class Store {
         "NOT_RETRYABLE",
         "Only failed, cancelled, or interrupted turns can be retried",
       );
+    }
+    const worker = latest.worker_id ? this.getWorker(latest.worker_id) : null;
+    let codexFinal = parseJson(latest.codex_final_json, null);
+    let audit = parseJson(latest.delivery_audit_json, null);
+    let protectedLegacyEvidence = false;
+    if (!codexFinal || !audit) {
+      const legacy = legacyDeliveryRetryEvidence(
+        this.config,
+        task,
+        turnFromRow(latest),
+        worker,
+      );
+      if (legacy) {
+        if (
+          (codexFinal && !exactJson(codexFinal, legacy.final)) ||
+          (audit && !exactJson(audit, legacy.audit))
+        ) {
+          throw new HttpError(
+            409,
+            "DELIVERY_RETRY_LEGACY_EVIDENCE_MISMATCH",
+            "Persisted turn data conflicts with the protected legacy final/JSONL evidence",
+          );
+        }
+        codexFinal = legacy.final;
+        audit = legacy.audit;
+        protectedLegacyEvidence = true;
+      }
+    }
+    if (codexFinal?.status === "completed") {
+      const changedFiles = Array.isArray(codexFinal.changedFiles)
+        ? codexFinal.changedFiles.map(String)
+        : [];
+      const validation = Array.isArray(codexFinal.validation)
+        ? codexFinal.validation.map(String)
+        : [];
+      const recordedChangedFiles = Array.isArray(audit?.changedFiles)
+        ? audit.changedFiles.map(String)
+        : null;
+      const recordedValidation = Array.isArray(audit?.validation)
+        ? audit.validation.map(String)
+        : null;
+      const files = Array.isArray(audit?.files) ? audit.files : null;
+      const exactFileSet =
+        files &&
+        recordedChangedFiles &&
+        files.length === recordedChangedFiles.length &&
+        JSON.stringify(
+          files
+            .map((file) => String(file?.path || ""))
+            .sort((left, right) => left.localeCompare(right)),
+        ) ===
+          JSON.stringify(
+            [...recordedChangedFiles].sort((left, right) =>
+              left.localeCompare(right),
+            ),
+          );
+      const exactHashes =
+        files &&
+        files.every(
+          (file) =>
+            typeof file?.gitBlob === "string" &&
+            /^[0-9a-f]{40,64}$/u.test(file.gitBlob) &&
+            typeof file?.sha256 === "string" &&
+            /^[0-9a-f]{64}$/u.test(file.sha256),
+        );
+      const safeStatuses =
+        files &&
+        files.every(
+          (file) =>
+            typeof file?.code === "string" &&
+            /^[ MA]{2}$/u.test(file.code) &&
+            /[MA]/u.test(file.code) &&
+            file.originalPath == null &&
+            file.unsafeReason == null,
+        );
+      const recordedOutputMatches =
+        recordedChangedFiles &&
+        recordedValidation &&
+        JSON.stringify(changedFiles) === JSON.stringify(recordedChangedFiles) &&
+        JSON.stringify(validation) === JSON.stringify(recordedValidation);
+      const auditIsExact =
+        audit?.version === 1 &&
+        audit?.safeForDeliveryRetry === true &&
+        audit?.completeFileSet === true &&
+        audit?.branch === task.branchName &&
+        typeof audit?.head === "string" &&
+        /^[0-9a-f]{40,64}$/u.test(audit.head) &&
+        typeof audit?.fingerprint === "string" &&
+        /^[0-9a-f]{64}$/u.test(audit.fingerprint) &&
+        Array.isArray(audit?.blockedPaths) &&
+        audit.blockedPaths.length === 0 &&
+        exactFileSet &&
+        exactHashes &&
+        safeStatuses &&
+        recordedOutputMatches;
+      if (!auditIsExact) {
+        throw new HttpError(
+          409,
+          "DELIVERY_RETRY_AUDIT_UNSAFE",
+          "Codex already completed, but the recorded delivery audit is missing or no longer proves the exact safe file set, hashes, statuses, and validation output",
+        );
+      }
+      if (
+        !worker ||
+        worker.status !== "attention" ||
+        worker.currentTurnId != null
+      ) {
+        throw new HttpError(
+          409,
+          "DELIVERY_RETRY_WORKER_NOT_PRESERVED",
+          "Delivery-only retry requires the original preserved attention worker",
+        );
+      }
+      const timestamp = now();
+      let event;
+      this.transaction(() => {
+        const updated = this.db
+          .prepare(
+            `UPDATE turns
+             SET status='queued', execution_mode='delivery_only',
+               codex_final_json=?, delivery_audit_json=?,
+               error_code=NULL, error_message=NULL, finished_at=NULL
+             WHERE id=? AND status IN ('failed','interrupted')`,
+          )
+          .run(stringifyJson(codexFinal), stringifyJson(audit), latest.id);
+        if (!updated.changes) {
+          throw new HttpError(
+            409,
+            "DELIVERY_RETRY_STATE_CHANGED",
+            "The original completed turn changed while delivery retry was being queued",
+          );
+        }
+        this.db
+          .prepare(
+            "UPDATE tasks SET status='queued', closed_at=NULL, updated_at=? WHERE id=?",
+          )
+          .run(timestamp, taskId);
+        event = this.insertEvent({
+          taskId,
+          turnId: latest.id,
+          workerId: latest.worker_id,
+          actorName,
+          type: "turn.delivery-retry.queued",
+          phase: "delivery-retry",
+          message:
+            "Queued delivery-only retry on the original completed Codex turn; Codex will not be launched",
+          data: {
+            executionMode: "delivery_only",
+            auditFingerprint: audit.fingerprint,
+            branch: audit.branch,
+            head: audit.head,
+            protectedLegacyEvidence,
+          },
+        });
+      });
+      this.notifyEvent(event);
+      return this.getTurn(latest.id);
     }
     return this.appendTurn(taskId, {
       message: latest.user_message,

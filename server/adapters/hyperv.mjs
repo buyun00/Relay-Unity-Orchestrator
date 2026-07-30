@@ -50,6 +50,48 @@ function parseJsonRecord(text) {
   }
 }
 
+function codexStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item));
+}
+
+function guestLocalUnitySaveUrl(configuredSaveUrl, guestEndpoint) {
+  let configured;
+  let guest;
+  try {
+    configured = new URL(configuredSaveUrl);
+    guest = new URL(guestEndpoint);
+  } catch (error) {
+    throw Object.assign(
+      new Error(
+        `Unity save endpoint configuration is invalid: ${error.message}`,
+      ),
+      { code: "UNITY_SAVE_ENDPOINT_INVALID" },
+    );
+  }
+  const hostname = guest.hostname.toLowerCase();
+  if (
+    !["http:", "https:"].includes(guest.protocol) ||
+    !["127.0.0.1", "[::1]", "localhost"].includes(hostname) ||
+    guest.username ||
+    guest.password
+  ) {
+    throw Object.assign(
+      new Error(
+        `Guest UnitySkills endpoint '${guestEndpoint}' must use an HTTP loopback address without user information`,
+      ),
+      { code: "UNITY_SAVE_ENDPOINT_NOT_LOOPBACK" },
+    );
+  }
+  if (guest.pathname === "/" && configured.pathname !== "/") {
+    guest.pathname = configured.pathname;
+  }
+  if (!guest.search && configured.search) {
+    guest.search = configured.search;
+  }
+  return guest.href;
+}
+
 function parseWorkspaceRefusal(error) {
   for (const text of [error?.stderr, error?.stdout, error?.message]) {
     if (!text) continue;
@@ -961,12 +1003,104 @@ export class HyperVAdapter {
     return this.codex.run(context, options);
   }
 
+  async auditDeliveryWorkspace(
+    context,
+    codexFinal,
+    { signal, onProgress } = {},
+  ) {
+    onProgress?.(
+      "delivery-audit",
+      "Recording the exact branch, HEAD, file set, hashes, and validation output before delivery",
+    );
+    const result = await this.powershell(
+      "Get-DeliveryWorkspaceAudit.ps1",
+      {
+        ...this.workerArguments(context.worker),
+        GuestProjectPath: required(
+          context.project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+        TaskBranch: required(context.task.branchName, "task.branchName"),
+        ChangedFilesJson: JSON.stringify(
+          codexStringArray(codexFinal?.changedFiles),
+        ),
+        ValidationJson: JSON.stringify(
+          codexStringArray(codexFinal?.validation),
+        ),
+      },
+      { signal, timeoutMs: 120_000 },
+    );
+    if (result?.ready !== true) {
+      throw Object.assign(
+        new Error(
+          result?.message ||
+            "The post-Codex workspace could not be recorded for safe delivery",
+        ),
+        {
+          code: result?.code || "DELIVERY_AUDIT_FAILED",
+          blockedPaths: Array.isArray(result?.blockedPaths)
+            ? result.blockedPaths.map(String)
+            : [],
+          details: result,
+        },
+      );
+    }
+    return result;
+  }
+
+  async verifyDeliveryRetryWorkspace(
+    context,
+    expectedAudit,
+    { signal, onProgress } = {},
+  ) {
+    onProgress?.(
+      "delivery-retry-audit",
+      "Verifying preserved output against the exact recorded delivery audit without mutation",
+    );
+    const result = await this.powershell(
+      "Get-DeliveryWorkspaceAudit.ps1",
+      {
+        ...this.workerArguments(context.worker),
+        GuestProjectPath: required(
+          context.project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+        TaskBranch: required(context.task.branchName, "task.branchName"),
+        ExpectedHead: required(expectedAudit?.head, "deliveryAudit.head"),
+        ChangedFilesJson: JSON.stringify(
+          codexStringArray(context.turn.codexFinal?.changedFiles),
+        ),
+        ValidationJson: JSON.stringify(
+          codexStringArray(context.turn.codexFinal?.validation),
+        ),
+        ExpectedAuditJson: JSON.stringify(expectedAudit),
+      },
+      { signal, timeoutMs: 120_000 },
+    );
+    if (result?.ready !== true || result?.exact !== true) {
+      throw Object.assign(
+        new Error(
+          result?.message ||
+            "Preserved output did not match the recorded delivery audit",
+        ),
+        {
+          code: result?.code || "DELIVERY_RETRY_AUDIT_MISMATCH",
+          blockedPaths: Array.isArray(result?.blockedPaths)
+            ? result.blockedPaths.map(String)
+            : [],
+          details: result,
+        },
+      );
+    }
+    return result;
+  }
+
   async finalize(context, { signal, onProgress }) {
-    const unitySaveUrl = resolveWorkerTemplate(
+    const configuredUnitySaveUrl = resolveWorkerTemplate(
       context.project.unitySaveUrl,
       context.worker,
     );
-    if (!unitySaveUrl && !this.config.allowUnitySaveSkip) {
+    if (!configuredUnitySaveUrl && !this.config.allowUnitySaveSkip) {
       throw Object.assign(
         new Error(
           "unitySaveUrl is required before a Hyper-V worker can be released",
@@ -976,13 +1110,20 @@ export class HyperVAdapter {
         },
       );
     }
-    if (unitySaveUrl) {
+    if (configuredUnitySaveUrl) {
+      const guestUnitySkillsEndpoint =
+        this.config.unityGuestLocalEndpoint || "http://127.0.0.1:8090";
+      const unitySaveUrl = guestLocalUnitySaveUrl(
+        configuredUnitySaveUrl,
+        guestUnitySkillsEndpoint,
+      );
       onProgress?.("unity-save", "Saving all Unity assets through Unity Skill");
       await this.powershell(
         "Save-UnityProject.ps1",
         {
           ...this.workerArguments(context.worker),
           UnitySaveUrl: unitySaveUrl,
+          GuestUnitySkillsEndpoint: guestUnitySkillsEndpoint,
         },
         { signal, timeoutMs: 120_000 },
       );

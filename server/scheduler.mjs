@@ -186,87 +186,154 @@ export class Scheduler {
   async execute(context, controller) {
     const signal = controller.signal;
     try {
-      if (context.resumePreservedWorkspace) {
+      let codexFinal;
+      if (context.deliveryOnlyRetry) {
+        codexFinal = context.turn.codexFinal;
+        if (
+          codexFinal?.status !== "completed" ||
+          context.turn.deliveryAudit?.safeForDeliveryRetry !== true
+        ) {
+          throw Object.assign(
+            new Error(
+              "Delivery-only retry refused because the original completed result or exact audit is missing",
+            ),
+            { code: "DELIVERY_RETRY_AUDIT_UNSAFE" },
+          );
+        }
         this.emitProgress(
           context,
-          "resume",
-          `Inspecting preserved workspace on ${context.worker.name} without checkpoint restore, worker restart, or Git reset`,
+          "delivery-retry",
+          `Reusing completed turn ${context.turn.id}; Codex will not be launched`,
+          "warning",
+          {
+            executionMode: "delivery_only",
+            auditFingerprint: context.turn.deliveryAudit.fingerprint,
+          },
         );
-        await this.adapter.resumePreserved?.(context, {
-          signal,
-          onProgress: (phase, message, data = null) =>
-            this.emitProgress(context, phase, message, "info", data),
-        });
+        await this.adapter.verifyDeliveryRetryWorkspace(
+          context,
+          context.turn.deliveryAudit,
+          {
+            signal,
+            onProgress: (phase, message, data = null) =>
+              this.emitProgress(context, phase, message, "info", data),
+          },
+        );
       } else {
+        if (context.resumePreservedWorkspace) {
+          this.emitProgress(
+            context,
+            "resume",
+            `Inspecting preserved workspace on ${context.worker.name} without checkpoint restore, worker restart, or Git reset`,
+          );
+          await this.adapter.resumePreserved?.(context, {
+            signal,
+            onProgress: (phase, message, data = null) =>
+              this.emitProgress(context, phase, message, "info", data),
+          });
+        } else {
+          this.emitProgress(
+            context,
+            "prepare",
+            `Worker ${context.worker.name} reserved for turn ${context.turn.sequence}`,
+          );
+          await this.adapter.prepare(context, {
+            signal,
+            onProgress: (phase, message, data = null) =>
+              this.emitProgress(context, phase, message, "info", data),
+          });
+        }
         this.emitProgress(
           context,
-          "prepare",
-          `Worker ${context.worker.name} reserved for turn ${context.turn.sequence}`,
+          "workspace-established",
+          `Task workspace ${context.task.branchName} is established and verified`,
+          "info",
+          { branchName: context.task.branchName },
         );
-        await this.adapter.prepare(context, {
-          signal,
-          onProgress: (phase, message, data = null) =>
-            this.emitProgress(context, phase, message, "info", data),
-        });
-      }
-      this.emitProgress(
-        context,
-        "workspace-established",
-        `Task workspace ${context.task.branchName} is established and verified`,
-        "info",
-        { branchName: context.task.branchName },
-      );
-      if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
+        if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
 
-      this.store.setTurnPhase(context.turn.id, "running");
-      this.emitProgress(
-        context,
-        "codex",
-        context.task.codexThreadId
-          ? `Resuming Codex conversation ${context.task.codexThreadId}`
-          : "Starting a persistent Codex conversation",
-      );
-      const codexResult = await this.adapter.runCodex(context, {
-        signal,
-        onEvent: (event) => {
-          const threadId = threadIdFromEvent(event);
-          if (threadId) this.store.setTaskThread(context.task.id, threadId);
-          const type = event?.type || "codex.event";
-          const agentMessage = codexAgentMessage(event);
-          if (agentMessage) {
-            this.store.emit({
-              taskId: context.task.id,
-              turnId: context.turn.id,
-              workerId: context.worker.id,
-              type: "codex.agent_message",
-              phase: "codex",
-              level: "info",
-              message: agentMessage.text.slice(0, 100_000),
-              data: {
-                eventType: type,
-                itemId: agentMessage.itemId,
-                itemType: "agent_message",
-              },
-            });
-            return;
-          }
-          const noisy = ["item.updated", "turn.updated"].includes(type);
-          if (!noisy) {
-            this.store.emit({
-              taskId: context.task.id,
-              turnId: context.turn.id,
-              workerId: context.worker.id,
-              type: `codex.${type}`,
-              phase: "codex",
-              level: type === "codex.stderr" ? "warning" : "info",
-              message: codexMessage(event).slice(0, 2_000),
-              data: { eventType: type },
-            });
-          }
-        },
-      });
-      this.store.setTaskThread(context.task.id, codexResult.threadId);
-      if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
+        this.store.setTurnPhase(context.turn.id, "running");
+        this.emitProgress(
+          context,
+          "codex",
+          context.task.codexThreadId
+            ? `Resuming Codex conversation ${context.task.codexThreadId}`
+            : "Starting a persistent Codex conversation",
+        );
+        const codexResult = await this.adapter.runCodex(context, {
+          signal,
+          onEvent: (event) => {
+            const threadId = threadIdFromEvent(event);
+            if (threadId) this.store.setTaskThread(context.task.id, threadId);
+            const type = event?.type || "codex.event";
+            const agentMessage = codexAgentMessage(event);
+            if (agentMessage) {
+              this.store.emit({
+                taskId: context.task.id,
+                turnId: context.turn.id,
+                workerId: context.worker.id,
+                type: "codex.agent_message",
+                phase: "codex",
+                level: "info",
+                message: agentMessage.text.slice(0, 100_000),
+                data: {
+                  eventType: type,
+                  itemId: agentMessage.itemId,
+                  itemType: "agent_message",
+                },
+              });
+              return;
+            }
+            const noisy = ["item.updated", "turn.updated"].includes(type);
+            if (!noisy) {
+              this.store.emit({
+                taskId: context.task.id,
+                turnId: context.turn.id,
+                workerId: context.worker.id,
+                type: `codex.${type}`,
+                phase: "codex",
+                level: type === "codex.stderr" ? "warning" : "info",
+                message: codexMessage(event).slice(0, 2_000),
+                data: { eventType: type },
+              });
+            }
+          },
+        });
+        this.store.setTaskThread(context.task.id, codexResult.threadId);
+        if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
+        codexFinal = codexResult.final;
+        this.store.recordCodexCompletion(context.turn.id, codexFinal);
+        if (codexFinal?.status !== "completed") {
+          const blocked = codexFinal?.status === "blocked";
+          const code = blocked ? "CODEX_BLOCKED" : "CODEX_NEEDS_INPUT";
+          const message = blocked
+            ? "Codex reported that the turn is blocked; delivery was suppressed"
+            : "Codex requires user input; delivery was suppressed";
+          this.store.failTurn(
+            context.turn.id,
+            Object.assign(new Error(message), { code }),
+            { preserveWorker: true },
+          );
+          this.emitProgress(
+            context,
+            blocked ? "blocked" : "needs-input",
+            `${message}. Worker workspace remains in attention.`,
+            "warning",
+            { code, structuredStatus: codexFinal?.status || null },
+          );
+          return;
+        }
+        const deliveryAudit = await this.adapter.auditDeliveryWorkspace(
+          context,
+          codexFinal,
+          {
+            signal,
+            onProgress: (phase, message, data = null) =>
+              this.emitProgress(context, phase, message, "info", data),
+          },
+        );
+        this.store.recordDeliveryAudit(context.turn.id, deliveryAudit);
+      }
 
       this.store.setTurnPhase(context.turn.id, "saving");
       this.emitProgress(
@@ -280,7 +347,7 @@ export class Scheduler {
           this.emitProgress(context, phase, message, "info", data),
       });
       this.store.completeTurn(context.turn.id, {
-        codexFinal: codexResult.final,
+        codexFinal,
         commitSha: delivery.commitSha,
         delivery,
       });
