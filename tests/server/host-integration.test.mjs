@@ -74,6 +74,7 @@ function context() {
       baseBranch: "main",
       branchName: "codex/task-0001-real-host-task",
       codexThreadId: null,
+      latestCommitSha: "d".repeat(40),
     },
     turn: {
       id: "turn-real",
@@ -88,84 +89,87 @@ function recoveryProof({
   taskBranch,
   auditedHead,
   auditFingerprint,
-  auditedPath,
   auditBlob,
   preservedBlob = auditBlob,
-  reused = false,
+  expectedRemoteTip = "d".repeat(40),
+  branchAction = "created",
 }) {
-  const preservationBranch =
-    "relay/preserved/task-0001-real-host-task-20260727T120000000Z-acde1234abcd";
-  const preservationCommit = "2".repeat(40);
-  const verifiedFiles = [
-    {
-      path: auditedPath,
-      code: "??",
-      originalPath: null,
-      auditBlob,
-      preservedBlob,
-    },
-  ];
+  const attempt = (stage) => ({
+    attempt: 1,
+    stage,
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+    timedOut: false,
+    timeoutSeconds: 45,
+    durationMs: 10,
+    transient: false,
+    backoffMilliseconds: 0,
+  });
   return {
-    proofVersion: 1,
+    proofVersion: 2,
     proven: true,
     auditFingerprint,
     auditedHead,
-    preservationBranch,
-    preservationCommit,
+    preservationBranch: "main",
+    preservationCommit: auditedHead,
     preservationParent: auditedHead,
-    reused,
+    reused: true,
     parentVerified: true,
     nameStatusVerified: true,
     treeVerified: true,
-    blobVerified: true,
-    verifiedFiles,
+    blobVerified: preservedBlob === auditBlob,
+    verifiedFiles: [],
     statusAfter: [],
     taskBranch,
-    taskBranchCreated: true,
+    taskBranchCreated: branchAction === "created",
+    taskBranchFastForwarded: branchAction === "fast-forwarded",
     currentBranch: taskBranch,
     ready: true,
     branch: taskBranch,
+    head: expectedRemoteTip,
+    originalBranch: "main",
     originalHead: auditedHead,
-    preservedBranch: preservationBranch,
-    preservedCommit: preservationCommit,
+    preservedBranch: "main",
+    preservedCommit: auditedHead,
     preservedTree: "3".repeat(40),
-    preservedNameStatus: [
-      { status: "A", path: auditedPath, originalPath: null },
-    ],
-    preservedFiles: verifiedFiles,
-    reusedPreservation: reused,
+    preservedNameStatus: [],
+    preservedFiles: [],
+    auditedFiles: [],
+    reusedPreservation: true,
     preservationVerified: true,
     preTargetCheckoutBranch: "main",
     preTargetCheckoutHead: auditedHead,
+    expectedRemoteTip,
+    remoteTip: expectedRemoteTip,
+    remoteRef: "refs/heads/" + taskBranch,
+    remoteTipAttempts: [attempt("remote-tip-ls-remote")],
+    fetchAttempts: [attempt("task-branch-fetch")],
+    branchAction,
+    localTaskHeadBefore: null,
+    localTaskHeadAfter: expectedRemoteTip,
+    porcelainV2After: ["# branch.head " + taskBranch],
+    untrackedFilesAfter: [],
+    preservationRef: null,
+    preservationRefCreated: false,
   };
 }
 
-function recoveryInspection({
-  auditedHead,
-  auditFingerprint,
-  auditedPath,
-  auditBlob,
-}) {
+function recoveryInspection({ auditedHead, auditFingerprint }) {
   return {
     ready: true,
     repositoryExists: true,
     branch: "main",
     head: auditedHead,
-    porcelainV2: ["# branch.head main", `? ${auditedPath}`],
-    untrackedFiles: [auditedPath],
+    statusBefore: [],
+    porcelainV2: ["# branch.head main"],
+    untrackedFiles: [],
     audit: {
       version: 1,
       branch: "main",
       head: auditedHead,
       fingerprint: auditFingerprint,
-      changes: [
-        {
-          code: "??",
-          path: auditedPath,
-          originalPath: null,
-          auditBlob,
-        },
-      ],
+      changes: [],
     },
   };
 }
@@ -585,60 +589,26 @@ test("an unchanged audited task branch resumes without recovery or mutation", as
   );
 });
 
-test("a pre-Codex prepare failure on main uses non-destructive recovery preparation", async () => {
+test("a pre-Codex clean-main failure verifies the durable remote tip before recovery", async () => {
   const calls = [];
   const progress = [];
   const recoveryContext = context();
   recoveryContext.workspaceEstablished = false;
-  const auditedMeta =
-    "baloot_client/Assets/AppAssets/hall/scripts/Common/Automation.meta";
-  const auditBlob = "3033568a1999ebaf6328b316315239ed67cd19a5";
+  const auditedHead = "1".repeat(40);
   const auditFingerprint = "5".repeat(64);
-  const processRunner = async (command, args) => {
+  const processRunner = async (command, args, options) => {
     const name = scriptName(args);
-    calls.push({ name, args });
+    calls.push({ name, args, options });
     const payload =
       name === "Inspect-PreservedWorkspace.ps1"
-        ? {
-            ready: true,
-            repositoryExists: true,
-            branch: "main",
-            head: "1".repeat(40),
-            statusBefore: [
-              { code: "??", path: auditedMeta, originalPath: null },
-            ],
-            auditedFiles: [
-              {
-                code: "??",
-                path: auditedMeta,
-                originalPath: null,
-                auditBlob,
-              },
-            ],
-            audit: {
-              version: 1,
-              branch: "main",
-              head: "1".repeat(40),
-              fingerprint: auditFingerprint,
-              changes: [
-                {
-                  code: "??",
-                  path: auditedMeta,
-                  originalPath: null,
-                  auditBlob,
-                },
-              ],
-            },
-            porcelainV2: ["# branch.head main", "? " + auditedMeta],
-            untrackedFiles: [auditedMeta],
-          }
+        ? recoveryInspection({ auditedHead, auditFingerprint })
         : name === "Recover-Workspace.ps1"
           ? recoveryProof({
               taskBranch: recoveryContext.task.branchName,
-              auditedHead: "1".repeat(40),
+              auditedHead,
               auditFingerprint,
-              auditedPath: auditedMeta,
-              auditBlob,
+              auditBlob: "3".repeat(40),
+              expectedRemoteTip: recoveryContext.task.latestCommitSha,
             })
           : {
               ready: true,
@@ -646,7 +616,6 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
               heartbeat: true,
               smb: true,
               unity: true,
-              skill: true,
             };
     return { exitCode: 0, stdout: JSON.stringify(payload), stderr: "" };
   };
@@ -662,17 +631,13 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
 
   assert.equal(result.preserved, true);
   assert.equal(result.recoveryPrepared, true);
-  assert.equal(result.proofVersion, 1);
-  assert.equal(result.proven, true);
-  assert.equal(result.auditedHead, "1".repeat(40));
-  assert.equal(result.preservationParent, "1".repeat(40));
-  assert.equal(result.parentVerified, true);
-  assert.equal(result.nameStatusVerified, true);
-  assert.equal(result.treeVerified, true);
-  assert.equal(result.blobVerified, true);
-  assert.equal(result.taskBranch, recoveryContext.task.branchName);
-  assert.equal(result.taskBranchCreated, true);
-  assert.equal(result.currentBranch, recoveryContext.task.branchName);
+  assert.equal(result.proofVersion, 2);
+  assert.equal(result.remoteTip, recoveryContext.task.latestCommitSha);
+  assert.equal(result.expectedRemoteTip, recoveryContext.task.latestCommitSha);
+  assert.equal(result.branchAction, "created");
+  assert.equal(result.preservationRefCreated, false);
+  assert.deepEqual(result.statusAfter, []);
+  assert.deepEqual(result.untrackedFilesAfter, []);
   assert.deepEqual(
     calls.map((call) => call.name),
     [
@@ -681,57 +646,19 @@ test("a pre-Codex prepare failure on main uses non-destructive recovery preparat
       "Get-WorkerHealth.ps1",
     ],
   );
-  assert.equal(
-    calls.some((call) =>
-      [
-        "Verify-PreservedWorkspace.ps1",
-        "Ensure-WorkerReady.ps1",
-        "Restore-Worker.ps1",
-        "Control-Worker.ps1",
-      ].includes(call.name),
-    ),
-    false,
-  );
   const recovery = calls.find((call) => call.name === "Recover-Workspace.ps1");
   assert.equal(
-    recovery.args[recovery.args.indexOf("-TaskBranch") + 1],
-    recoveryContext.task.branchName,
+    recovery.args[recovery.args.indexOf("-ExpectedRemoteTip") + 1],
+    recoveryContext.task.latestCommitSha,
   );
-  assert.equal(recovery.args[recovery.args.indexOf("-BaseBranch") + 1], "main");
-  assert.deepEqual(
-    JSON.parse(recovery.args[recovery.args.indexOf("-AuditJson") + 1]),
-    {
-      version: 1,
-      branch: "main",
-      head: "1".repeat(40),
-      fingerprint: auditFingerprint,
-      changes: [
-        {
-          code: "??",
-          path: auditedMeta,
-          originalPath: null,
-          auditBlob,
-        },
-      ],
-    },
-  );
-  const inspectionEvidence = progress.find(
-    (entry) => entry.phase === "workspace-inspected",
-  );
-  assert.equal(inspectionEvidence.data.branch, "main");
-  assert.equal(inspectionEvidence.data.head, "1".repeat(40));
-  assert.deepEqual(inspectionEvidence.data.untrackedFiles, [auditedMeta]);
-  const preservationEvidence = progress.find(
-    (entry) => entry.phase === "workspace-preserved",
-  );
-  assert.equal(preservationEvidence.data.preservationVerified, true);
+  assert.equal(recovery.options.timeoutMs, 420_000);
   assert.equal(
-    preservationEvidence.data.preservedBranch,
-    result.preservedBranch,
-  );
-  assert.equal(
-    preservationEvidence.data.preservedCommit,
-    result.preservedCommit,
+    progress.some(
+      (entry) =>
+        entry.phase === "workspace-recovered" &&
+        entry.data.remoteTip === recoveryContext.task.latestCommitSha,
+    ),
+    true,
   );
 });
 

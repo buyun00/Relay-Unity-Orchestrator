@@ -23,6 +23,7 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 . (Join-Path $PSScriptRoot 'Credential.ps1')
+. (Join-Path $PSScriptRoot 'PowerShell-Direct.ps1')
 $credential = Import-RelayCredential -Path $CredentialPath
 
 $helperPath = Join-Path $PSScriptRoot 'Workspace-Git.ps1'
@@ -41,10 +42,10 @@ $guestSource = [System.IO.File]::ReadAllText(
     [System.Text.Encoding]::UTF8
 )
 $remoteOutput = @(
-    Invoke-Command -VMName $VMName -Credential $credential -ArgumentList @(
-    $GuestProjectPath, $RepoUrl, $BaseBranch, $TaskBranch, $Mode,
-    $GitAuthorName, $GitAuthorEmail, $AuditJson, $helperSource, $guestSource
-) -ScriptBlock {
+    Invoke-RelayPowerShellDirect -VMName $VMName -Credential $credential -ArgumentList @(
+        $GuestProjectPath, $RepoUrl, $BaseBranch, $TaskBranch, $Mode,
+        $GitAuthorName, $GitAuthorEmail, $AuditJson, $helperSource, $guestSource
+    ) -Stage 'powershell-direct-workspace-prepare' -TimeoutSeconds $TimeoutSeconds -ScriptBlock {
         param(
             $ProjectPath, $RepositoryUrl, $Base, $Branch, $RequestedMode,
             $AuthorName, $AuthorEmail, $AuditJson, $HelperSource, $GuestSource
@@ -52,16 +53,7 @@ $remoteOutput = @(
         $ErrorActionPreference = 'Stop'
         Set-StrictMode -Version Latest
         . ([scriptblock]::Create($HelperSource))
-        & ([scriptblock]::Create($GuestSource)) `
-            -ProjectPath $ProjectPath `
-            -RepositoryUrl $RepositoryUrl `
-            -Base $Base `
-            -Branch $Branch `
-            -RequestedMode $RequestedMode `
-            -AuthorName $AuthorName `
-            -AuthorEmail $AuthorEmail `
-            -AuditJson $AuditJson `
-            -OutputJson
+        & ([scriptblock]::Create($GuestSource)) -ProjectPath $ProjectPath -RepositoryUrl $RepositoryUrl -Base $Base -Branch $Branch -RequestedMode $RequestedMode -AuthorName $AuthorName -AuthorEmail $AuthorEmail -AuditJson $AuditJson -OutputJson
     }
 )
 $remoteRecords = @(

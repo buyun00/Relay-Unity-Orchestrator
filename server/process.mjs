@@ -15,6 +15,7 @@ export function runProcess(command, args, options = {}) {
     let settled = false;
     let stdout = "";
     let stderr = "";
+    let terminationError = null;
     const child = spawn(command, args, {
       cwd,
       env: { ...process.env, ...env },
@@ -34,22 +35,22 @@ export function runProcess(command, args, options = {}) {
       if (!child.killed) child.kill("SIGTERM");
     };
     const abort = () => {
-      terminate();
-      const error =
+      if (terminationError) return;
+      terminationError =
         signal?.reason instanceof Error
           ? signal.reason
           : Object.assign(new Error("Process aborted"), { code: "ABORTED" });
-      finish(() => reject(error));
+      terminate();
     };
     const timer =
       timeoutMs > 0
         ? setTimeout(() => {
-            terminate();
-            const error = Object.assign(
+            if (terminationError) return;
+            terminationError = Object.assign(
               new Error(`Process timed out after ${timeoutMs}ms`),
-              { code: "PROCESS_TIMEOUT" },
+              { code: "PROCESS_TIMEOUT", timeoutMs, timedOut: true },
             );
-            finish(() => reject(error));
+            terminate();
           }, timeoutMs)
         : null;
 
@@ -83,6 +84,16 @@ export function runProcess(command, args, options = {}) {
       finish(() => reject(error));
     });
     child.on("close", (exitCode, childSignal) => {
+      if (terminationError) {
+        Object.assign(terminationError, {
+          exitCode,
+          signal: childSignal,
+          stdout,
+          stderr,
+        });
+        finish(() => reject(terminationError));
+        return;
+      }
       if (!acceptExitCodes.includes(exitCode)) {
         const detail = stderr.trim() || stdout.trim();
         const error = Object.assign(

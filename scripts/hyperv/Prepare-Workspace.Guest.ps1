@@ -195,17 +195,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $ProjectPath '.git'))) {
     if (-not (Test-Path -LiteralPath $parent)) {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $cloneOutput = & git clone -- $RepositoryUrl $ProjectPath 2>&1
-        $cloneExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($cloneExitCode -ne 0) {
-        throw "git clone failed: $($cloneOutput -join [Environment]::NewLine)"
-    }
+    Invoke-RelayGitWithRetry $parent @(
+        'clone', '--no-tags', '--single-branch', '--branch', $Base,
+        '--', $RepositoryUrl, $ProjectPath
+    ) 'repository-clone' @{} 60 3 1000 | Out-Null
 }
 
 # Capture only the audited changes. The preservation tree starts at the audited
@@ -412,6 +405,21 @@ if ($deletionPaths.Count -gt 0 -or $prohibitedPaths.Count -gt 0 -or $unsupported
         DeletionPaths = @($deletionPaths.ToArray())
         ProhibitedPaths = @($prohibitedPaths.ToArray())
         UnsupportedChanges = @($unsupportedChanges.ToArray())
+        OriginalBranch = $originalBranch
+        OriginalHead = $originalHead
+    }
+    return (Complete-Result (New-RefusalResult @refusalArguments))
+}
+
+if ($RequestedMode -ne 'recovery' -and $statusBefore.Count -gt 0) {
+    $refusalArguments = @{
+        Code = 'WORKSPACE_DIRTY_REFUSED'
+        Message = 'Workspace preparation refused because complete porcelain v2 or untracked state is not clean; no branch or remote operation was attempted.'
+        Status = $statusBefore
+        BlockedPaths = @($statusBefore | ForEach-Object { $_.path })
+        DeletionPaths = @()
+        ProhibitedPaths = @()
+        UnsupportedChanges = @()
         OriginalBranch = $originalBranch
         OriginalHead = $originalHead
     }
@@ -806,11 +814,32 @@ if ($shouldPreserve) {
     $script:preservationVerified = $true
 }
 
+$configuredOrigin = Get-GitValue @('remote', 'get-url', 'origin')
+if ($configuredOrigin -ne $RepositoryUrl) {
+    $refusalArguments = @{
+        Code = 'WORKSPACE_REMOTE_MISMATCH'
+        Message = "Configured origin '$configuredOrigin' does not equal expected '$RepositoryUrl'; Relay did not change it."
+        Status = $statusBefore
+        BlockedPaths = @()
+        DeletionPaths = @()
+        ProhibitedPaths = @()
+        UnsupportedChanges = @()
+        OriginalBranch = $originalBranch
+        OriginalHead = $originalHead
+    }
+    return (Complete-Result (New-RefusalResult @refusalArguments))
+}
+$taskTipQuery = Invoke-RelayGitWithRetry $ProjectPath @(
+    'ls-remote', '--refs', 'origin', "refs/heads/$Branch"
+) 'prepare-task-tip-ls-remote' @{} 45 3 1000
+$taskRemoteExists = -not [string]::IsNullOrWhiteSpace($taskTipQuery.result.stdout)
+$fetchBranch = if ($taskRemoteExists) { $Branch } else { $Base }
+$fetchDestination = "refs/remotes/origin/$fetchBranch"
+Invoke-RelayGitWithRetry $ProjectPath @(
+    'fetch', '--no-tags', '--no-prune', 'origin',
+    "refs/heads/$($fetchBranch):$fetchDestination"
+) 'prepare-branch-fetch' @{} 45 3 1000 | Out-Null
 Set-RepositoryIdentity
-Invoke-Git @('remote', 'set-url', 'origin', $RepositoryUrl) | Out-Null
-Invoke-Git @('fetch', 'origin') | Out-Null
-
-$taskRemoteExists = Test-GitReference "refs/remotes/origin/$Branch"
 $source = if ($RequestedMode -eq 'recovery' -or $preservedCommit) {
     "origin/$Base"
 } elseif ($taskRemoteExists) {

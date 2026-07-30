@@ -16,7 +16,15 @@ const verifyHostScript = path.resolve(
   "scripts/hyperv/Verify-PreservedWorkspace.ps1",
 );
 const recoverHostScript = path.resolve("scripts/hyperv/Recover-Workspace.ps1");
+const recoverGuestScript = path.resolve(
+  "scripts/hyperv/Recover-Workspace.Guest.ps1",
+);
+const workspaceGitScript = path.resolve("scripts/hyperv/Workspace-Git.ps1");
+const powerShellDirectScript = path.resolve(
+  "scripts/hyperv/PowerShell-Direct.ps1",
+);
 const taskBranch = "codex/task-0017-task";
+const recoveryTaskBranch = "codex/task-0019-hall-3-empty-top-left-gifts-grid";
 
 function git(cwd, ...args) {
   return execFileSync("git", args, {
@@ -168,7 +176,8 @@ function runHostWorkspaceScript(
         [string]$VMName,
         [pscredential]$Credential,
         [object[]]$ArgumentList,
-        [scriptblock]$ScriptBlock
+        [scriptblock]$ScriptBlock,
+        [switch]$AsJob
       )
       if ($ArgumentList.Count -ne ${expectedArgumentCount}) {
         throw "Expected ${expectedArgumentCount} PowerShell Direct arguments, received $($ArgumentList.Count)."
@@ -270,6 +279,7 @@ function refs(project, ...prefixes) {
 }
 
 function runRecoveryHostWrapper(t, guestPayload, { throwGuest = false } = {}) {
+  const expectedTip = "d".repeat(40);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-recovery-host-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const credentialPath = path.join(root, "credential.xml");
@@ -291,18 +301,15 @@ function runRecoveryHostWrapper(t, guestPayload, { throwGuest = false } = {}) {
         [string]$VMName,
         [pscredential]$Credential,
         [object[]]$ArgumentList,
-        [scriptblock]$ScriptBlock
+        [scriptblock]$ScriptBlock,
+        [switch]$AsJob
       )
       $global:relayInvokeCount += 1
       if ($global:relayInvokeCount -eq 1) {
         if (${throwGuest ? "$true" : "$false"}) {
           throw '模拟 guest exception'
         }
-        $decorated = [psobject]$global:relayGuestJson
-        $decorated | Add-Member NoteProperty PSComputerName 'guest-01' -Force
-        $decorated | Add-Member NoteProperty RunspaceId ([Guid]::NewGuid()) -Force
-        $decorated | Add-Member NoteProperty PSShowComputerName $true -Force
-        return $decorated
+        return $global:relayGuestJson
       }
       return $true
     }`,
@@ -310,7 +317,7 @@ function runRecoveryHostWrapper(t, guestPayload, { throwGuest = false } = {}) {
       credentialPath,
     )} -GuestProjectPath 'D:\\Work\\中文 Project' -RepoUrl 'https://example.test/repo.git' -BaseBranch 'main' -TaskBranch ${quote(
       taskBranch,
-    )} -AuditJson '{}' -TimeoutSeconds 30`,
+    )} -ExpectedRemoteTip '${expectedTip}' -PowerShellDirectTimeoutSeconds 60`,
   ].join("; ");
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   return spawnSync(
@@ -329,6 +336,97 @@ function runRecoveryHostWrapper(t, guestPayload, { throwGuest = false } = {}) {
       windowsHide: true,
     },
   );
+}
+
+function publishRecoveryTip(repository, branch = recoveryTaskBranch) {
+  const seed = path.join(repository.root, "seed");
+  git(seed, "checkout", "-q", "-b", branch);
+  write(path.join(seed, "remote-task", "delivered.txt"), "durably delivered\n");
+  git(seed, "add", ".");
+  git(
+    seed,
+    "-c",
+    "user.name=Relay Test",
+    "-c",
+    "user.email=relay@test.invalid",
+    "commit",
+    "-q",
+    "-m",
+    "durable task delivery",
+  );
+  const tip = git(seed, "rev-parse", "HEAD");
+  git(seed, "push", "-q", "-u", "origin", branch);
+  git(seed, "checkout", "-q", "main");
+  return tip;
+}
+
+function recoverClean(
+  project,
+  repository,
+  expectedRemoteTip,
+  branch = recoveryTaskBranch,
+) {
+  const completed = spawnSync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      recoverGuestScript,
+      "-ProjectPath",
+      project,
+      "-RepositoryUrl",
+      repository.remote,
+      "-BaseBranch",
+      "main",
+      "-TaskBranch",
+      branch,
+      "-ExpectedRemoteTip",
+      expectedRemoteTip,
+      "-GitNetworkTimeoutSeconds",
+      "30",
+      "-OutputJson",
+    ],
+    { cwd: path.resolve("."), encoding: "utf8", windowsHide: true },
+  );
+  assert.equal(
+    completed.status,
+    0,
+    "Clean recovery guest failed:\n" +
+      completed.stderr +
+      "\n" +
+      completed.stdout,
+  );
+  return JSON.parse(completed.stdout.trim());
+}
+
+function runPowerShellJson(script) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const completed = spawnSync(
+    "powershell.exe",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encoded,
+    ],
+    { cwd: path.resolve("."), encoding: "utf8", windowsHide: true },
+  );
+  assert.equal(
+    completed.status,
+    0,
+    "PowerShell behavior regression failed:\n" +
+      completed.stderr +
+      "\n" +
+      completed.stdout,
+  );
+  return JSON.parse(completed.stdout.trim());
 }
 
 test("a clean established workspace produces an empty coherent audit", (t) => {
@@ -998,7 +1096,7 @@ test("the real host recovery wrapper emits a structured exceptional result", (t)
   const result = JSON.parse(completed.stdout.trim());
   assert.equal(result.proven, false);
   assert.equal(result.code, "RECOVERY_HOST_EXCEPTION");
-  assert.equal(result.phase, "host-wrapper");
+  assert.equal(result.phase, "recovery-host-wrapper");
   assert.equal(result.reason, "RECOVERY_HOST_EXCEPTION");
   assert.match(result.message, /guest exception/u);
   assert.match(completed.stderr, /RELAY_RECOVERY_FAILED:/u);
@@ -1411,4 +1509,235 @@ test("sensitive, log, cache, and build paths stop non-destructively", (t) => {
       content,
     );
   }
+});
+
+test("clean main recovery verifies the exact remote tip and creates a tracking branch", (t) => {
+  const repository = createRepository(t);
+  const remoteTip = publishRecoveryTip(repository);
+  const project = clone(repository, "clean-main-recovery");
+  const mainHead = git(project, "rev-parse", "refs/heads/main");
+  const refsBefore = refs(project, "refs/heads/relay/preserved/");
+  const globalBefore = spawnSync(
+    "git",
+    ["config", "--global", "--list", "--show-origin"],
+    { encoding: "utf8", windowsHide: true },
+  ).stdout;
+
+  const result = recoverClean(project, repository, remoteTip);
+
+  assert.equal(result.ready, true, JSON.stringify(result, null, 2));
+  assert.equal(result.proofVersion, 2);
+  assert.equal(result.expectedRemoteTip, remoteTip);
+  assert.equal(result.remoteTip, remoteTip);
+  assert.equal(result.remoteRef, "refs/heads/" + recoveryTaskBranch);
+  assert.equal(result.branchAction, "created");
+  assert.equal(result.taskBranchCreated, true);
+  assert.equal(result.preservationRefCreated, false);
+  assert.deepEqual(result.statusBefore, []);
+  assert.deepEqual(result.untrackedFilesBefore, []);
+  assert.deepEqual(result.statusAfter, []);
+  assert.deepEqual(result.untrackedFilesAfter, []);
+  assert.equal(git(project, "branch", "--show-current"), recoveryTaskBranch);
+  assert.equal(git(project, "rev-parse", "HEAD"), remoteTip);
+  assert.equal(
+    git(
+      project,
+      "rev-parse",
+      "--abbrev-ref",
+      "--symbolic-full-name",
+      "@{upstream}",
+    ),
+    "origin/" + recoveryTaskBranch,
+  );
+  assert.equal(git(project, "rev-parse", "refs/heads/main"), mainHead);
+  assert.deepEqual(refs(project, "refs/heads/relay/preserved/"), refsBefore);
+  assert.equal(
+    spawnSync("git", ["config", "--global", "--list", "--show-origin"], {
+      encoding: "utf8",
+      windowsHide: true,
+    }).stdout,
+    globalBefore,
+  );
+});
+
+test("an existing compatible local task branch is reused without overwrite", (t) => {
+  const repository = createRepository(t);
+  const remoteTip = publishRecoveryTip(repository);
+  const project = clone(repository, "existing-compatible-recovery");
+  git(project, "branch", recoveryTaskBranch, remoteTip);
+  const refsBefore = refs(project, "refs/heads/");
+
+  const result = recoverClean(project, repository, remoteTip);
+
+  assert.equal(result.ready, true, JSON.stringify(result, null, 2));
+  assert.equal(result.branchAction, "existing-compatible");
+  assert.equal(result.taskBranchCreated, false);
+  assert.equal(result.taskBranchFastForwarded, false);
+  assert.equal(result.localTaskHeadBefore, remoteTip);
+  assert.equal(result.localTaskHeadAfter, remoteTip);
+  assert.equal(git(project, "rev-parse", "HEAD"), remoteTip);
+  assert.deepEqual(refs(project, "refs/heads/relay/preserved/"), []);
+  assert.ok(refs(project, "refs/heads/").length >= refsBefore.length);
+});
+
+test("dirty recovery is refused before remote or branch mutation", (t) => {
+  const repository = createRepository(t);
+  const remoteTip = publishRecoveryTip(repository);
+  const project = clone(repository, "dirty-recovery-refusal");
+  const dirtyPath = path.join(project, "incident-untracked.txt");
+  write(dirtyPath, "preserve me\n");
+  const branchBefore = git(project, "branch", "--show-current");
+  const headBefore = git(project, "rev-parse", "HEAD");
+  const refsBefore = refs(project, "refs/heads/");
+
+  const result = recoverClean(project, repository, remoteTip);
+
+  assert.equal(result.ready, false);
+  assert.equal(result.code, "WORKSPACE_DIRTY_REFUSED");
+  assert.equal(result.phase, "workspace-cleanliness");
+  assert.ok(result.untrackedFilesBefore.includes("incident-untracked.txt"));
+  assert.equal(git(project, "branch", "--show-current"), branchBefore);
+  assert.equal(git(project, "rev-parse", "HEAD"), headBefore);
+  assert.deepEqual(refs(project, "refs/heads/"), refsBefore);
+  assert.equal(fs.readFileSync(dirtyPath, "utf8"), "preserve me\n");
+});
+
+test("remote tip mismatch refuses before fetch and local branch creation", (t) => {
+  const repository = createRepository(t);
+  publishRecoveryTip(repository);
+  const project = clone(repository, "remote-tip-mismatch");
+  const headBefore = git(project, "rev-parse", "HEAD");
+  const localRefsBefore = refs(project, "refs/heads/");
+
+  const result = recoverClean(project, repository, "f".repeat(40));
+
+  assert.equal(result.ready, false);
+  assert.equal(result.code, "RECOVERY_REMOTE_TIP_MISMATCH");
+  assert.equal(result.phase, "remote-tip-verification");
+  assert.equal(result.expectedRemoteTip, "f".repeat(40));
+  assert.notEqual(result.remoteTip, result.expectedRemoteTip);
+  assert.equal(git(project, "branch", "--show-current"), "main");
+  assert.equal(git(project, "rev-parse", "HEAD"), headBefore);
+  assert.deepEqual(refs(project, "refs/heads/"), localRefsBefore);
+});
+
+test("a non-fast-forward local task branch is refused without switching main", (t) => {
+  const repository = createRepository(t);
+  const remoteTip = publishRecoveryTip(repository);
+  const project = clone(repository, "non-fast-forward-refusal");
+  git(project, "checkout", "-q", "-b", recoveryTaskBranch, "main");
+  write(path.join(project, "local-only.txt"), "local divergent commit\n");
+  git(project, "add", ".");
+  git(
+    project,
+    "-c",
+    "user.name=Relay Test",
+    "-c",
+    "user.email=relay@test.invalid",
+    "commit",
+    "-q",
+    "-m",
+    "local divergent task",
+  );
+  const localTaskHead = git(project, "rev-parse", "HEAD");
+  git(project, "checkout", "-q", "main");
+  const mainHead = git(project, "rev-parse", "HEAD");
+
+  const result = recoverClean(project, repository, remoteTip);
+
+  assert.equal(result.ready, false);
+  assert.equal(result.code, "WORKSPACE_TARGET_BRANCH_NON_FAST_FORWARD");
+  assert.equal(result.phase, "local-task-compatibility");
+  assert.equal(git(project, "branch", "--show-current"), "main");
+  assert.equal(git(project, "rev-parse", "HEAD"), mainHead);
+  assert.equal(git(project, "rev-parse", recoveryTaskBranch), localTaskHead);
+});
+
+test("curl 18 is retried once with bounded backoff and then succeeds", () => {
+  const helper = workspaceGitScript.replaceAll("'", "''");
+  const result = runPowerShellJson(
+    [
+      "$ProgressPreference = 'SilentlyContinue'",
+      ". '" + helper + "'",
+      "$script:waits = New-Object System.Collections.Generic.List[int]",
+      "$runner = { param($Repo,$Args,$Env,$Timeout,$Stage,$Attempt) if ($Attempt -eq 1) { [pscustomobject]@{ exitCode=1; stdoutBytes=[byte[]]@(); stdout=''; stderr='curl 18 transfer closed with outstanding read data'; stage=$Stage; timedOut=$false; timeoutSeconds=$Timeout; durationMs=5 } } else { [pscustomobject]@{ exitCode=0; stdoutBytes=[byte[]]@(); stdout='ok'; stderr=''; stage=$Stage; timedOut=$false; timeoutSeconds=$Timeout; durationMs=4 } } }",
+      "$waiter = { param($Milliseconds,$Attempt) $script:waits.Add([int]$Milliseconds) }",
+      "$value = Invoke-RelayGitWithRetry -RepositoryPath '.' -Arguments @('fetch') -Stage 'task-branch-fetch' -TimeoutSeconds 30 -MaximumAttempts 3 -InitialBackoffMilliseconds 1000 -ProcessInvoker $runner -BackoffWaiter $waiter",
+      "[pscustomobject]@{ attempts=@($value.attempts); waits=@($script:waits) } | ConvertTo-Json -Depth 8 -Compress",
+    ].join("; "),
+  );
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0].transient, true);
+  assert.equal(result.attempts[0].backoffMilliseconds, 1000);
+  assert.equal(result.attempts[1].exitCode, 0);
+  assert.deepEqual(result.waits, [1000]);
+});
+
+test("three exhausted transient failures retain every attempt and backoff", () => {
+  const helper = workspaceGitScript.replaceAll("'", "''");
+  const result = runPowerShellJson(
+    [
+      "$ProgressPreference = 'SilentlyContinue'",
+      ". '" + helper + "'",
+      "$script:waits = New-Object System.Collections.Generic.List[int]",
+      "$runner = { param($Repo,$Args,$Env,$Timeout,$Stage,$Attempt) [pscustomobject]@{ exitCode=1; stdoutBytes=[byte[]]@(); stdout=''; stderr='fatal: early EOF'; stage=$Stage; timedOut=$false; timeoutSeconds=$Timeout; durationMs=5 } }",
+      "$waiter = { param($Milliseconds,$Attempt) $script:waits.Add([int]$Milliseconds) }",
+      "try { Invoke-RelayGitWithRetry -RepositoryPath '.' -Arguments @('fetch') -Stage 'task-branch-fetch' -TimeoutSeconds 30 -MaximumAttempts 3 -InitialBackoffMilliseconds 1000 -ProcessInvoker $runner -BackoffWaiter $waiter | Out-Null; throw 'expected retry failure' } catch { [pscustomobject]@{ message=$_.Exception.Message; stage=$_.Exception.Data['relayStage']; attempts=@($_.Exception.Data['relayAttempts']); waits=@($script:waits) } | ConvertTo-Json -Depth 8 -Compress }",
+    ].join("; "),
+  );
+  assert.equal(result.stage, "task-branch-fetch");
+  assert.match(result.message, /early EOF/u);
+  assert.equal(result.attempts.length, 3);
+  assert.deepEqual(result.waits, [1000, 2000]);
+  assert.equal(
+    result.attempts.every((attempt) => attempt.transient),
+    true,
+  );
+});
+
+test("PowerShell Direct timeout stops only its owned job and reports the exact stage", () => {
+  const helper = powerShellDirectScript.replaceAll("'", "''");
+  const result = runPowerShellJson(
+    [
+      "$ProgressPreference = 'SilentlyContinue'",
+      ". '" + helper + "'",
+      "function global:Invoke-Command { param([string]$VMName,[pscredential]$Credential,[object[]]$ArgumentList,[scriptblock]$ScriptBlock,[switch]$AsJob) $global:ownedJob = Start-Job -ScriptBlock { Start-Sleep -Seconds 30 }; return $global:ownedJob }",
+      "$credential = New-Object System.Management.Automation.PSCredential('test',(ConvertTo-SecureString 'test' -AsPlainText -Force))",
+      "$started = [DateTime]::UtcNow",
+      "try { Invoke-RelayPowerShellDirect -VMName 'fake' -Credential $credential -ArgumentList @('owned') -ScriptBlock {} -Stage 'powershell-direct-recovery' -TimeoutSeconds 1 | Out-Null; throw 'expected timeout' } catch { [pscustomobject]@{ message=$_.Exception.Message; stage=$_.Exception.Data['relayStage']; timedOut=$_.Exception.Data['relayTimedOut']; elapsedMs=[int]([DateTime]::UtcNow-$started).TotalMilliseconds; ownedJobRemoved=$null -eq (Get-Job -Id $global:ownedJob.Id -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress }",
+    ].join("; "),
+  );
+  assert.equal(result.stage, "powershell-direct-recovery");
+  assert.equal(result.timedOut, true);
+  assert.match(result.message, /owned remoting job was stopped/u);
+  assert.ok(result.elapsedMs < 10_000);
+  assert.equal(result.ownedJobRemoved, true);
+});
+
+test("recovery source suppresses prompts and forbids deletion or global Git mutation", () => {
+  const gitSource = fs.readFileSync(workspaceGitScript, "utf8");
+  const recoverySource = fs.readFileSync(recoverGuestScript, "utf8");
+  const hostSource = fs.readFileSync(recoverHostScript, "utf8");
+  const directSource = fs.readFileSync(powerShellDirectScript, "utf8");
+  const chain = [gitSource, recoverySource, hostSource, directSource].join(
+    "\n",
+  );
+
+  assert.match(gitSource, /http\.version=HTTP\/1\.1/u);
+  assert.match(gitSource, /credential\.interactive=never/u);
+  assert.match(gitSource, /GIT_TERMINAL_PROMPT.*0/u);
+  assert.match(gitSource, /GCM_INTERACTIVE.*Never/u);
+  assert.match(gitSource, /WaitForExit\(\$TimeoutSeconds \* 1000\)/u);
+  assert.match(gitSource, /\$process\.Kill\(\)/u);
+  assert.match(recoverySource, /ls-remote.*--exit-code.*--refs/su);
+  assert.match(recoverySource, /fetch.*--no-tags.*--no-prune/su);
+  assert.match(
+    recoverySource,
+    /refs\/heads\/\$\(\$TaskBranch\):refs\/remotes\/origin\/\$TaskBranch/u,
+  );
+  assert.match(directSource, /Stop-Job -Job \$job/u);
+  assert.doesNotMatch(chain, /\bgit\s+config\s+--global\b/iu);
+  assert.doesNotMatch(chain, /(?:'|")(?:reset|clean|restore|rebase)(?:'|")/u);
+  assert.doesNotMatch(chain, /\bRemove-Item\b/u);
+  assert.doesNotMatch(chain, /\b(?:taskkill|Stop-Process)\b/iu);
 });

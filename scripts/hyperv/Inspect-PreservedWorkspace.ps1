@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$VMName,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$CredentialPath,
-    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$GuestProjectPath
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$GuestProjectPath,
+    [ValidateRange(10, 300)][int]$TimeoutSeconds = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,7 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 . (Join-Path $PSScriptRoot 'Credential.ps1')
+. (Join-Path $PSScriptRoot 'PowerShell-Direct.ps1')
 
 function ConvertTo-InspectionArray {
     param([AllowNull()][object]$Value)
@@ -38,7 +40,7 @@ $guestSource = [System.IO.File]::ReadAllText(
     [System.Text.Encoding]::UTF8
 )
 $remoteOutput = @(
-    Invoke-Command -VMName $VMName -Credential $credential -ArgumentList @(
+    Invoke-RelayPowerShellDirect -VMName $VMName -Credential $credential -Stage 'powershell-direct-workspace-inspection' -TimeoutSeconds $TimeoutSeconds -ArgumentList @(
         $GuestProjectPath, $helperSource, $guestSource
     ) -ScriptBlock {
         param($ProjectPath, $HelperSource, $GuestSource)

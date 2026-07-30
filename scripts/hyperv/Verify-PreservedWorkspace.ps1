@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$GuestProjectPath,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$TaskBranch,
     [string]$ExpectedHead,
-    [AllowNull()][string]$AuditedFilesJson
+    [AllowNull()][string]$AuditedFilesJson,
+    [ValidateRange(10, 300)][int]$TimeoutSeconds = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +14,7 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 . (Join-Path $PSScriptRoot 'Credential.ps1')
+. (Join-Path $PSScriptRoot 'PowerShell-Direct.ps1')
 
 function ConvertFrom-AuditedFilesJson {
     param([AllowNull()][string]$Json)
@@ -80,7 +82,7 @@ $argumentList[3] = $normalizedAuditedFilesJson
 $argumentList[4] = $helperSource
 $argumentList[5] = $guestSource
 $remoteOutput = @(
-    Invoke-Command -VMName $VMName -Credential $credential `
+    Invoke-RelayPowerShellDirect -VMName $VMName -Credential $credential -Stage 'powershell-direct-workspace-verification' -TimeoutSeconds $TimeoutSeconds `
         -ArgumentList $argumentList `
         -ScriptBlock {
             param(

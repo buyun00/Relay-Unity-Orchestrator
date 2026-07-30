@@ -39,7 +39,18 @@ const recoveryProofFields = [
   "statusAfter",
   "taskBranch",
   "taskBranchCreated",
+  "taskBranchFastForwarded",
   "currentBranch",
+  "expectedRemoteTip",
+  "remoteTip",
+  "remoteRef",
+  "remoteTipAttempts",
+  "fetchAttempts",
+  "branchAction",
+  "localTaskHeadAfter",
+  "porcelainV2After",
+  "untrackedFilesAfter",
+  "preservationRefCreated",
 ];
 
 function parseJsonRecord(text) {
@@ -198,7 +209,7 @@ function parseRecoveryResult(operation, result) {
   }
 
   const invalidFields = [];
-  if (proof.proofVersion !== 1) invalidFields.push("proofVersion");
+  if (proof.proofVersion !== 2) invalidFields.push("proofVersion");
   if (proof.proven !== true) invalidFields.push("proven");
   for (const field of [
     "reused",
@@ -207,6 +218,8 @@ function parseRecoveryResult(operation, result) {
     "treeVerified",
     "blobVerified",
     "taskBranchCreated",
+    "taskBranchFastForwarded",
+    "preservationRefCreated",
   ]) {
     if (typeof proof[field] !== "boolean") invalidFields.push(field);
   }
@@ -218,6 +231,11 @@ function parseRecoveryResult(operation, result) {
     "preservationParent",
     "taskBranch",
     "currentBranch",
+    "expectedRemoteTip",
+    "remoteTip",
+    "remoteRef",
+    "branchAction",
+    "localTaskHeadAfter",
   ]) {
     if (typeof proof[field] !== "string" || !proof[field]) {
       invalidFields.push(field);
@@ -225,6 +243,13 @@ function parseRecoveryResult(operation, result) {
   }
   if (!Array.isArray(proof.verifiedFiles)) invalidFields.push("verifiedFiles");
   if (!Array.isArray(proof.statusAfter)) invalidFields.push("statusAfter");
+  if (!Array.isArray(proof.untrackedFilesAfter))
+    invalidFields.push("untrackedFilesAfter");
+  if (!Array.isArray(proof.porcelainV2After))
+    invalidFields.push("porcelainV2After");
+  if (!Array.isArray(proof.remoteTipAttempts))
+    invalidFields.push("remoteTipAttempts");
+  if (!Array.isArray(proof.fetchAttempts)) invalidFields.push("fetchAttempts");
   if (invalidFields.length) {
     const transport = transportRecord(result);
     transport.invalidFields = invalidFields;
@@ -367,114 +392,85 @@ function requireInspectionAudit(inspection) {
   return audit;
 }
 
-function validateRecoveryProof(inspection, recovery, taskBranch) {
+function validateRecoveryProof(
+  inspection,
+  recovery,
+  taskBranch,
+  expectedRemoteTip,
+) {
   const audit = requireInspectionAudit(inspection);
-  if (
-    recovery.proofVersion !== 1 ||
-    recovery.proven !== true ||
-    recovery.auditedHead !== audit.head ||
-    recovery.preservationParent !== audit.head ||
-    recovery.auditFingerprint !== audit.fingerprint ||
-    !/^[0-9a-f]{40}$/iu.test(recovery.preservationCommit || "") ||
-    !/^[0-9a-f]{40}$/iu.test(recovery.preservationParent || "") ||
-    !/^[0-9a-f]{40}$/iu.test(recovery.preservedTree || "")
-  ) {
-    throw Object.assign(
-      new Error(
-        "Recovery proof did not match the inspected HEAD and audit fingerprint; the worker remains in attention",
-      ),
-      {
-        code: "WORKSPACE_AUDIT_MISMATCH",
-        details: { inspection, recovery },
-      },
+  const attemptsAreBoundedAndSuccessful = (attempts) =>
+    Array.isArray(attempts) &&
+    attempts.length >= 1 &&
+    attempts.length <= 3 &&
+    attempts.at(-1)?.exitCode === 0 &&
+    attempts.at(-1)?.timedOut === false &&
+    attempts.every(
+      (attempt, index) =>
+        attempt.attempt === index + 1 &&
+        attempt.timeoutSeconds > 0 &&
+        attempt.timeoutSeconds <= 120 &&
+        attempt.backoffMilliseconds >= 0 &&
+        attempt.backoffMilliseconds <= 4_000,
     );
-  }
+  const branchActionMatches =
+    (recovery.branchAction === "created" &&
+      recovery.taskBranchCreated === true &&
+      recovery.taskBranchFastForwarded === false) ||
+    (recovery.branchAction === "existing-compatible" &&
+      recovery.taskBranchCreated === false &&
+      recovery.taskBranchFastForwarded === false) ||
+    (recovery.branchAction === "fast-forwarded" &&
+      recovery.taskBranchCreated === false &&
+      recovery.taskBranchFastForwarded === true);
+
   if (
+    recovery.proofVersion !== 2 ||
+    recovery.proven !== true ||
+    audit.changes.length !== 0 ||
+    inspection.statusBefore.length !== 0 ||
+    inspection.untrackedFiles.length !== 0 ||
+    recovery.auditedHead !== audit.head ||
+    recovery.originalBranch !== audit.branch ||
+    recovery.originalHead !== audit.head ||
+    recovery.auditFingerprint !== audit.fingerprint ||
+    recovery.expectedRemoteTip !== expectedRemoteTip ||
+    recovery.remoteTip !== expectedRemoteTip ||
+    recovery.remoteRef !== "refs/heads/" + taskBranch ||
+    recovery.taskBranch !== taskBranch ||
+    recovery.currentBranch !== taskBranch ||
+    recovery.head !== expectedRemoteTip ||
+    recovery.localTaskHeadAfter !== expectedRemoteTip ||
+    recovery.statusAfter.length !== 0 ||
+    recovery.untrackedFilesAfter.length !== 0 ||
+    recovery.preservationRefCreated !== false ||
+    recovery.preservationRef !== null ||
+    recovery.preservationBranch !== audit.branch ||
+    recovery.preservationCommit !== audit.head ||
+    recovery.preservationParent !== audit.head ||
     recovery.parentVerified !== true ||
     recovery.nameStatusVerified !== true ||
     recovery.treeVerified !== true ||
     recovery.blobVerified !== true ||
-    recovery.taskBranch !== taskBranch ||
-    recovery.currentBranch !== taskBranch ||
-    recovery.taskBranchCreated !== true ||
-    recovery.statusAfter.length !== 0 ||
-    recovery.preservationBranch !== recovery.preservedBranch ||
-    recovery.preservationCommit !== recovery.preservedCommit
+    recovery.verifiedFiles.length !== 0 ||
+    !branchActionMatches ||
+    !attemptsAreBoundedAndSuccessful(recovery.remoteTipAttempts) ||
+    !attemptsAreBoundedAndSuccessful(recovery.fetchAttempts)
   ) {
     throw Object.assign(
       new Error(
-        "Recovery proof did not attest a verified preservation and clean new task branch; the worker remains in attention",
+        "Clean recovery proof did not match the inspected base workspace, durable remote tip, bounded attempt evidence, and final task branch; the worker remains in attention",
       ),
       {
-        code: "WORKSPACE_PRESERVATION_UNPROVEN",
-        details: { inspection, recovery, taskBranch },
-      },
-    );
-  }
-
-  const expectedChanges = new Set(
-    audit.changes.map((change) =>
-      changeKey(change, expectedStatus(String(change.code || ""))),
-    ),
-  );
-  const preservedChanges = Array.isArray(recovery.preservedNameStatus)
-    ? recovery.preservedNameStatus
-    : [];
-  const actualChanges = new Set(
-    preservedChanges.map((change) => changeKey(change)),
-  );
-  if (
-    expectedChanges.size !== actualChanges.size ||
-    [...expectedChanges].some((key) => !actualChanges.has(key))
-  ) {
-    throw Object.assign(
-      new Error(
-        "Recovery commit name-status did not exactly match the inspected change set",
-      ),
-      {
-        code: "WORKSPACE_PRESERVATION_UNPROVEN",
-        details: { inspection, recovery },
-      },
-    );
-  }
-
-  const preservedFiles = new Map(
-    (Array.isArray(recovery.verifiedFiles) ? recovery.verifiedFiles : []).map(
-      (file) => [normalizeGitPath(file.path), file],
-    ),
-  );
-  if (
-    preservedFiles.size !== recovery.verifiedFiles.length ||
-    preservedFiles.size !== audit.changes.length
-  ) {
-    throw Object.assign(
-      new Error(
-        "Recovery proof contained duplicate, missing, or unexpected verified file paths",
-      ),
-      {
-        code: "WORKSPACE_PRESERVATION_UNPROVEN",
-        details: { inspection, recovery },
-      },
-    );
-  }
-  for (const audited of audit.changes) {
-    const path = normalizeGitPath(audited.path);
-    const preserved = preservedFiles.get(path);
-    if (
-      !preserved ||
-      preserved.auditBlob !== audited.auditBlob ||
-      preserved.preservedBlob !== audited.auditBlob
-    ) {
-      throw Object.assign(
-        new Error(
-          `Recovery commit blob for '${path}' did not match the inspection audit`,
-        ),
-        {
-          code: "WORKSPACE_PRESERVATION_UNPROVEN",
-          details: { inspection, recovery },
+        code: "WORKSPACE_RECOVERY_PROOF_MISMATCH",
+        details: {
+          inspection,
+          recovery,
+          taskBranch,
+          expectedRemoteTip,
         },
-      );
-    }
+      },
+    );
   }
   return audit;
 }
@@ -703,7 +699,7 @@ export class HyperVAdapter {
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
         SharePath: context.worker.sharePath || context.project.smbPath,
       },
-      { signal },
+      { signal, timeoutMs: 360_000 },
     );
     if (result.preservedBranch && result.preservedCommit) {
       onProgress?.(
@@ -733,7 +729,7 @@ export class HyperVAdapter {
             "project.guestProjectPath",
           ),
         },
-        { signal },
+        { signal, timeoutMs: 90_000 },
       ),
     );
     if (!inspection.ready || !inspection.repositoryExists) {
@@ -817,7 +813,7 @@ export class HyperVAdapter {
         ExpectedHead: required(inspection.head, "inspection.head"),
         AuditedFilesJson: JSON.stringify(inspection.auditedFiles),
       },
-      { signal },
+      { signal, timeoutMs: 120_000 },
     );
     const verificationStatus = normalizeNullableArray(
       result.status,
@@ -899,7 +895,7 @@ export class HyperVAdapter {
     const audit = requireInspectionAudit(inspection);
     onProgress?.(
       "workspace-recovery",
-      `Guest is on ${inspection.branch || "a detached HEAD"} at ${inspection.head}; preserving it before creating ${context.task.branchName}`,
+      `Guest is on clean ${inspection.branch || "a detached HEAD"} at ${inspection.head}; verifying durable remote tip before recovering ${context.task.branchName}`,
     );
     const result = await this.powershell(
       "Recover-Workspace.ps1",
@@ -912,13 +908,19 @@ export class HyperVAdapter {
         RepoUrl: required(context.project.repoUrl, "project.repoUrl"),
         BaseBranch: required(context.task.baseBranch, "task.baseBranch"),
         TaskBranch: required(context.task.branchName, "task.branchName"),
-        GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
-        GitAuthorEmail:
-          this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
-        AuditJson: JSON.stringify(audit),
+        ExpectedRemoteTip: required(
+          context.task.latestCommitSha,
+          "task.latestCommitSha",
+        ),
         SharePath: context.worker.sharePath || context.project.smbPath,
+        GitNetworkTimeoutSeconds: 45,
+        PowerShellDirectTimeoutSeconds: 360,
       },
-      { signal, responseContract: "recovery-proof" },
+      {
+        signal,
+        timeoutMs: 420_000,
+        responseContract: "recovery-proof",
+      },
     );
     if (
       !result.proven ||
@@ -941,10 +943,11 @@ export class HyperVAdapter {
       inspection,
       result,
       required(context.task.branchName, "task.branchName"),
+      required(context.task.latestCommitSha, "task.latestCommitSha"),
     );
     onProgress?.(
-      "workspace-preserved",
-      `Verified ${result.preservedBranch} at ${result.preservedCommit} before creating ${context.task.branchName}`,
+      "workspace-recovered",
+      `Verified remote ${result.remoteRef} at ${result.remoteTip} and recovered ${context.task.branchName}`,
       {
         originalBranch: result.originalBranch || inspection.branch || null,
         originalHead: result.originalHead || inspection.head || null,
@@ -966,6 +969,12 @@ export class HyperVAdapter {
         auditFingerprint: result.auditFingerprint || null,
         reusedPreservation: Boolean(result.reused),
         preservationVerified: true,
+        remoteRef: result.remoteRef,
+        remoteTip: result.remoteTip,
+        expectedRemoteTip: result.expectedRemoteTip,
+        branchAction: result.branchAction,
+        remoteTipAttempts: result.remoteTipAttempts,
+        fetchAttempts: result.fetchAttempts,
         preTargetCheckoutBranch: result.preTargetCheckoutBranch || null,
         preTargetCheckoutHead: result.preTargetCheckoutHead || null,
       },

@@ -38,20 +38,36 @@ function Invoke-RelayGitProcess {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [hashtable]$Environment = @{}
+        [hashtable]$Environment = @{},
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 60,
+        [string]$Stage = ''
     )
 
+    if ([string]::IsNullOrWhiteSpace($Stage)) {
+        $Stage = "git:$($Arguments[0])"
+    }
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = 'git'
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $nativeArguments = @('-C', $RepositoryPath) + @($Arguments)
+    $nativeArguments = @(
+        '-c', 'http.version=HTTP/1.1',
+        '-c', 'credential.interactive=never',
+        '-c', 'http.lowSpeedLimit=1',
+        '-c', 'http.lowSpeedTime=30',
+        '-C', $RepositoryPath
+    ) + @($Arguments)
     $startInfo.Arguments = (
         $nativeArguments |
             ForEach-Object { ConvertTo-RelayNativeArgument ([string]$_) }
     ) -join ' '
+    $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+    $startInfo.EnvironmentVariables['GIT_ASKPASS'] = ''
+    $startInfo.EnvironmentVariables['SSH_ASKPASS'] = ''
+    $startInfo.EnvironmentVariables['GCM_INTERACTIVE'] = 'Never'
+    $startInfo.EnvironmentVariables['GCM_GUI_PROMPT'] = '0'
     foreach ($name in $Environment.Keys) {
         $value = $Environment[$name]
         if ($null -eq $value) {
@@ -65,16 +81,32 @@ function Invoke-RelayGitProcess {
     $process.StartInfo = $startInfo
     $stdout = New-Object System.IO.MemoryStream
     $stderr = New-Object System.IO.MemoryStream
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $timedOut = $false
+    $exitCode = $null
     try {
         [void]$process.Start()
         $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
         $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderr)
-        $process.WaitForExit()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $timedOut = $true
+            try {
+                # This Process instance owns exactly this Git child. Do not use
+                # a name-based process sweep or unrelated process tree.
+                $process.Kill()
+            } catch {
+                # Preserve the original timeout as the primary diagnostic.
+            }
+            $process.WaitForExit()
+        }
         [System.Threading.Tasks.Task]::WaitAll(
             [System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
         )
-        $exitCode = $process.ExitCode
+        if ($process.HasExited) {
+            $exitCode = $process.ExitCode
+        }
     } finally {
+        $stopwatch.Stop()
         $process.Dispose()
     }
 
@@ -91,6 +123,105 @@ function Invoke-RelayGitProcess {
         stdoutBytes = $stdout.ToArray()
         stdout = $stdoutText
         stderr = $stderrText
+        stage = $Stage
+        timedOut = $timedOut
+        timeoutSeconds = $TimeoutSeconds
+        durationMs = $stopwatch.ElapsedMilliseconds
+    }
+}
+
+function New-RelayGitFailure {
+    param(
+        [Parameter(Mandatory = $true)][object]$Result,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [object[]]$Attempts = @()
+    )
+
+    $message = $Result.stderr.Trim()
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        $message = $Result.stdout.Trim()
+    }
+    $summary = if ([bool]$Result.timedOut) {
+        "Git stage '$($Result.stage)' timed out after $($Result.timeoutSeconds)s; the owned Git child was terminated."
+    } else {
+        "Git stage '$($Result.stage)' failed with exit code $($Result.exitCode): $message"
+    }
+    $exception = if ([bool]$Result.timedOut) {
+        New-Object System.TimeoutException($summary)
+    } else {
+        New-Object System.InvalidOperationException($summary)
+    }
+    $exception.Data['relayStage'] = [string]$Result.stage
+    $exception.Data['relayExitCode'] = $Result.exitCode
+    $exception.Data['relayStdout'] = [string]$Result.stdout
+    $exception.Data['relayStderr'] = [string]$Result.stderr
+    $exception.Data['relayTimedOut'] = [bool]$Result.timedOut
+    $exception.Data['relayAttempts'] = @($Attempts)
+    $exception.Data['relayGitCommand'] = [string]$Arguments[0]
+    return $exception
+}
+
+function Test-RelayTransientGitFailure {
+    param([Parameter(Mandatory = $true)][object]$Result)
+
+    if ([bool]$Result.timedOut) { return $true }
+    $diagnostic = ([string]$Result.stderr + [Environment]::NewLine + [string]$Result.stdout)
+    return $diagnostic -match '(?im)(?:curl\s+18|transfer closed with outstanding read data|early EOF|unexpected disconnect|invalid index-pack output|connection (?:was )?reset|connection reset by peer|operation timed out|low speed|less than \d+ bytes/sec transferred)'
+}
+
+function Invoke-RelayGitWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryPath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [hashtable]$Environment = @{},
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 60,
+        [ValidateRange(1, 3)][int]$MaximumAttempts = 3,
+        [ValidateRange(0, 10000)][int]$InitialBackoffMilliseconds = 1000,
+        [scriptblock]$ProcessInvoker,
+        [scriptblock]$BackoffWaiter
+    )
+
+    $attempts = New-Object System.Collections.Generic.List[object]
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt += 1) {
+        $result = if ($null -eq $ProcessInvoker) {
+            Invoke-RelayGitProcess $RepositoryPath $Arguments $Environment $TimeoutSeconds $Stage
+        } else {
+            & $ProcessInvoker $RepositoryPath $Arguments $Environment $TimeoutSeconds $Stage $attempt
+        }
+        $transient = $result.exitCode -ne 0 -and
+            (Test-RelayTransientGitFailure $result)
+        $backoffMilliseconds = if ($transient -and $attempt -lt $MaximumAttempts) {
+            $InitialBackoffMilliseconds * [Math]::Pow(2, $attempt - 1)
+        } else {
+            0
+        }
+        $attempts.Add([pscustomobject]@{
+            attempt = $attempt
+            stage = $Stage
+            exitCode = $result.exitCode
+            stdout = $result.stdout
+            stderr = $result.stderr
+            timedOut = [bool]$result.timedOut
+            timeoutSeconds = $result.timeoutSeconds
+            durationMs = $result.durationMs
+            transient = [bool]$transient
+            backoffMilliseconds = [int]$backoffMilliseconds
+        })
+        if ($result.exitCode -eq 0 -and -not $result.timedOut) {
+            return [pscustomobject]@{
+                result = $result
+                attempts = $attempts.ToArray()
+            }
+        }
+        if (-not $transient -or $attempt -eq $MaximumAttempts) {
+            throw (New-RelayGitFailure $result $Arguments $attempts.ToArray())
+        }
+        if ($null -eq $BackoffWaiter) {
+            Start-Sleep -Milliseconds $backoffMilliseconds
+        } else {
+            & $BackoffWaiter $backoffMilliseconds $attempt
+        }
     }
 }
 
@@ -98,16 +229,14 @@ function Invoke-RelayGit {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [hashtable]$Environment = @{}
+        [hashtable]$Environment = @{},
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 60,
+        [string]$Stage = ''
     )
 
-    $result = Invoke-RelayGitProcess $RepositoryPath $Arguments $Environment
-    if ($result.exitCode -ne 0) {
-        $message = $result.stderr.Trim()
-        if ([string]::IsNullOrWhiteSpace($message)) {
-            $message = $result.stdout.Trim()
-        }
-        throw "git '$($Arguments[0])' failed with exit code $($result.exitCode): $message"
+    $result = Invoke-RelayGitProcess $RepositoryPath $Arguments $Environment $TimeoutSeconds $Stage
+    if ($result.exitCode -ne 0 -or $result.timedOut) {
+        throw (New-RelayGitFailure $result $Arguments)
     }
     return $result
 }
