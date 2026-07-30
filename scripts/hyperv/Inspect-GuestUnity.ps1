@@ -10,11 +10,8 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 Import-Module Hyper-V -ErrorAction Stop
-
-$credential = Import-Clixml -LiteralPath ([System.IO.Path]::GetFullPath($CredentialPath))
-if ($credential -isnot [System.Management.Automation.PSCredential]) {
-    throw 'CredentialPath did not contain a PSCredential.'
-}
+. (Join-Path $PSScriptRoot 'Credential.ps1')
+$credential = Import-RelayCredential -Path $CredentialPath
 
 $integrationServices = @(Get-VMIntegrationService -VMName $VMName -ErrorAction Stop | ForEach-Object {
     [pscustomobject]@{

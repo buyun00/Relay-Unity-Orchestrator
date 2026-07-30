@@ -12,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
+. (Join-Path $PSScriptRoot 'Credential.ps1')
 
 function ConvertFrom-AuditedFilesJson {
     param([AllowNull()][string]$Json)
@@ -45,10 +46,7 @@ function ConvertTo-VerificationArray {
     return ,([object[]]@($Value))
 }
 
-$credential = Import-Clixml -LiteralPath ([System.IO.Path]::GetFullPath($CredentialPath))
-if ($credential -isnot [System.Management.Automation.PSCredential]) {
-    throw 'CredentialPath did not contain a PSCredential.'
-}
+$credential = Import-RelayCredential -Path $CredentialPath
 
 $helperPath = Join-Path $PSScriptRoot 'Workspace-Git.ps1'
 $guestScriptPath = Join-Path $PSScriptRoot 'Verify-PreservedWorkspace.Guest.ps1'
@@ -122,7 +120,8 @@ if ($null -eq $guestResult -or $guestResult -isnot [psobject]) {
 }
 $guestResult = $guestResult | Select-Object -Property @(
     'ready', 'preserved', 'code', 'message', 'projectPath', 'branch', 'head',
-    'expectedBranch', 'expectedHead', 'changedFiles', 'status', 'auditedFiles'
+    'expectedBranch', 'expectedHead', 'changedFiles', 'status', 'auditedFiles',
+    'auditFingerprint', 'expectedAuditFingerprint', 'auditMatched'
 )
 $result = [pscustomobject]@{
     ready = [bool]$guestResult.ready
@@ -137,6 +136,9 @@ $result = [pscustomobject]@{
     changedFiles = [int]$guestResult.changedFiles
     status = [object[]](ConvertTo-VerificationArray -Value $guestResult.status)
     auditedFiles = [object[]](ConvertTo-VerificationArray -Value $guestResult.auditedFiles)
+    auditFingerprint = $guestResult.auditFingerprint
+    expectedAuditFingerprint = $guestResult.expectedAuditFingerprint
+    auditMatched = [bool]$guestResult.auditMatched
     transport = [pscustomobject]@{
         boundary = 'PowerShellDirect'
         resultRecords = $remoteRecords.Count

@@ -381,7 +381,7 @@ test("real host/guest verification normalizes empty and null audits into one Pow
   );
 });
 
-test("real host/guest verification refuses one or many dirty audited files without mutation", (t) => {
+test("real host/guest verification accepts one or many unchanged audited files without mutation", (t) => {
   for (const count of [1, 2]) {
     const repository = createRepository(t);
     const project = clone(repository, `guest-dirty-task-branch-${count}`);
@@ -414,13 +414,16 @@ test("real host/guest verification refuses one or many dirty audited files witho
 
     const result = verifyThroughHost(t, project, inspection.auditedFiles);
 
-    assert.equal(result.ready, false);
+    assert.equal(result.ready, true);
     assert.equal(result.preserved, true);
-    assert.equal(result.code, "PRESERVED_WORKSPACE_DIRTY");
+    assert.equal(result.code, null);
     assert.equal(result.branch, taskBranch);
     assert.equal(result.head, headBefore);
     assert.equal(result.changedFiles, count);
     assert.equal(result.auditedFiles.length, count);
+    assert.equal(result.auditMatched, true);
+    assert.equal(result.auditFingerprint, inspection.audit.fingerprint);
+    assert.equal(result.expectedAuditFingerprint, inspection.audit.fingerprint);
     assert.equal(result.transport.auditedFilesParameters, 1);
     assert.equal(result.transport.auditedFilesCount, count);
     assert.equal(git(project, "branch", "--show-current"), branchBefore);
@@ -440,6 +443,35 @@ test("real host/guest verification refuses one or many dirty audited files witho
       preservationRefsBefore,
     );
   }
+});
+
+test("real host/guest verification refuses workspace content changed after inspection", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-dirty-changed-after-audit");
+  const prepared = prepare(project, repository);
+  assert.equal(prepared.ready, true);
+  const dirtyPath = path.join(
+    project,
+    "baloot_client",
+    "Assets",
+    "Incident",
+    "dirty-after-audit.meta",
+  );
+  write(dirtyPath, "fileFormatVersion: 2\nguid: before-audit\n");
+  const inspection = inspectThroughHost(t, project);
+  write(dirtyPath, "fileFormatVersion: 2\nguid: after-audit\n");
+
+  const result = verifyThroughHost(t, project, inspection.auditedFiles);
+
+  assert.equal(result.ready, false);
+  assert.equal(result.preserved, true);
+  assert.equal(result.code, "PRESERVED_WORKSPACE_CHANGED_AFTER_INSPECTION");
+  assert.equal(result.auditMatched, false);
+  assert.notEqual(result.auditFingerprint, result.expectedAuditFingerprint);
+  assert.equal(
+    fs.readFileSync(dirtyPath, "utf8"),
+    "fileFormatVersion: 2\nguid: after-audit\n",
+  );
 });
 
 test("recovery preserves every tracked and untracked task-0017 file before target checkout", (t) => {

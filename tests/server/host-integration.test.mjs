@@ -486,7 +486,7 @@ test("an established task branch uses preserved verification without restart or 
   );
 });
 
-test("a dirty established task branch returns branch, HEAD, audit, and transport diagnostics without recovery", async () => {
+test("an unchanged audited task branch resumes without recovery or mutation", async () => {
   const calls = [];
   const preservedContext = context();
   preservedContext.task.number = 17;
@@ -525,23 +525,34 @@ test("a dirty established task branch returns branch, HEAD, audit, and transport
               auditedFilesCount: 1,
             },
           }
-        : {
-            ready: false,
-            preserved: true,
-            code: "PRESERVED_WORKSPACE_DIRTY",
-            message: "Established task branch is not clean",
-            branch: preservedContext.task.branchName,
-            head: "a".repeat(40),
-            changedFiles: 1,
-            status: [{ code: "??", path: auditedFile.path }],
-            auditedFiles: [auditedFile],
-            transport: {
-              boundary: "PowerShellDirect",
-              resultRecords: 1,
-              auditedFilesParameters: 1,
-              auditedFilesCount: 1,
-            },
-          };
+        : name === "Verify-PreservedWorkspace.ps1"
+          ? {
+              ready: true,
+              preserved: true,
+              code: null,
+              message: "Established task branch audit is unchanged",
+              branch: preservedContext.task.branchName,
+              head: "a".repeat(40),
+              changedFiles: 1,
+              status: [{ code: "??", path: auditedFile.path }],
+              auditedFiles: [auditedFile],
+              auditMatched: true,
+              auditFingerprint: "b".repeat(64),
+              expectedAuditFingerprint: "b".repeat(64),
+              transport: {
+                boundary: "PowerShellDirect",
+                resultRecords: 1,
+                auditedFilesParameters: 1,
+                auditedFilesCount: 1,
+              },
+            }
+          : {
+              ready: true,
+              vm: true,
+              heartbeat: true,
+              smb: true,
+              unity: true,
+            };
     return { exitCode: 0, stdout: JSON.stringify(payload), stderr: "" };
   };
   const adapter = new HyperVAdapter(config(), {
@@ -549,21 +560,24 @@ test("a dirty established task branch returns branch, HEAD, audit, and transport
     codex: { inspect: async () => ({}) },
   });
 
-  await assert.rejects(
-    () => adapter.resumePreserved(preservedContext, {}),
-    (error) => {
-      assert.equal(error.code, "PRESERVED_WORKSPACE_DIRTY");
-      assert.equal(error.details.branch, preservedContext.task.branchName);
-      assert.equal(error.details.head, "a".repeat(40));
-      assert.deepEqual(error.details.auditedFiles, [auditedFile]);
-      assert.equal(error.details.transport.boundary, "PowerShellDirect");
-      assert.equal(error.details.transport.auditedFilesParameters, 1);
-      return true;
-    },
+  const progress = [];
+  const result = await adapter.resumePreserved(preservedContext, {
+    onProgress: (phase, message, data) =>
+      progress.push({ phase, message, data }),
+  });
+  assert.equal(result.preserved, true);
+  assert.equal(result.auditMatched, true);
+  assert.equal(
+    progress.some((entry) => entry.phase === "workspace-audit-verified"),
+    true,
   );
   assert.deepEqual(
     calls.map((call) => call.name),
-    ["Inspect-PreservedWorkspace.ps1", "Verify-PreservedWorkspace.ps1"],
+    [
+      "Inspect-PreservedWorkspace.ps1",
+      "Verify-PreservedWorkspace.ps1",
+      "Get-WorkerHealth.ps1",
+    ],
   );
   assert.deepEqual(
     JSON.parse(calls[1].args[calls[1].args.indexOf("-AuditedFilesJson") + 1]),

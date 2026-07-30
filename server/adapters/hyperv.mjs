@@ -785,14 +785,27 @@ export class HyperVAdapter {
       result.auditedFiles,
       "verification.auditedFiles",
     );
+    const changedFiles = Number(result.changedFiles);
+    const cleanVerification =
+      changedFiles === 0 &&
+      verificationStatus.length === 0 &&
+      verificationAuditedFiles.length === 0;
+    const expectedAuditFingerprint =
+      inspection.audit?.fingerprint || inspection.auditFingerprint || null;
+    const unchangedAuditedWorkspace =
+      changedFiles > 0 &&
+      result.auditMatched === true &&
+      typeof expectedAuditFingerprint === "string" &&
+      result.auditFingerprint === expectedAuditFingerprint &&
+      result.expectedAuditFingerprint === expectedAuditFingerprint &&
+      changedFiles === verificationStatus.length &&
+      changedFiles === verificationAuditedFiles.length;
     if (
       result.ready !== true ||
       result.preserved !== true ||
       result.branch !== context.task.branchName ||
       result.head !== inspection.head ||
-      Number(result.changedFiles) !== 0 ||
-      verificationStatus.length !== 0 ||
-      verificationAuditedFiles.length !== 0
+      (!cleanVerification && !unchangedAuditedWorkspace)
     ) {
       throw Object.assign(
         new Error(
@@ -813,6 +826,17 @@ export class HyperVAdapter {
             },
             transport: result.transport || inspection.transport || null,
           },
+        },
+      );
+    }
+    if (unchangedAuditedWorkspace) {
+      onProgress?.(
+        "workspace-audit-verified",
+        `Verified ${changedFiles} unchanged audited workspace modification(s) before resuming Codex`,
+        {
+          auditFingerprint: result.auditFingerprint,
+          changedFiles,
+          paths: verificationAuditedFiles.map((file) => file.path),
         },
       );
     }

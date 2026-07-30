@@ -12,16 +12,14 @@ Set-StrictMode -Version Latest
 $OutputEncoding = [Console]::OutputEncoding
 Import-Module Hyper-V -ErrorAction Stop
 . (Join-Path $PSScriptRoot 'Saved-State-Recovery.ps1')
+. (Join-Path $PSScriptRoot 'Credential.ps1')
 
 $vm = Get-VM -Name $VMName -ErrorAction Stop
 $checkpoint = @(Get-VMSnapshot -VM $vm -Name $CheckpointName -ErrorAction Stop)
 if ($checkpoint.Count -ne 1) {
     throw "Expected exactly one checkpoint named '$CheckpointName' for '$VMName'; found $($checkpoint.Count)."
 }
-$credential = Import-Clixml -LiteralPath ([System.IO.Path]::GetFullPath($CredentialPath))
-if ($credential -isnot [System.Management.Automation.PSCredential]) {
-    throw 'CredentialPath did not contain a PSCredential exported with Export-Clixml.'
-}
+$credential = Import-RelayCredential -Path $CredentialPath
 
 if ($vm.State -eq [Microsoft.HyperV.PowerShell.VMState]::Saved) {
     $null = Remove-RelayVMSavedStatePreservingStorage `

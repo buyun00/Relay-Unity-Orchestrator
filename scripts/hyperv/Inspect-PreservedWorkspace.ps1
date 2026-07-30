@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
+. (Join-Path $PSScriptRoot 'Credential.ps1')
 
 function ConvertTo-InspectionArray {
     param([AllowNull()][object]$Value)
@@ -19,10 +20,7 @@ function ConvertTo-InspectionArray {
     return ,([object[]]@($Value))
 }
 
-$credential = Import-Clixml -LiteralPath ([System.IO.Path]::GetFullPath($CredentialPath))
-if ($credential -isnot [System.Management.Automation.PSCredential]) {
-    throw 'CredentialPath did not contain a PSCredential.'
-}
+$credential = Import-RelayCredential -Path $CredentialPath
 
 $helperPath = Join-Path $PSScriptRoot 'Workspace-Git.ps1'
 $guestScriptPath = Join-Path $PSScriptRoot 'Inspect-PreservedWorkspace.Guest.ps1'

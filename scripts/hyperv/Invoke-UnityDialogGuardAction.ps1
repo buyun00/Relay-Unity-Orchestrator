@@ -16,11 +16,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
-
-$credential = Import-Clixml -LiteralPath ([System.IO.Path]::GetFullPath($CredentialPath))
-if ($credential -isnot [System.Management.Automation.PSCredential]) {
-    throw 'CredentialPath did not contain a PSCredential.'
-}
+. (Join-Path $PSScriptRoot 'Credential.ps1')
+$credential = Import-RelayCredential -Path $CredentialPath
 $requestId = [Guid]::NewGuid().ToString('N')
 
 $response = Invoke-Command -VMName $VMName -Credential $credential -ArgumentList @(

@@ -11,15 +11,13 @@ Set-StrictMode -Version Latest
 $OutputEncoding = [Console]::OutputEncoding
 Import-Module Hyper-V -ErrorAction Stop
 . (Join-Path $PSScriptRoot 'Saved-State-Recovery.ps1')
+. (Join-Path $PSScriptRoot 'Credential.ps1')
 
 $credentialFile = [System.IO.Path]::GetFullPath($CredentialPath)
 if (-not (Test-Path -LiteralPath $credentialFile -PathType Leaf)) {
     throw "Credential file '$credentialFile' does not exist."
 }
-$credential = Import-Clixml -LiteralPath $credentialFile
-if ($credential -isnot [System.Management.Automation.PSCredential]) {
-    throw 'CredentialPath did not contain a PSCredential exported with Export-Clixml.'
-}
+$credential = Import-RelayCredential -Path $credentialFile
 
 $startResult = Start-RelayVMWithSavedStateFallback -VMName $VMName
 

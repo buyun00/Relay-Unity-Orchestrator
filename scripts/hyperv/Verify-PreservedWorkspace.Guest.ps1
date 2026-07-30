@@ -52,7 +52,10 @@ function New-VerificationFailure(
     [AllowNull()][string]$Branch,
     [AllowNull()][string]$Head,
     [AllowNull()][AllowEmptyCollection()][object[]]$Status = @(),
-    [AllowNull()][AllowEmptyCollection()][object[]]$AuditedFiles = @()
+    [AllowNull()][AllowEmptyCollection()][object[]]$AuditedFiles = @(),
+    [AllowNull()][string]$AuditFingerprint = $null,
+    [AllowNull()][string]$ExpectedAuditFingerprint = $null,
+    [bool]$AuditMatched = $false
 ) {
     if ($null -eq $Status) {
         $Status = [object[]]@()
@@ -73,6 +76,9 @@ function New-VerificationFailure(
         changedFiles = @($Status).Count
         status = [object[]]@($Status)
         auditedFiles = [object[]]@($AuditedFiles)
+        auditFingerprint = $AuditFingerprint
+        expectedAuditFingerprint = $ExpectedAuditFingerprint
+        auditMatched = $AuditMatched
     }
 }
 
@@ -124,7 +130,31 @@ if (
         -AuditedFiles $auditedFiles))
 }
 $status = @(Get-RelayWorkspaceStatus $ProjectPath)
-if ($auditedFiles.Count -gt 0 -or $status.Count -gt 0) {
+$currentAuditedFiles = @(
+    foreach ($entry in $status) {
+        $absolutePath = [System.IO.Path]::GetFullPath(
+            (Join-Path $ProjectPath $entry.path)
+        )
+        [pscustomobject]@{
+            code = $entry.code
+            path = $entry.path
+            originalPath = $entry.originalPath
+            auditBlob = if ([System.IO.File]::Exists($absolutePath)) {
+                Get-RelayPathBlob $ProjectPath $entry.path
+            } else {
+                ''
+            }
+        }
+    }
+)
+$expectedAuditFingerprint = Get-RelayAuditFingerprint `
+    -Head $currentHead `
+    -AuditedFiles $auditedFiles
+$currentAuditFingerprint = Get-RelayAuditFingerprint `
+    -Head $currentHead `
+    -AuditedFiles $currentAuditedFiles
+$auditMatched = $currentAuditFingerprint -eq $expectedAuditFingerprint
+if (-not $auditMatched) {
     $blockedPaths = @(
         @($auditedFiles | ForEach-Object { [string]$_.path }) +
         @($status | ForEach-Object { [string]$_.path }) |
@@ -132,25 +162,34 @@ if ($auditedFiles.Count -gt 0 -or $status.Count -gt 0) {
             Sort-Object -Unique
     )
     return (Complete-Verification (New-VerificationFailure `
-        -Code 'PRESERVED_WORKSPACE_DIRTY' `
-        -Message "Established task branch '$ExpectedBranch' is not clean; refusing to resume Codex: $($blockedPaths -join ', ')" `
+        -Code 'PRESERVED_WORKSPACE_CHANGED_AFTER_INSPECTION' `
+        -Message "Established task branch '$ExpectedBranch' changed after its audit; refusing to resume Codex: $($blockedPaths -join ', ')" `
         -Branch $currentBranch `
         -Head $currentHead `
         -Status $status `
-        -AuditedFiles $auditedFiles))
+        -AuditedFiles $currentAuditedFiles `
+        -AuditFingerprint $currentAuditFingerprint `
+        -ExpectedAuditFingerprint $expectedAuditFingerprint))
 }
 $result = [pscustomobject]@{
     ready = $true
     code = $null
-    message = "Established task branch '$ExpectedBranch' is clean and verified."
+    message = if ($status.Count -eq 0) {
+        "Established task branch '$ExpectedBranch' is clean and verified."
+    } else {
+        "Established task branch '$ExpectedBranch' has $($status.Count) unchanged audited modification(s) and is verified for resume."
+    }
     projectPath = $ProjectPath
     branch = $currentBranch
     head = $currentHead
     expectedBranch = $ExpectedBranch
     expectedHead = $ExpectedHead
-    changedFiles = 0
-    status = [object[]]@()
-    auditedFiles = [object[]]@()
+    changedFiles = $status.Count
+    status = [object[]]@($status)
+    auditedFiles = [object[]]@($currentAuditedFiles)
+    auditFingerprint = $currentAuditFingerprint
+    expectedAuditFingerprint = $expectedAuditFingerprint
+    auditMatched = $true
     preserved = $true
 }
 Complete-Verification $result
