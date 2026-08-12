@@ -56,6 +56,7 @@ async function invokeAudit({
   changedFiles = ["Assets/Only.cs"],
   validation = ["PowerShell syntax passed", "targeted tests passed"],
   expectedAudit = null,
+  approvedOverlayPaths = [],
 }) {
   const args = [
     "-NoLogo",
@@ -78,7 +79,12 @@ async function invokeAudit({
   if (expectedHead) args.push("-ExpectedHead", expectedHead);
   if (expectedAudit)
     args.push("-ExpectedAuditJson", JSON.stringify(expectedAudit));
-  const result = await run(powershell, args);
+  const result = await run(powershell, args, {
+    env: {
+      ...process.env,
+      RELAY_APPROVED_OVERLAY_PATHS_JSON: JSON.stringify(approvedOverlayPaths),
+    },
+  });
   return JSON.parse(result.stdout.trim());
 }
 
@@ -139,4 +145,131 @@ test("delivery audit accepts the exact tracked file and rejects hash or extra-fi
   assert.equal(extraFile.ready, false);
   assert.equal(extraFile.code, "DELIVERY_RETRY_AUDIT_MISMATCH");
   assert.ok(extraFile.blockedPaths.includes("Assets/Extra.cs"));
+});
+
+test("delivery audit excludes only explicitly approved skip-worktree overlays", async (t) => {
+  const { repository } = await createRepository(t);
+  const overlayPath = "Packages/manifest.json";
+  const overlay = path.join(repository, ...overlayPath.split("/"));
+  fs.mkdirSync(path.dirname(overlay), { recursive: true });
+  fs.writeFileSync(overlay, '{"unitySkills":"remote"}\n');
+  await run(git, ["-C", repository, "add", "--", overlayPath]);
+  await run(git, ["-C", repository, "commit", "-m", "track overlay"]);
+  await run(git, [
+    "-C",
+    repository,
+    "update-index",
+    "--skip-worktree",
+    "--",
+    overlayPath,
+  ]);
+  fs.writeFileSync(overlay, '{"unitySkills":"local"}\n');
+
+  const unapproved = await invokeAudit({ repository });
+  assert.equal(unapproved.ready, true);
+  assert.equal(unapproved.completeFileSet, false);
+  assert.equal(unapproved.safeForDeliveryRetry, false);
+  assert.ok(unapproved.blockedPaths.includes(overlayPath));
+
+  const approved = await invokeAudit({
+    repository,
+    approvedOverlayPaths: [overlayPath],
+  });
+  assert.equal(approved.ready, true);
+  assert.equal(approved.completeFileSet, true);
+  assert.equal(approved.safeForDeliveryRetry, true);
+  assert.deepEqual(
+    approved.files.map(({ path: filePath }) => filePath),
+    ["Assets/Only.cs"],
+  );
+  assert.deepEqual(approved.blockedPaths, []);
+});
+
+test("delivery audit reconstructs an exact multi-file commit result from a clean HEAD", async (t) => {
+  const { repository } = await createRepository(t);
+  const secondPath = "Assets/Second.cs";
+  fs.writeFileSync(path.join(repository, "Assets", "Second.cs"), "baseline\n");
+  await run(git, ["-C", repository, "add", "--", secondPath]);
+  await run(git, ["-C", repository, "commit", "-m", "track second file"]);
+  fs.writeFileSync(path.join(repository, "Assets", "Second.cs"), "intended\n");
+  await run(git, [
+    "-C",
+    repository,
+    "add",
+    "--",
+    "Assets/Only.cs",
+    secondPath,
+  ]);
+  await run(git, ["-C", repository, "commit", "-m", "Codex result"]);
+  const head = (
+    await run(git, ["-C", repository, "rev-parse", "HEAD"])
+  ).stdout
+    .trim()
+    .toLowerCase();
+
+  const recorded = await invokeAudit({
+    repository,
+    changedFiles: ["Assets/Only.cs", secondPath],
+  });
+  assert.equal(recorded.ready, true);
+  assert.equal(recorded.exact, true);
+  assert.equal(recorded.safeForDeliveryRetry, true);
+  assert.equal(recorded.completeFileSet, true);
+  assert.equal(recorded.head, head);
+  assert.equal(recorded.source, "head-commit");
+  assert.deepEqual(
+    recorded.files.map(({ code, path: filePath }) => ({ code, filePath })),
+    [
+      { code: " M", filePath: "Assets/Only.cs" },
+      { code: " M", filePath: secondPath },
+    ],
+  );
+  assert.deepEqual(recorded.blockedPaths, []);
+
+  const exact = await invokeAudit({
+    repository,
+    expectedHead: head,
+    expectedAudit: recorded,
+    changedFiles: ["Assets/Only.cs", secondPath],
+  });
+  assert.equal(exact.ready, true);
+  assert.equal(exact.exact, true);
+  assert.equal(exact.source, "head-commit");
+  assert.equal(exact.fingerprint, recorded.fingerprint);
+});
+
+test("delivery audit reconstructs committed additions from a clean HEAD", async (t) => {
+  const { repository } = await createRepository(t);
+  await run(git, ["-C", repository, "add", "--", "Assets/Only.cs"]);
+  await run(git, ["-C", repository, "commit", "-m", "Clean parent"]);
+  const addedPaths = ["Assets/Added.cs", "Assets/Added.cs.meta"];
+  fs.writeFileSync(path.join(repository, "Assets", "Added.cs"), "added\n");
+  fs.writeFileSync(
+    path.join(repository, "Assets", "Added.cs.meta"),
+    "fileFormatVersion: 2\n",
+  );
+  await run(git, ["-C", repository, "add", "--", ...addedPaths]);
+  await run(git, ["-C", repository, "commit", "-m", "Add Codex result"]);
+
+  const recorded = await invokeAudit({
+    repository,
+    changedFiles: addedPaths,
+  });
+  assert.equal(recorded.ready, true);
+  assert.equal(recorded.exact, true);
+  assert.equal(recorded.safeForDeliveryRetry, true);
+  assert.equal(recorded.completeFileSet, true);
+  assert.equal(recorded.source, "head-commit");
+  assert.deepEqual(
+    recorded.files.map(({ code, path: filePath, unsafeReason }) => ({
+      code,
+      filePath,
+      unsafeReason,
+    })),
+    [
+      { code: "A ", filePath: addedPaths[0], unsafeReason: null },
+      { code: "A ", filePath: addedPaths[1], unsafeReason: null },
+    ],
+  );
+  assert.deepEqual(recorded.blockedPaths, []);
 });

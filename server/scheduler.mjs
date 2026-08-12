@@ -187,6 +187,7 @@ export class Scheduler {
     const signal = controller.signal;
     try {
       let codexFinal;
+      let deliveryAudit = context.turn.deliveryAudit || null;
       if (context.deliveryOnlyRetry) {
         codexFinal = context.turn.codexFinal;
         if (
@@ -323,7 +324,7 @@ export class Scheduler {
           );
           return;
         }
-        const deliveryAudit = await this.adapter.auditDeliveryWorkspace(
+        deliveryAudit = await this.adapter.auditDeliveryWorkspace(
           context,
           codexFinal,
           {
@@ -346,6 +347,57 @@ export class Scheduler {
         onProgress: (phase, message, data = null) =>
           this.emitProgress(context, phase, message, "info", data),
       });
+      if (
+        !context.deliveryOnlyRetry &&
+        deliveryAudit?.safeForDeliveryRetry !== true
+      ) {
+        try {
+          const committedAudit = await this.adapter.auditDeliveryWorkspace(
+            context,
+            codexFinal,
+            {
+              signal,
+              onProgress: (phase, message, data = null) =>
+                this.emitProgress(context, phase, message, "info", data),
+            },
+          );
+          if (
+            committedAudit?.ready === true &&
+            committedAudit?.exact === true &&
+            committedAudit?.safeForDeliveryRetry === true &&
+            committedAudit?.completeFileSet === true &&
+            committedAudit?.head === delivery.commitSha
+          ) {
+            deliveryAudit = committedAudit;
+            this.store.recordDeliveryAudit(context.turn.id, committedAudit);
+          } else {
+            this.emitProgress(
+              context,
+              "delivery-audit-post-commit",
+              "Committed delivery completed, but the post-commit exact audit remained unsafe; preserving the original audit",
+              "warning",
+              {
+                commitSha: delivery.commitSha,
+                auditHead: committedAudit?.head || null,
+                safeForDeliveryRetry:
+                  committedAudit?.safeForDeliveryRetry === true,
+                completeFileSet: committedAudit?.completeFileSet === true,
+              },
+            );
+          }
+        } catch (auditError) {
+          this.emitProgress(
+            context,
+            "delivery-audit-post-commit",
+            `Committed delivery completed, but post-commit audit refresh failed: ${auditError?.message || String(auditError)}`,
+            "warning",
+            {
+              commitSha: delivery.commitSha,
+              code: auditError?.code || "POST_COMMIT_DELIVERY_AUDIT_FAILED",
+            },
+          );
+        }
+      }
       this.store.completeTurn(context.turn.id, {
         codexFinal,
         commitSha: delivery.commitSha,

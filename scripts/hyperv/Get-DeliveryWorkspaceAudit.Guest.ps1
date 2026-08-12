@@ -108,6 +108,91 @@ function Test-ExactStringArray {
     return $true
 }
 
+function Get-CommittedHeadStatus {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryPath,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$ExpectedPaths
+    )
+
+    if ($ExpectedPaths.Count -eq 0) {
+        return @()
+    }
+
+    # This fallback is deliberately narrow: only a normal single-parent HEAD
+    # whose complete delta is the declared set of added or modified tracked
+    # files can represent a Codex result that was committed before Relay
+    # recorded it. Deletes and rename/copy pairs remain ineligible.
+    $parentRecord = Get-RelayGitValue $RepositoryPath @(
+        'rev-list', '--parents', '-n', '1', 'HEAD'
+    )
+    $commitIds = @($parentRecord -split '\s+' | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    })
+    if ($commitIds.Count -ne 2) {
+        return @()
+    }
+
+    $allDelta = Invoke-RelayGit $RepositoryPath @(
+        'diff-tree', '--no-commit-id', '--name-only', '--no-renames',
+        '-r', '-z', $commitIds[1], $commitIds[0]
+    )
+    $modifiedDelta = Invoke-RelayGit $RepositoryPath @(
+        'diff-tree', '--no-commit-id', '--name-only', '--no-renames',
+        '--diff-filter=M', '-r', '-z', $commitIds[1], $commitIds[0]
+    )
+    $addedDelta = Invoke-RelayGit $RepositoryPath @(
+        'diff-tree', '--no-commit-id', '--name-only', '--no-renames',
+        '--diff-filter=A', '-r', '-z', $commitIds[1], $commitIds[0]
+    )
+    $allPaths = [string[]]@(
+        ConvertFrom-RelayNulFields $allDelta.stdoutBytes |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { ConvertTo-RelayGitPath $_ }
+    )
+    $modifiedPaths = [string[]]@(
+        ConvertFrom-RelayNulFields $modifiedDelta.stdoutBytes |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { ConvertTo-RelayGitPath $_ }
+    )
+    $addedPaths = [string[]]@(
+        ConvertFrom-RelayNulFields $addedDelta.stdoutBytes |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { ConvertTo-RelayGitPath $_ }
+    )
+    $auditablePaths = [string[]]@($addedPaths + $modifiedPaths)
+    $sortedExpected = Get-OrdinalSortedStrings -Values $ExpectedPaths
+    $sortedAll = Get-OrdinalSortedStrings -Values $allPaths
+    $sortedAuditable = Get-OrdinalSortedStrings -Values $auditablePaths
+    if (
+        -not (Test-ExactStringArray -Left $sortedExpected -Right $sortedAll) -or
+        -not (Test-ExactStringArray -Left $sortedExpected -Right $sortedAuditable)
+    ) {
+        return @()
+    }
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($statusPath in $addedPaths) {
+        $entries.Add([pscustomobject]@{
+            code = 'A '
+            path = $statusPath
+            originalPath = $null
+        })
+    }
+    foreach ($statusPath in $modifiedPaths) {
+        $entries.Add([pscustomobject]@{
+            code = ' M'
+            path = $statusPath
+            originalPath = $null
+        })
+    }
+    # Let PowerShell emit one status object per pipeline record. Wrapping the
+    # object[] in a unary comma nests the entire delta as one entry; property
+    # enumeration then space-joins every code and path in multi-file commits.
+    return [object[]]$entries.ToArray()
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -266,6 +351,18 @@ if (
 }
 
 $status = @(Get-RelayWorkspaceStatus $ProjectPath)
+$auditSource = 'workspace'
+if ($status.Count -eq 0 -and $script:changedFiles.Count -gt 0) {
+    $committedHeadStatus = @(
+        Get-CommittedHeadStatus `
+            -RepositoryPath $ProjectPath `
+            -ExpectedPaths $script:changedFiles
+    )
+    if ($committedHeadStatus.Count -gt 0) {
+        $status = $committedHeadStatus
+        $auditSource = 'head-commit'
+    }
+}
 $files = New-Object System.Collections.Generic.List[object]
 $blocked = New-Object System.Collections.Generic.List[string]
 $actualPaths = New-Object System.Collections.Generic.List[string]
@@ -350,7 +447,11 @@ $currentAudit = [pscustomobject]@{
     safeForDeliveryRetry = $safeForRetry
     code = $null
     message = if ($safeForRetry) {
-        "Recorded an exact delivery audit for $($files.Count) modified tracked file(s)."
+        if ($auditSource -eq 'head-commit') {
+            "Recorded an exact delivery audit for $($files.Count) modified tracked file(s) from the committed HEAD delta."
+        } else {
+            "Recorded an exact delivery audit for $($files.Count) modified tracked file(s)."
+        }
     } else {
         'Recorded delivery state, but it is not eligible for delivery-only retry.'
     }
@@ -365,6 +466,7 @@ $currentAudit = [pscustomobject]@{
     files = [object[]]$files.ToArray()
     blockedPaths = [string[]]@($blockedPaths)
     fingerprint = $fingerprint
+    source = $auditSource
 }
 if ($null -eq $expectedAudit) {
     return (Complete-DeliveryAudit $currentAudit)
