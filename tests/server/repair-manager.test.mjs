@@ -89,6 +89,33 @@ function createConfig(root, dataDirectory, autoDeploy) {
   };
 }
 
+test("self-repair scopes safe.directory to each Git working directory", async () => {
+  const root = path.resolve("D:\\Relay-Unity-Orchestrator");
+  const calls = [];
+  const manager = new RepairManager(
+    {
+      config: createConfig(root, path.join(root, ".repair-test"), false),
+      store: new MemoryRepairStore(),
+    },
+    {
+      processRunner: async (command, args, options) => {
+        calls.push({ command, args, options });
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    },
+  );
+
+  await manager.git(["status", "--porcelain"]);
+
+  assert.deepEqual(calls[0].args, [
+    "-c",
+    `safe.directory=${root.replaceAll("\\", "/")}`,
+    "status",
+    "--porcelain",
+  ]);
+  assert.equal(calls[0].options.cwd, root);
+});
+
 test("self-repair commits, fast-forwards, records deployment, and requests Guardian restart", async (t) => {
   const root = await createRepository();
   const dataDirectory = fs.mkdtempSync(

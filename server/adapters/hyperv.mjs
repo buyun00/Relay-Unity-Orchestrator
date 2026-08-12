@@ -767,6 +767,12 @@ export class HyperVAdapter {
     const workspaceEstablished = Boolean(
       context.workspaceEstablished || context.task.codexThreadId,
     );
+    if (!context.task.latestCommitSha && !workspaceEstablished) {
+      return this.retryInitialPreparation(context, inspection, {
+        signal,
+        onProgress,
+      });
+    }
     if (inspection.branch === taskBranch) {
       if (!workspaceEstablished) {
         throw Object.assign(
@@ -794,6 +800,56 @@ export class HyperVAdapter {
       signal,
       onProgress,
     });
+  }
+
+  async retryInitialPreparation(context, inspection, { signal, onProgress }) {
+    onProgress?.(
+      "workspace-initial-retry",
+      `Retrying initial preparation of ${context.task.branchName} without restoring the checkpoint or restarting ${context.worker.vmName}`,
+      {
+        originalBranch: inspection.branch || null,
+        originalHead: inspection.head || null,
+        auditFingerprint:
+          inspection.audit?.fingerprint || inspection.auditFingerprint || null,
+      },
+    );
+    const result = await this.powershell(
+      "Prepare-Workspace.ps1",
+      {
+        ...this.workerArguments(context.worker),
+        GuestProjectPath: required(
+          context.project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+        RepoUrl: required(context.project.repoUrl, "project.repoUrl"),
+        BaseBranch: required(context.task.baseBranch, "task.baseBranch"),
+        TaskBranch: required(context.task.branchName, "task.branchName"),
+        Mode: "new",
+        GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
+        GitAuthorEmail:
+          this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
+        SharePath: context.worker.sharePath || context.project.smbPath,
+      },
+      { signal, timeoutMs: 360_000 },
+    );
+    onProgress?.(
+      "workspace-initial-prepared",
+      `Initial task branch ${context.task.branchName} was prepared without a checkpoint restore`,
+      {
+        branch: result.currentBranch || result.branch || null,
+        head: result.head || null,
+      },
+    );
+    return this.finishPreservedResume(
+      context,
+      {
+        ...result,
+        inspection,
+        recoveryPrepared: false,
+        initialPreparationRetried: true,
+      },
+      { onProgress },
+    );
   }
 
   async verifyPreserved(context, inspection, { signal, onProgress }) {
@@ -1001,9 +1057,11 @@ export class HyperVAdapter {
     }
     onProgress?.(
       "unity",
-      result.recoveryPrepared
-        ? "Recovered task branch, Unity, and SMB are ready"
-        : "Preserved Git branch, Unity, and SMB are ready",
+      result.initialPreparationRetried
+        ? "Initially prepared task branch, Unity, and SMB are ready"
+        : result.recoveryPrepared
+          ? "Recovered task branch, Unity, and SMB are ready"
+          : "Preserved Git branch, Unity, and SMB are ready",
     );
     return { ...result, preserved: true };
   }

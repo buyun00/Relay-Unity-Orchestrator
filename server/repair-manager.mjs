@@ -40,6 +40,10 @@ function safeRepairSuffix(repairId) {
     .toLowerCase();
 }
 
+function gitSafeDirectory(cwd) {
+  return path.resolve(cwd).replaceAll("\\", "/");
+}
+
 export class RepairManager {
   constructor(
     { config, store },
@@ -62,11 +66,16 @@ export class RepairManager {
   }
 
   async git(args, { cwd = this.config.projectRoot, ...options } = {}) {
-    return this.processRunner(this.gitCommand, args, {
-      cwd,
-      timeoutMs: 10 * 60 * 1000,
-      ...options,
-    });
+    const resolvedCwd = path.resolve(cwd);
+    return this.processRunner(
+      this.gitCommand,
+      ["-c", `safe.directory=${gitSafeDirectory(resolvedCwd)}`, ...args],
+      {
+        cwd: resolvedCwd,
+        timeoutMs: 10 * 60 * 1000,
+        ...options,
+      },
+    );
   }
 
   emit(repair, message, level = "info", data = null) {

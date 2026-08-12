@@ -589,6 +589,69 @@ test("an unchanged audited task branch resumes without recovery or mutation", as
   );
 });
 
+test("a failed initial preparation without a commit retries preparation without restoring the checkpoint", async () => {
+  const calls = [];
+  const retryContext = context();
+  retryContext.workspaceEstablished = false;
+  retryContext.task.latestCommitSha = null;
+  const auditedHead = "1".repeat(40);
+  const processRunner = async (command, args) => {
+    const name = scriptName(args);
+    calls.push({ name, args });
+    const payload =
+      name === "Inspect-PreservedWorkspace.ps1"
+        ? recoveryInspection({
+            auditedHead,
+            auditFingerprint: "5".repeat(64),
+          })
+        : name === "Prepare-Workspace.ps1"
+          ? {
+              ready: true,
+              branch: retryContext.task.branchName,
+              currentBranch: retryContext.task.branchName,
+              head: "2".repeat(40),
+            }
+          : {
+              ready: true,
+              vm: true,
+              heartbeat: true,
+              smb: true,
+              unity: true,
+            };
+    return { exitCode: 0, stdout: JSON.stringify(payload), stderr: "" };
+  };
+  const adapter = new HyperVAdapter(config({ checkpointsEnabled: true }), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  const result = await adapter.resumePreserved(retryContext, {});
+
+  assert.equal(result.preserved, true);
+  assert.equal(result.initialPreparationRetried, true);
+  assert.deepEqual(
+    calls.map((call) => call.name),
+    [
+      "Inspect-PreservedWorkspace.ps1",
+      "Prepare-Workspace.ps1",
+      "Get-WorkerHealth.ps1",
+    ],
+  );
+  const preparation = calls.find(
+    (call) => call.name === "Prepare-Workspace.ps1",
+  );
+  assert.equal(
+    preparation.args[preparation.args.indexOf("-Mode") + 1],
+    "new",
+  );
+  assert.equal(
+    calls.some((call) =>
+      ["Restore-Worker.ps1", "Recover-Workspace.ps1"].includes(call.name),
+    ),
+    false,
+  );
+});
+
 test("a pre-Codex clean-main failure verifies the durable remote tip before recovery", async () => {
   const calls = [];
   const progress = [];
