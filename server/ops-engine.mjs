@@ -20,12 +20,17 @@ const INCIDENT_EVENT_TYPES = new Set([
   "system.runtime.unhealthy",
   "guardian.health.failed",
   "guardian.restart.failed",
+  "checkpoint.maintenance.failed",
 ]);
 
 const INCIDENT_RECOVERY_EVENT_TYPES = new Map([
   [
     "guardian.health.recovered",
     new Set(["guardian.health.failed", "guardian.restart.failed"]),
+  ],
+  [
+    "checkpoint.maintenance.completed",
+    new Set(["checkpoint.maintenance.failed"]),
   ],
 ]);
 
@@ -232,7 +237,12 @@ export class OpsEngine {
       if (incident.status !== "monitoring" && !sameRecoveryKind) continue;
       const sameTask = event.taskId && incident.taskId === event.taskId;
       const sameWorker = event.workerId && incident.workerId === event.workerId;
-      if (!sameTask && !sameWorker && !sameRecoveryKind) continue;
+      const sameRecoveryTarget = Boolean(
+        sameRecoveryKind &&
+          (!incident.taskId || sameTask) &&
+          (!incident.workerId || sameWorker),
+      );
+      if (!sameTask && !sameWorker && !sameRecoveryTarget) continue;
       this.store.updateIncident(incident.id, {
         status: "resolved",
         lastAction: event.type,
