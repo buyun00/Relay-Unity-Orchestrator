@@ -344,6 +344,7 @@ export class Scheduler {
       );
       const delivery = await this.adapter.finalize(context, {
         signal,
+        deliveryAudit,
         onProgress: (phase, message, data = null) =>
           this.emitProgress(context, phase, message, "info", data),
       });

@@ -1135,10 +1135,10 @@ export class HyperVAdapter {
         TaskBranch: required(context.task.branchName, "task.branchName"),
         ExpectedHead: required(expectedAudit?.head, "deliveryAudit.head"),
         ChangedFilesJson: JSON.stringify(
-          codexStringArray(context.turn.codexFinal?.changedFiles),
+          codexStringArray(expectedAudit?.changedFiles),
         ),
         ValidationJson: JSON.stringify(
-          codexStringArray(context.turn.codexFinal?.validation),
+          codexStringArray(expectedAudit?.validation),
         ),
         ExpectedAuditJson: JSON.stringify(expectedAudit),
       },
@@ -1162,7 +1162,21 @@ export class HyperVAdapter {
     return result;
   }
 
-  async finalize(context, { signal, onProgress }) {
+  async finalize(context, { signal, onProgress, deliveryAudit }) {
+    if (
+      deliveryAudit?.ready !== true ||
+      deliveryAudit?.exact !== true ||
+      deliveryAudit?.safeForDeliveryRetry !== true ||
+      deliveryAudit?.completeFileSet !== true ||
+      !Array.isArray(deliveryAudit?.files)
+    ) {
+      throw Object.assign(
+        new Error(
+          "An exact safe delivery audit is required before Unity save and Git finalization",
+        ),
+        { code: "DELIVERY_AUDIT_REQUIRED" },
+      );
+    }
     const configuredUnitySaveUrl = resolveWorkerTemplate(
       context.project.unitySaveUrl,
       context.worker,
@@ -1195,6 +1209,19 @@ export class HyperVAdapter {
         { signal, timeoutMs: 120_000 },
       );
     }
+    await this.verifyDeliveryRetryWorkspace(context, deliveryAudit, {
+      signal,
+      onProgress: (phase, message, data = null) =>
+        onProgress?.(
+          phase === "delivery-retry-audit"
+            ? "delivery-audit-post-save"
+            : phase,
+          phase === "delivery-retry-audit"
+            ? "Verifying Unity save did not change the exact audited delivery workspace"
+            : message,
+          data,
+        ),
+    });
     onProgress?.("commit", "Committing changes inside the guest");
     onProgress?.(
       "push",
@@ -1210,6 +1237,7 @@ export class HyperVAdapter {
         ),
         TaskBranch: required(context.task.branchName, "task.branchName"),
         CommitMessage: `task #${context.task.number} turn ${context.turn.sequence}: ${context.task.title}`,
+        ExpectedAuditJson: JSON.stringify(deliveryAudit),
         GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
         GitAuthorEmail:
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
