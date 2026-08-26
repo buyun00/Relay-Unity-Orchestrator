@@ -188,7 +188,6 @@ function defaultPayload(event) {
   copy("buildProjectKey", "buildProjectKey", "projectKey");
   copy("buildBranch", "buildBranch", "branch");
   copy("buildMode", "buildMode", "mode");
-  copy("sourceCommitSha", "sourceCommitSha", "commitSha");
   copy("buildRequirement", "buildRequirement");
   return payload;
 }
