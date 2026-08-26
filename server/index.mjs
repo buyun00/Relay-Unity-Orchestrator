@@ -176,7 +176,16 @@ if (config.qaHubM2mEnabled) {
     if (record) qaHubPersistence.enqueue(record);
   };
   stopQaHubDurableEventSink = store.onDurableEvent(persistQaHubEvent);
-  for (const event of qaHubPersistence.listBoundEvents()) persistQaHubEvent(event);
+  for (const event of qaHubPersistence.listBoundEvents()) {
+    try {
+      persistQaHubEvent(event);
+    } catch (error) {
+      // The durable outbox body is immutable. A deployment may deliberately
+      // normalize future events differently, so startup recovery must retain
+      // the already-recorded delivery instead of rewriting its payload.
+      if (error?.code !== "INTEGRATION_EVENT_CONFLICT") throw error;
+    }
+  }
 }
 const checkpointMaintenance = new CheckpointMaintenance({
   config,
