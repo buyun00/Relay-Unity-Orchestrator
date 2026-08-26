@@ -599,6 +599,7 @@ export class Store {
   constructor(config) {
     this.config = config;
     this.listeners = new Set();
+    this.durableEventSinks = new Set();
     fs.mkdirSync(config.dataDirectory, { recursive: true });
     fs.mkdirSync(config.uploadDirectory, { recursive: true });
     fs.mkdirSync(config.logDirectory, { recursive: true });
@@ -1399,6 +1400,11 @@ export class Store {
     return () => this.listeners.delete(listener);
   }
 
+  onDurableEvent(listener) {
+    this.durableEventSinks.add(listener);
+    return () => this.durableEventSinks.delete(listener);
+  }
+
   insertEvent({
     taskId = null,
     turnId = null,
@@ -1452,6 +1458,10 @@ export class Store {
       data,
       createdAt,
     };
+    // Durable sinks write through this same SQLite connection. When the source
+    // event is inside a Store transaction, their outbox row commits or rolls
+    // back with it; failures intentionally propagate instead of losing facts.
+    for (const sink of this.durableEventSinks) sink(event);
     return event;
   }
 
@@ -1949,6 +1959,7 @@ export class Store {
       this.archiveTaskPrompt(turnId);
       const task = this.getTask(taskId);
       const turn = this.getTurn(turnId);
+      input.onCreatedInTransaction?.({ task, turn });
       queueMicrotask(() =>
         this.emit({
           taskId,
@@ -2194,8 +2205,12 @@ export class Store {
         )
         .run(executing ? "running" : "queued", priority, timestamp, taskId);
       this.attachUploads(input.attachments, taskId, turnId);
+      for (const attachment of input.preparedAttachments || []) {
+        this.createAttachment({ ...attachment, taskId, turnId });
+      }
       this.archiveTaskPrompt(turnId);
       const turn = this.getTurn(turnId);
+      input.onCreatedInTransaction?.({ task: this.getTask(taskId), turn });
       queueMicrotask(() =>
         this.emit({
           taskId,

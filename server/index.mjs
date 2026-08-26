@@ -1,3 +1,5 @@
+import fs from "node:fs";
+
 import { config } from "./config.mjs";
 import { createAdapter } from "./adapters/index.mjs";
 import { BuildDispatcher } from "./build-dispatcher.mjs";
@@ -12,9 +14,50 @@ import { OzdqpBuildClient } from "./ozdqp-build-client.mjs";
 import { OpsEngine } from "./ops-engine.mjs";
 import { ProjectManagementClient } from "./project-management-client.mjs";
 import { ProjectManagementSessionStore } from "./project-management-session-store.mjs";
+import { QaHubM2MService } from "./qa-hub-m2m.mjs";
+import { QaHubM2mSqliteStore } from "./qa-hub-m2m-store.mjs";
+import {
+  normalizeQaHubWebhookEvent,
+  QaHubWebhookOutbox,
+} from "./qa-hub-webhook-outbox.mjs";
 import { RepairManager } from "./repair-manager.mjs";
 import { Scheduler } from "./scheduler.mjs";
 import { TaskCompletionService } from "./task-completion-service.mjs";
+
+function readSecretFile(filePath, label) {
+  if (!filePath) throw new Error(`${label} file is not configured`);
+  const value = fs.readFileSync(filePath, "utf8").trim();
+  if (!value) throw new Error(`${label} file is empty`);
+  return value;
+}
+
+function qaHubProjectMap(raw) {
+  const result = new Map();
+  for (const entry of String(raw || "").split(",")) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0 || separator === entry.length - 1) continue;
+    const qaProjectKey = entry.slice(0, separator).trim();
+    const relayProjectId = entry.slice(separator + 1).trim();
+    if (qaProjectKey && relayProjectId) result.set(qaProjectKey, relayProjectId);
+  }
+  if (result.size === 0) {
+    throw new Error("QA Hub project allowlist is empty or invalid");
+  }
+  return result;
+}
+
+function qaHubWebhookEndpoint(value) {
+  const endpoint = new URL(value);
+  if (
+    endpoint.protocol !== "http:" ||
+    endpoint.hostname !== "127.0.0.1" ||
+    endpoint.username ||
+    endpoint.password
+  ) {
+    throw new Error("QA Hub webhook endpoint must be credential-free loopback HTTP");
+  }
+  return endpoint.toString();
+}
 
 const store = new Store(config);
 const auditLog = new DailyAuditLogger({
@@ -59,6 +102,82 @@ guardian.start();
 const adapter = createAdapter(config);
 const runtime = await adapter.initialize();
 const scheduler = new Scheduler({ config, store, adapter });
+let qaHubM2mService = null;
+let qaHubWebhookOutbox = null;
+let stopQaHubDurableEventSink = null;
+if (config.qaHubM2mEnabled) {
+  const m2mToken = readSecretFile(
+    config.qaHubM2mTokenFile,
+    "QA Hub M2M token",
+  );
+  const webhookSecret = readSecretFile(
+    config.qaHubWebhookSecretFile,
+    "QA Hub webhook secret",
+  );
+  const projectMap = qaHubProjectMap(config.qaHubProjectMap);
+  const webhookEndpoint = qaHubWebhookEndpoint(config.qaHubWebhookUrl);
+  const qaHubPersistence = new QaHubM2mSqliteStore({ store });
+  const m2mAdapter = qaHubPersistence.m2mAdapter();
+  qaHubM2mService = new QaHubM2MService({
+    store,
+    scheduler,
+    relayInstanceId: config.qaHubRelayInstanceId,
+    token: m2mToken,
+    scopes: config.qaHubM2mScopes,
+    projectMap,
+    idempotency: m2mAdapter,
+    bindings: m2mAdapter,
+    atomicPersistence: qaHubPersistence.atomicPersistence(),
+    uploadDirectory: config.uploadDirectory,
+    maxAttachmentBytes: config.uploadLimitBytes,
+  });
+  qaHubWebhookOutbox = new QaHubWebhookOutbox({
+    store,
+    adapter: qaHubPersistence.outboxAdapter(),
+    relayInstanceId: config.qaHubRelayInstanceId,
+    endpoint: webhookEndpoint,
+    secret: webhookSecret,
+    pollIntervalMs: config.qaHubWebhookPollMs,
+    retryScheduleMs: [
+      1_000,
+      5_000,
+      30_000,
+      Math.min(300_000, config.qaHubWebhookRetryMaxMs),
+      config.qaHubWebhookRetryMaxMs,
+    ],
+  });
+  const persistQaHubEvent = (event) => {
+    if (!event.taskId) return;
+    const binding = qaHubPersistence.getHandoffByTaskId(event.taskId);
+    if (!binding) return;
+    const task = store.getTask(event.taskId);
+    const project = task ? store.getProject(task.projectId) : null;
+    const record = normalizeQaHubWebhookEvent(
+      {
+        ...event,
+        data: {
+          ...(event.data || {}),
+          ...(event.type === "turn.delivered"
+            ? {
+                buildRequirement: {
+                  required: project?.autoBuildEnabled === true,
+                  projectKey: project?.buildProjectKey || null,
+                },
+              }
+            : {}),
+        },
+        handoffId: binding.handoffId,
+        attemptId: binding.attemptId,
+        qaInstanceId: binding.qaInstanceId,
+        externalRevision: event.id,
+      },
+      config.qaHubRelayInstanceId,
+    );
+    if (record) qaHubPersistence.enqueue(record);
+  };
+  stopQaHubDurableEventSink = store.onDurableEvent(persistQaHubEvent);
+  for (const event of qaHubPersistence.listBoundEvents()) persistQaHubEvent(event);
+}
 const checkpointMaintenance = new CheckpointMaintenance({
   config,
   store,
@@ -124,9 +243,11 @@ const api = new PipelineHttpServer({
   checkpointMaintenance,
   projectManagementClient,
   taskCompletionService,
+  qaHubM2mService,
 });
 
 await api.listen();
+qaHubWebhookOutbox?.start();
 if (config.ozdqpBuildEnabled) {
   buildDispatcher.start();
   buildStatusMonitor.start();
@@ -184,6 +305,8 @@ async function shutdown(signal) {
   const buildStatusDrained = await buildStatusMonitor.waitForIdle(
     Math.max(15_000, config.ozdqpBuildTimeoutMs + 1_000),
   );
+  await qaHubWebhookOutbox?.stop();
+  stopQaHubDurableEventSink?.();
   if (!drained) {
     console.warn(
       "Timed out waiting for active turns to stop; startup reconciliation will preserve their workers",

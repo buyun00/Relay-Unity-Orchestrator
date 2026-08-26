@@ -150,6 +150,28 @@ export const config = Object.freeze({
   unityGuestLocalEndpoint:
     process.env.PIPELINE_UNITY_GUEST_LOCAL_ENDPOINT?.trim() ||
     "http://127.0.0.1:8090",
+  qaHubM2mEnabled: boolean(process.env.PIPELINE_QA_HUB_M2M_ENABLED, false),
+  qaHubRelayInstanceId:
+    process.env.PIPELINE_QA_HUB_RELAY_INSTANCE_ID?.trim() || "relay-main",
+  qaHubM2mTokenFile:
+    process.env.PIPELINE_QA_HUB_M2M_TOKEN_FILE?.trim() || null,
+  qaHubM2mScopes: stringList(process.env.PIPELINE_QA_HUB_M2M_SCOPES, [
+    "qa:handoff:create",
+    "qa:handoff:continue",
+    "qa:handoff:read",
+  ]),
+  qaHubProjectMap: process.env.PIPELINE_QA_HUB_PROJECT_MAP?.trim() || "",
+  qaHubWebhookUrl: process.env.PIPELINE_QA_HUB_WEBHOOK_URL?.trim() || null,
+  qaHubWebhookSecretFile:
+    process.env.PIPELINE_QA_HUB_WEBHOOK_SECRET_FILE?.trim() || null,
+  qaHubWebhookPollMs: Math.max(
+    100,
+    integer(process.env.PIPELINE_QA_HUB_WEBHOOK_POLL_MS, 500),
+  ),
+  qaHubWebhookRetryMaxMs: Math.max(
+    1_000,
+    integer(process.env.PIPELINE_QA_HUB_WEBHOOK_RETRY_MAX_MS, 60_000),
+  ),
   codexCommand: process.env.PIPELINE_CODEX_COMMAND || "codex",
   codexHome: process.env.CODEX_HOME?.trim() || null,
   codexModel: process.env.PIPELINE_CODEX_MODEL?.trim() || DEFAULT_CODEX_MODEL,

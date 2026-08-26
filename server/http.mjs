@@ -13,6 +13,7 @@ import {
 } from "./util.mjs";
 import { codexTaskSettings } from "./codex-settings.mjs";
 import { requestUserName } from "./daily-audit-log.mjs";
+import { QA_HUB_M2M_BASE_PATH } from "./qa-hub-m2m.mjs";
 import {
   isActionableProjectManagementDefect,
   projectManagementTaskKey,
@@ -359,6 +360,7 @@ export class PipelineHttpServer {
     checkpointMaintenance = null,
     projectManagementClient = null,
     taskCompletionService = null,
+    qaHubM2mService = null,
   }) {
     this.config = config;
     this.store = store;
@@ -369,6 +371,7 @@ export class PipelineHttpServer {
     this.checkpointMaintenance = checkpointMaintenance;
     this.projectManagementClient = projectManagementClient;
     this.taskCompletionService = taskCompletionService;
+    this.qaHubM2mService = qaHubM2mService;
     this.sseClients = new Set();
     this.unsubscribe = store.onEvent((event) => this.broadcast(event));
     this.server = http.createServer(
@@ -504,6 +507,31 @@ export class PipelineHttpServer {
       );
       const pathname = url.pathname.replace(/\/$/, "") || "/";
       const actorName = requestUserName(request);
+
+      if (
+        this.qaHubM2mService &&
+        (pathname === QA_HUB_M2M_BASE_PATH ||
+          pathname.startsWith(`${QA_HUB_M2M_BASE_PATH}/`))
+      ) {
+        const body =
+          request.method === "GET"
+            ? {}
+            : await readJson(request, this.config.requestBodyLimitBytes);
+        const result = await this.qaHubM2mService.handle({
+          method: request.method,
+          url: request.url,
+          headers: request.headers,
+          remoteAddress: request.socket?.remoteAddress,
+          body,
+        });
+        json(
+          response,
+          result.statusCode ?? result.status ?? 500,
+          result.body,
+          { ...cors, ...(result.headers || {}) },
+        );
+        return;
+      }
 
       if (request.method === "GET" && pathname === "/") {
         const dashboardUrl = new URL(url);
