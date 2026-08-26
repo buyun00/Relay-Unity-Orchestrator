@@ -7,6 +7,7 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
 import { BuildDispatcher } from "../../server/build-dispatcher.mjs";
+import { BuildStatusMonitor } from "../../server/build-status-monitor.mjs";
 import { Store } from "../../server/db.mjs";
 import {
   OzdqpBuildClient,
@@ -137,6 +138,9 @@ test("client sends the Relay envelope, stable idempotency key, and optional API 
   const result = await client.submit(sampleDispatch());
   assert.deepEqual(result, {
     jobId: "job-accepted",
+    jobStatus: "unknown",
+    currentStep: null,
+    cdnUrl: null,
     status: 202,
     deduplicated: false,
   });
@@ -157,6 +161,46 @@ test("client sends the Relay envelope, stable idempotency key, and optional API 
   assert.equal(payload.playerBaseVersion, 1);
   assert.equal(payload.requestedBy.turnSequence, 2);
   assert.equal(Object.hasOwn(payload.repository, "baseBranch"), false);
+});
+
+test("client reads a matching Packer job without downloading its full log", async () => {
+  const calls = [];
+  const client = new OzdqpBuildClient({
+    endpoint: "http://packer.invalid/api/v1/builds",
+    apiKey: "test-api-key",
+    fetcher: async (url, options) => {
+      calls.push({ url, options });
+      return new Response(
+        JSON.stringify({
+          job: {
+            jobId: "job-progress",
+            status: "publishing",
+            buildMode: "cdn",
+            sourceBranch: "codex/task-0017-example",
+            sourceCommit: COMMIT_SHA,
+            currentStep: "publish-cdn",
+            cdnUrl: "http://packer.invalid/cdn/ozdqp/branches/task/windows/",
+            startedAtUtc: "2026-08-04T01:00:00.000Z",
+            updatedAtUtc: "2026-08-04T01:03:00.000Z",
+            durationSeconds: 180,
+          },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+
+  const job = await client.getJob({
+    ...sampleDispatch(),
+    ozdqpJobId: "job-progress",
+  });
+  assert.equal(job.status, "publishing");
+  assert.equal(job.currentStep, "publish-cdn");
+  assert.equal(job.durationSeconds, 180);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/api\/v1\/jobs\/job-progress\?logLines=1$/u);
+  assert.equal(calls[0].options.method, "GET");
+  assert.equal(calls[0].options.headers["X-OZDQP-API-Key"], "test-api-key");
 });
 
 test("client classifies retryable, permanent, and authentication HTTP responses without response bodies", async (t) => {
@@ -402,6 +446,145 @@ test("dispatcher retries 5xx, accepts the job, and leaves the Relay turn success
     store
       .listTaskEvents(context.task.id)
       .some((event) => event.type === "build.dispatch.retrying"),
+  );
+});
+
+test("build progress monitoring completes independently after the next task starts", async (t) => {
+  const config = createConfig();
+  const store = new Store(config);
+  const { context, project, worker } = seedTurn(store);
+  const nextTask = store.createTask({
+    projectId: project.id,
+    title: "Next independent task",
+    message: "This task must not wait for packing",
+  });
+  complete(store, context.turn.id);
+  const claimedDispatch = store.claimNextBuildDispatch();
+  store.acceptBuildDispatch(claimedDispatch.id, {
+    jobId: "job-background-progress",
+    jobStatus: "building",
+    currentStep: "unity-build",
+    status: 202,
+  });
+  store.releaseWorkerAfterSuccess(worker.id);
+
+  const nextContext = store.claimNextTurn();
+  assert.equal(nextContext.turn.id, nextTask.turn.id);
+  assert.equal(store.getTurn(context.turn.id).status, "success");
+  assert.equal(
+    store.getBuildDispatch(claimedDispatch.id).buildStatus,
+    "building",
+  );
+
+  const monitor = new BuildStatusMonitor({
+    store,
+    client: {
+      async getJob(dispatch) {
+        return {
+          jobId: dispatch.ozdqpJobId,
+          status: "completed",
+          buildMode: "cdn",
+          sourceBranch: dispatch.branchName,
+          sourceCommit: dispatch.commitSha,
+          currentStep: "published",
+          cdnUrl: "http://packer.invalid/cdn/ozdqp/branches/task/windows/",
+          error: null,
+          startedAt: "2026-08-04T01:00:00.000Z",
+          finishedAt: "2026-08-04T01:05:00.000Z",
+          durationSeconds: 300,
+        };
+      },
+    },
+    pollIntervalMs: 100,
+    retryScheduleMs: [1],
+    random: () => 0.5,
+  });
+  t.after(async () => {
+    monitor.stop();
+    await monitor.waitForIdle();
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  monitor.start();
+  const completed = await waitUntil(() => {
+    const value = store.getBuildDispatch(claimedDispatch.id);
+    return value?.buildStatus === "completed" ? value : null;
+  }, "background build status to complete");
+  assert.equal(completed.status, "accepted");
+  assert.equal(completed.buildStep, "published");
+  assert.equal(completed.buildDurationSeconds, 300);
+  assert.equal(completed.nextStatusCheckAt, null);
+  assert.equal(store.getTurn(context.turn.id).status, "success");
+  assert.equal(store.getTurn(nextTask.turn.id).status, "preparing");
+  assert.ok(
+    store
+      .listTaskEvents(context.task.id)
+      .some((event) => event.type === "build.status.completed"),
+  );
+});
+
+test("build progress monitoring follows a retry after the same Packer job fails", async (t) => {
+  const config = createConfig();
+  const store = new Store(config);
+  const { context } = seedTurn(store);
+  complete(store, context.turn.id);
+  const claimedDispatch = store.claimNextBuildDispatch();
+  store.acceptBuildDispatch(claimedDispatch.id, {
+    jobId: "job-retried-after-failure",
+    jobStatus: "building",
+    currentStep: "first-attempt",
+    status: 202,
+  });
+  let calls = 0;
+  const monitor = new BuildStatusMonitor({
+    store,
+    client: {
+      async getJob(dispatch) {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            jobId: dispatch.ozdqpJobId,
+            status: "failed",
+            currentStep: "Failed",
+            error: "first attempt failed",
+            finishedAt: "2026-08-12T08:11:46.000Z",
+          };
+        }
+        return {
+          jobId: dispatch.ozdqpJobId,
+          status: "building",
+          currentStep: "Running Unity batchmode",
+          error: null,
+          startedAt: "2026-08-12T08:39:10.000Z",
+          finishedAt: null,
+        };
+      },
+    },
+    pollIntervalMs: 2,
+    failedPollIntervalMs: 2,
+  });
+  t.after(async () => {
+    monitor.stop();
+    await monitor.waitForIdle();
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  monitor.start();
+  const retried = await waitUntil(() => {
+    const value = store.getBuildDispatch(claimedDispatch.id);
+    return calls >= 2 && value?.buildStatus === "building" ? value : null;
+  }, "retried build status to return to building");
+  assert.equal(retried.buildStep, "Running Unity batchmode");
+  assert.equal(retried.buildErrorMessage, null);
+  assert.notEqual(retried.nextStatusCheckAt, null);
+  assert.deepEqual(
+    store
+      .listTaskEvents(context.task.id)
+      .filter((event) => event.type.startsWith("build.status."))
+      .map((event) => event.type),
+    ["build.status.failed", "build.status.building"],
   );
 });
 

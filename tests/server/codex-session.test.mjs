@@ -64,6 +64,7 @@ test("persistent Ops prompts use stdin and resume without Windows command-line o
       processRunner: async (command, args, options) => {
         calls.push({ command, args, options });
         const finalPath = args[args.indexOf("--output-last-message") + 1];
+        assert.equal(fs.existsSync(finalPath), false);
         fs.writeFileSync(
           finalPath,
           JSON.stringify({
@@ -76,6 +77,7 @@ test("persistent Ops prompts use stdin and resume without Windows command-line o
           }),
           "utf8",
         );
+        assert.equal(options.completionCheck(), true);
         options.onStdout?.(
           `${JSON.stringify({
             type: "thread.started",

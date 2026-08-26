@@ -56,6 +56,35 @@ function httpError(status, retryAfterMs) {
   );
 }
 
+function safeText(value, limit = 1_000) {
+  return typeof value === "string" && value.trim()
+    ? value.trim().slice(0, limit)
+    : null;
+}
+
+function jobFromPayload(payload) {
+  const job = payload?.job;
+  if (!job || typeof job !== "object") return null;
+  return {
+    jobId: safeText(job.jobId, 240),
+    status: safeText(job.status, 80)?.toLowerCase() || "unknown",
+    buildMode: safeText(job.buildMode, 80),
+    sourceBranch: safeText(job.sourceBranch, 500),
+    sourceCommit: safeText(job.sourceCommit, 80)?.toLowerCase() || null,
+    currentStep: safeText(job.currentStep, 500),
+    cdnUrl: safeText(job.cdnUrl, 2_000),
+    error: safeText(job.error, 2_000),
+    startedAt: safeText(job.startedAtUtc, 80),
+    finishedAt: safeText(job.finishedAtUtc, 80),
+    updatedAt: safeText(job.updatedAtUtc, 80),
+    durationSeconds:
+      Number.isFinite(Number(job.durationSeconds)) &&
+      Number(job.durationSeconds) >= 0
+        ? Number(job.durationSeconds)
+        : null,
+  };
+}
+
 export class OzdqpBuildClient {
   constructor({
     endpoint,
@@ -115,10 +144,8 @@ export class OzdqpBuildClient {
         signal: controller.signal,
       });
       const body = responsePayload(await response.text());
-      const jobId =
-        typeof body?.job?.jobId === "string" && body.job.jobId.trim()
-          ? body.job.jobId.trim()
-          : null;
+      const job = jobFromPayload(body);
+      const jobId = job?.jobId || null;
       if (
         (response.status === 200 ||
           response.status === 202 ||
@@ -127,6 +154,9 @@ export class OzdqpBuildClient {
       ) {
         return {
           jobId,
+          jobStatus: job.status,
+          currentStep: job.currentStep,
+          cdnUrl: job.cdnUrl,
           status: response.status,
           deduplicated:
             response.status === 200 ||
@@ -161,6 +191,90 @@ export class OzdqpBuildClient {
           : "OZDQP API request failed before receiving a response",
         {
           code: timedOut ? "OZDQP_REQUEST_TIMEOUT" : "OZDQP_NETWORK_ERROR",
+          retryable: true,
+        },
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async getJob(dispatch) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () =>
+        controller.abort(
+          Object.assign(new Error("OZDQP status request timed out"), {
+            code: "OZDQP_STATUS_REQUEST_TIMEOUT",
+          }),
+        ),
+      this.timeoutMs,
+    );
+    timeout.unref?.();
+    try {
+      const endpoint = new URL(
+        `./jobs/${encodeURIComponent(dispatch.ozdqpJobId)}`,
+        this.endpoint,
+      );
+      endpoint.searchParams.set("logLines", "1");
+      const headers = {};
+      if (this.apiKey) headers["X-OZDQP-API-Key"] = this.apiKey;
+      const response = await this.fetcher(endpoint.toString(), {
+        method: "GET",
+        headers,
+        signal: controller.signal,
+      });
+      const body = responsePayload(await response.text());
+      if (response.status < 200 || response.status >= 300) {
+        throw httpError(
+          response.status,
+          retryAfterMilliseconds(
+            response.headers.get("retry-after"),
+            this.clock,
+          ),
+        );
+      }
+      const job = jobFromPayload(body);
+      if (!job?.jobId || !job.sourceBranch || !job.sourceCommit) {
+        throw new OzdqpBuildClientError(
+          "OZDQP job status response did not contain a complete job identity",
+          {
+            code: "OZDQP_STATUS_INVALID_RESPONSE",
+            status: response.status,
+            retryable: true,
+          },
+        );
+      }
+      if (
+        job.jobId !== dispatch.ozdqpJobId ||
+        job.sourceBranch !== dispatch.branchName ||
+        job.sourceCommit !== dispatch.commitSha.toLowerCase() ||
+        (job.buildMode && job.buildMode !== "cdn")
+      ) {
+        throw new OzdqpBuildClientError(
+          "OZDQP job status identity did not match the accepted build",
+          {
+            code: "OZDQP_STATUS_IDENTITY_MISMATCH",
+            status: response.status,
+            retryable: false,
+          },
+        );
+      }
+      return job;
+    } catch (error) {
+      if (error instanceof OzdqpBuildClientError) throw error;
+      const timedOut =
+        controller.signal.aborted ||
+        error?.name === "AbortError" ||
+        error?.code === "OZDQP_STATUS_REQUEST_TIMEOUT";
+      throw new OzdqpBuildClientError(
+        timedOut
+          ? "OZDQP job status request timed out"
+          : "OZDQP job status request failed before receiving a response",
+        {
+          code: timedOut
+            ? "OZDQP_STATUS_REQUEST_TIMEOUT"
+            : "OZDQP_STATUS_NETWORK_ERROR",
           retryable: true,
         },
       );

@@ -2,13 +2,13 @@
 
 ## 目标状态
 
-Relay 不再要求用户先发现 `attention` Worker 或手工进入桌面 Codex。控制服务会把执行失败、Worker 动作失败、健康异常、Relay 运行前置失败和 Guardian 故障记录为持久事故，并自动送入专用的“系统自动恢复”会话。网页“系统助手”同时支持多个独立人工会话。
+Relay 不再要求用户先发现 `attention` Worker 或手工进入桌面 Codex。控制服务保留一条 GPT-5.6 Luna Max 常驻监督会话：只要存在 `queued`、`running` 或 `failed` Task，它就每 5 分钟复用同一个 Codex thread，检查 Task、JSONL、Worker、Unity、Git 和交付证据。执行失败、Worker 动作失败、健康异常、Relay 运行前置失败和 Guardian 故障仍会立即唤醒监督会话。网页“系统助手”同时支持多个独立人工会话。
 
 每条会话分别保存 Codex thread、模型、推理深度和 Fast 设置。不同会话最多按 `PIPELINE_OPS_MAX_CONCURRENT_SESSIONS` 并行运行，同一会话内的轮次始终串行，所有会改变外部状态的结构化动作还会经过全局串行执行器，避免并发重启或修复相互冲突。
 
 “清屏”会把当前最大轮次写入 `cleared_through_sequence`，只改变网页可见范围；数据库轮次、Codex thread、事故和动作审计均不会删除。需要完全独立上下文时应新建对话，而不是清屏。
 
-Ops Codex 负责理解未知异常并组合动作；实际状态变更由 Relay 执行器完成和审计。当前动作包括：
+监督 Codex 负责判断任务是在正常长耗时还是实际卡住。发现真实故障时，它优先返回 `codex.repair`，由 Relay 新建一条 GPT-5.6 Sol xhigh 修复会话。修复会话使用 `danger-full-access`，不受旧版只读沙箱和结构化动作目录限制，可以直接使用 PowerShell Direct、本机 API、Git、Unity 端点、服务控制和源码修改，直到原 Task 恢复到可执行状态。其他兼容动作仍包括：
 
 - 在原 Task、原 Codex thread 和保留的 Worker workspace 上追加恢复消息；
 - 重试或重新打开 Task；
@@ -18,7 +18,9 @@ Ops Codex 负责理解未知异常并组合动作；实际状态变更由 Relay 
 - 启动 Relay 自身代码修复；
 - 在证据已经证明恢复时关闭事故。
 
-系统没有删除项目、任务、Worker、日志、数据库、VM、检查点、Git 分支或 worktree 的自动动作。
+每条 Task/Turn 的原始标题、用户提示词和附件引用会同步写入 `task_prompt_archive`。归档、实时提示词和 Task 删除均受 SQLite 不可变触发器保护；修复会话启动前后还会校验完整归档指纹。修复必须继续原 Task 和原 Codex thread/workspace，不能创建替代 Task 来绕过原需求。
+
+如果修复过程中 Relay 重启，运行中的 `repair` Turn 会重新入队，并用已经持久化的修复 Codex thread 继续，而不是从头丢失现场。
 
 ## attention 自动恢复
 
@@ -71,9 +73,15 @@ PIPELINE_OPS_AUTO_HANDLE=true
 PIPELINE_OPS_AUTO_DEPLOY=true
 PIPELINE_OPS_MAX_ATTEMPTS=4
 PIPELINE_OPS_MAX_CONCURRENT_SESSIONS=4
-PIPELINE_OPS_CODEX_MODEL=gpt-5.6-sol
-PIPELINE_OPS_CODEX_REASONING_EFFORT=xhigh
+PIPELINE_OPS_SUPERVISOR_INTERVAL_MS=300000
+PIPELINE_OPS_CODEX_MODEL=gpt-5.6-luna
+PIPELINE_OPS_CODEX_REASONING_EFFORT=max
 PIPELINE_OPS_CODEX_FAST_MODE=false
+PIPELINE_OPS_REPAIR_CODEX_MODEL=gpt-5.6-sol
+PIPELINE_OPS_REPAIR_CODEX_REASONING_EFFORT=xhigh
+PIPELINE_OPS_REPAIR_CODEX_FAST_MODE=false
+PIPELINE_OPS_REPAIR_CODEX_TIMEOUT_MINUTES=0
+PIPELINE_OPS_REPAIR_TASK_START_WAIT_MS=120000
 
 PIPELINE_GUARDIAN_ENABLED=true
 PIPELINE_GUARDIAN_HOST=0.0.0.0
@@ -114,6 +122,7 @@ SQLite 新增以下记录：
 
 - `ops_threads`：每条系统 Codex 对话的持久 `thread_id`、标题、模型配置和非破坏清屏位置；
 - `ops_turns`：手工消息、自动事故轮次和结构化结论；
+- `task_prompt_archive`：Task 标题、每一轮原始用户提示词和附件引用的不可变副本；
 - `incidents`：错误指纹、关联 Task/Turn/Worker、尝试次数和解决状态；
 - `ops_actions`：每个自动动作的原因、目标、结果与错误；
 - `repair_runs`：worktree、分支、基准/修复 SHA、验证、部署和回滚状态。

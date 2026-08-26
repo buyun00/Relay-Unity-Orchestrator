@@ -4,6 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import {
   errorPayload,
+  executionProfile,
   gitRef,
   HttpError,
   integer,
@@ -11,6 +12,16 @@ import {
   safeFilename,
 } from "./util.mjs";
 import { codexTaskSettings } from "./codex-settings.mjs";
+import { requestUserName } from "./daily-audit-log.mjs";
+import {
+  isActionableProjectManagementDefect,
+  projectManagementTaskKey,
+  projectManagementTaskPrompt,
+  projectManagementTaskTitle,
+} from "./project-management-client.mjs";
+
+const PROJECT_MANAGEMENT_SESSION_COOKIE = "relay-project-management-session";
+const PROJECT_MANAGEMENT_BROWSER_COOKIE = "relay-project-management-browser";
 
 function json(response, status, payload, headers = {}) {
   const body = JSON.stringify(payload);
@@ -75,6 +86,52 @@ function readBuffer(request, limit) {
     request.on("end", () => resolve(Buffer.concat(chunks)));
     request.on("error", reject);
   });
+}
+
+function removePreparedAttachments(attachments) {
+  for (const attachment of attachments || []) {
+    try {
+      fs.rmSync(attachment.path, { force: true });
+    } catch {
+      // Best-effort cleanup; the database never references these paths.
+    }
+  }
+}
+
+function persistProjectManagementImages(config, images) {
+  const attachments = [];
+  try {
+    for (const image of images || []) {
+      if (
+        !Buffer.isBuffer(image?.buffer) ||
+        !image.buffer.length ||
+        image.buffer.length > config.uploadLimitBytes ||
+        !String(image.contentType || "").startsWith("image/")
+      ) {
+        throw new HttpError(
+          502,
+          "PROJECT_MANAGEMENT_IMAGE_INVALID",
+          "轻语图片下载结果无效，任务尚未创建",
+        );
+      }
+      const filename = safeFilename(image.filename);
+      const diskPath = path.join(
+        config.uploadDirectory,
+        `${crypto.randomUUID()}-${filename}`,
+      );
+      fs.writeFileSync(diskPath, image.buffer, { flag: "wx" });
+      attachments.push({
+        filename,
+        path: diskPath,
+        contentType: image.contentType,
+        size: image.buffer.length,
+      });
+    }
+    return attachments;
+  } catch (error) {
+    removePreparedAttachments(attachments);
+    throw error;
+  }
 }
 
 async function readJson(request, limit) {
@@ -174,23 +231,100 @@ function routeId(pathname, prefix) {
   return decodeURIComponent(rest);
 }
 
-function requestUserName(request) {
-  const value = request.headers["x-pipeline-user"];
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (!raw) return "未记录用户";
-  let decoded;
-  try {
-    decoded = decodeURIComponent(raw);
-  } catch {
-    decoded = raw;
+function cookieValue(request, name) {
+  const header = String(request.headers.cookie || "");
+  for (const item of header.split(";")) {
+    const separator = item.indexOf("=");
+    if (separator < 0) continue;
+    if (item.slice(0, separator).trim() !== name) continue;
+    try {
+      return decodeURIComponent(item.slice(separator + 1).trim());
+    } catch {
+      return null;
+    }
   }
-  return (
-    decoded
-      .replace(/[\u0000-\u001f\u007f]/gu, "")
-      .trim()
-      .replace(/\s+/gu, " ")
-      .slice(0, 80) || "未记录用户"
+  return null;
+}
+
+function projectManagementCookie(request, name, value, maxAge) {
+  const forwardedProtocol = String(request.headers["x-forwarded-proto"] || "")
+    .split(",", 1)[0]
+    .trim()
+    .toLowerCase();
+  const origin = String(request.headers.origin || "");
+  const secure =
+    forwardedProtocol === "https" ||
+    origin.toLowerCase().startsWith("https://");
+  return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
+}
+
+function projectManagementSessionCookies(request, sessionId, browserId) {
+  return [
+    projectManagementCookie(
+      request,
+      PROJECT_MANAGEMENT_SESSION_COOKIE,
+      sessionId,
+      43_200,
+    ),
+    projectManagementCookie(
+      request,
+      PROJECT_MANAGEMENT_BROWSER_COOKIE,
+      browserId,
+      31_536_000,
+    ),
+  ];
+}
+
+function opaqueCookieId(value) {
+  const candidate = String(value || "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+    candidate,
+  )
+    ? candidate
+    : null;
+}
+
+function normalizedProjectName(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/gu, "");
+}
+
+const INLINE_ATTACHMENT_TYPES = new Set([
+  "image/avif",
+  "image/bmp",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+
+function attachmentContentType(value) {
+  const contentType = String(value || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u.test(
+    contentType,
+  )
+    ? contentType
+    : "application/octet-stream";
+}
+
+function attachmentDisposition(filename, inline) {
+  const normalized = String(filename || "attachment.bin")
+    .toWellFormed()
+    .replace(/[\x00-\x1f\x7f]/gu, "_");
+  const safeAscii =
+    normalized.replace(/[^\x20-\x7e]/gu, "_").replace(/["\\]/gu, "_") ||
+    "attachment.bin";
+  const encoded = encodeURIComponent(normalized).replace(
+    /['()*]/gu,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
   );
+  return `${inline ? "inline" : "attachment"}; filename="${safeAscii}"; filename*=UTF-8''${encoded}`;
 }
 
 function publicRuntimeStatus(runtime) {
@@ -215,12 +349,26 @@ function publicRuntimeStatus(runtime) {
 }
 
 export class PipelineHttpServer {
-  constructor({ config, store, scheduler, ops = null, guardian = null }) {
+  constructor({
+    config,
+    store,
+    scheduler,
+    ops = null,
+    guardian = null,
+    auditLog = null,
+    checkpointMaintenance = null,
+    projectManagementClient = null,
+    taskCompletionService = null,
+  }) {
     this.config = config;
     this.store = store;
     this.scheduler = scheduler;
     this.ops = ops;
     this.guardian = guardian;
+    this.auditLog = auditLog;
+    this.checkpointMaintenance = checkpointMaintenance;
+    this.projectManagementClient = projectManagementClient;
+    this.taskCompletionService = taskCompletionService;
     this.sseClients = new Set();
     this.unsubscribe = store.onEvent((event) => this.broadcast(event));
     this.server = http.createServer(
@@ -252,6 +400,7 @@ export class PipelineHttpServer {
     return origin && this.originAllowed(request)
       ? {
           "Access-Control-Allow-Origin": origin,
+          "Access-Control-Allow-Credentials": "true",
           "Access-Control-Allow-Headers":
             "Content-Type, Idempotency-Key, X-File-Name, X-Pipeline-User",
           "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
@@ -259,6 +408,36 @@ export class PipelineHttpServer {
           Vary: "Origin",
         }
       : {};
+  }
+
+  projectManagementSession(request, responseHeaders) {
+    if (!this.projectManagementClient) {
+      throw new HttpError(
+        503,
+        "PROJECT_MANAGEMENT_DISABLED",
+        "项目管理系统集成尚未启用",
+      );
+    }
+    const requestedSessionId = cookieValue(
+      request,
+      PROJECT_MANAGEMENT_SESSION_COOKIE,
+    );
+    const browserId =
+      opaqueCookieId(cookieValue(request, PROJECT_MANAGEMENT_BROWSER_COOKIE)) ||
+      crypto.randomUUID();
+    const session = this.projectManagementClient.ensureSession(
+      opaqueCookieId(requestedSessionId),
+      {
+        browserId,
+        relayUserName: requestUserName(request),
+      },
+    );
+    responseHeaders["Set-Cookie"] = projectManagementSessionCookies(
+      request,
+      session.id,
+      browserId,
+    );
+    return session.id;
   }
 
   broadcast(event) {
@@ -306,6 +485,7 @@ export class PipelineHttpServer {
   }
 
   async handle(request, response) {
+    this.auditLog?.trackAccess(request, response);
     const cors = this.corsHeaders(request);
     try {
       if (!this.originAllowed(request))
@@ -406,6 +586,8 @@ export class PipelineHttpServer {
               enabled: false,
               reachable: false,
             },
+            checkpointMaintenance:
+              this.checkpointMaintenance?.status?.() || null,
             runtime: publicRuntimeStatus(runtime),
             uptimeSeconds: Math.round(process.uptime()),
             now: new Date().toISOString(),
@@ -445,7 +627,448 @@ export class PipelineHttpServer {
               runtime,
               ops: this.ops?.status?.() || null,
               guardian: this.guardian?.status?.() || null,
+              checkpointMaintenance:
+                this.checkpointMaintenance?.status?.() || null,
             },
+          },
+          cors,
+        );
+        return;
+      }
+
+      if (
+        request.method === "GET" &&
+        pathname === "/api/project-management/session"
+      ) {
+        const sessionId = this.projectManagementSession(request, cors);
+        json(
+          response,
+          200,
+          {
+            ok: true,
+            session: this.projectManagementClient.publicSession(sessionId),
+          },
+          cors,
+        );
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        pathname === "/api/project-management/login/start"
+      ) {
+        const sessionId = this.projectManagementSession(request, cors);
+        json(
+          response,
+          200,
+          {
+            ok: true,
+            session: await this.projectManagementClient.startLogin(sessionId),
+          },
+          cors,
+        );
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        pathname === "/api/project-management/login/status"
+      ) {
+        const sessionId = this.projectManagementSession(request, cors);
+        json(
+          response,
+          200,
+          {
+            ok: true,
+            session: await this.projectManagementClient.pollLogin(sessionId),
+          },
+          cors,
+        );
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        pathname === "/api/project-management/logout"
+      ) {
+        const sessionId = this.projectManagementSession(request, cors);
+        json(
+          response,
+          200,
+          {
+            ok: true,
+            session: await this.projectManagementClient.logout(sessionId),
+          },
+          cors,
+        );
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        pathname === "/api/project-management/projects"
+      ) {
+        const sessionId = this.projectManagementSession(request, cors);
+        const relayProjectId = requiredString(
+          url.searchParams.get("relayProjectId"),
+          "relayProjectId",
+          { max: 200 },
+        );
+        const relayProject = this.store.getProject(relayProjectId);
+        if (!relayProject) {
+          throw new HttpError(404, "PROJECT_NOT_FOUND", "Project not found");
+        }
+        const projects =
+          await this.projectManagementClient.listProjects(sessionId);
+        let selectedProjectId = this.projectManagementClient.selectedProject(
+          sessionId,
+          relayProjectId,
+        );
+        if (!projects.some((project) => project.id === selectedProjectId)) {
+          const relayName = normalizedProjectName(relayProject.name);
+          selectedProjectId =
+            projects.find(
+              (project) => normalizedProjectName(project.name) === relayName,
+            )?.id || (projects.length === 1 ? projects[0].id : null);
+        }
+        if (selectedProjectId) {
+          this.projectManagementClient.rememberProject(
+            sessionId,
+            relayProjectId,
+            selectedProjectId,
+          );
+        }
+        json(response, 200, { ok: true, projects, selectedProjectId }, cors);
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        pathname === "/api/project-management/defects"
+      ) {
+        const sessionId = this.projectManagementSession(request, cors);
+        const relayProjectId = requiredString(
+          url.searchParams.get("relayProjectId"),
+          "relayProjectId",
+          { max: 200 },
+        );
+        const externalProjectId = requiredString(
+          url.searchParams.get("externalProjectId"),
+          "externalProjectId",
+          { max: 200 },
+        );
+        if (!this.store.getProject(relayProjectId)) {
+          throw new HttpError(404, "PROJECT_NOT_FOUND", "Project not found");
+        }
+        this.projectManagementClient.rememberProject(
+          sessionId,
+          relayProjectId,
+          externalProjectId,
+        );
+        const listed = await this.projectManagementClient.listDefects(
+          sessionId,
+          {
+            externalProjectId,
+            page: integer(url.searchParams.get("page"), 1, 1, 10_000),
+            pageSize: integer(url.searchParams.get("pageSize"), 100, 1, 200),
+            search: url.searchParams.get("search") || "",
+          },
+        );
+        const actionableDefects = listed.defects.filter(
+          isActionableProjectManagementDefect,
+        );
+        const defects = actionableDefects.map((defect) => {
+          const importedTask = this.store.getTaskByIdempotencyKey(
+            projectManagementTaskKey({
+              relayProjectId,
+              externalProjectId,
+              defectId: defect.id,
+            }),
+          );
+          return {
+            ...defect,
+            importedTask: importedTask
+              ? {
+                  id: importedTask.id,
+                  number: importedTask.number,
+                  status: importedTask.status,
+                  title: importedTask.title,
+                }
+              : null,
+          };
+        });
+        json(
+          response,
+          200,
+          { ok: true, ...listed, total: defects.length, defects },
+          cors,
+        );
+        return;
+      }
+      const projectManagementDefect = pathname.match(
+        /^\/api\/project-management\/defects\/([^/]+)$/u,
+      );
+      if (projectManagementDefect && request.method === "GET") {
+        const sessionId = this.projectManagementSession(request, cors);
+        const relayProjectId = requiredString(
+          url.searchParams.get("relayProjectId"),
+          "relayProjectId",
+          { max: 200 },
+        );
+        const externalProjectId = requiredString(
+          url.searchParams.get("externalProjectId"),
+          "externalProjectId",
+          { max: 200 },
+        );
+        const defect = await this.projectManagementClient.getDefect(
+          sessionId,
+          decodeURIComponent(projectManagementDefect[1]),
+        );
+        const importedTask = this.store.getTaskByIdempotencyKey(
+          projectManagementTaskKey({
+            relayProjectId,
+            externalProjectId,
+            defectId: defect.id,
+          }),
+        );
+        json(
+          response,
+          200,
+          {
+            ok: true,
+            defect: {
+              ...defect,
+              importedTask: importedTask
+                ? {
+                    id: importedTask.id,
+                    number: importedTask.number,
+                    status: importedTask.status,
+                    title: importedTask.title,
+                  }
+                : null,
+            },
+          },
+          cors,
+        );
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        pathname === "/api/project-management/import"
+      ) {
+        const sessionId = this.projectManagementSession(request, cors);
+        const session = this.projectManagementClient.publicSession(sessionId);
+        if (!session.authenticated) {
+          throw new HttpError(
+            401,
+            "PROJECT_MANAGEMENT_AUTH_REQUIRED",
+            "请先使用轻羽 APP 扫码登录",
+          );
+        }
+        const completionBinding =
+          this.projectManagementClient.completionBinding(sessionId);
+        const body = await readJson(request, this.config.requestBodyLimitBytes);
+        const relayProjectId = requiredString(body.projectId, "projectId", {
+          max: 200,
+        });
+        const relayProject = this.store.getProject(relayProjectId);
+        if (!relayProject || !relayProject.enabled) {
+          throw new HttpError(
+            400,
+            "PROJECT_NOT_AVAILABLE",
+            "Project is not available",
+          );
+        }
+        const externalProjectId = requiredString(
+          body.externalProjectId,
+          "externalProjectId",
+          { max: 200 },
+        );
+        if (!Array.isArray(body.items) || body.items.length === 0) {
+          throw new HttpError(
+            400,
+            "VALIDATION_ERROR",
+            "items must contain at least one defect",
+          );
+        }
+        if (body.items.length > 30) {
+          throw new HttpError(
+            400,
+            "VALIDATION_ERROR",
+            "A maximum of 30 defects can be imported at once",
+          );
+        }
+        const taskCodexSettings = codexTaskSettings(body, {
+          codexModel: this.config.codexModel,
+          codexReasoningEffort: this.config.codexReasoningEffort,
+          codexFastMode: this.config.codexServiceTier === "fast",
+        });
+        const priority = integer(body.priority, 0, -100, 100);
+        const turnExecutionProfile = executionProfile(body.executionProfile);
+        const uniqueDefectIds = new Set();
+        const requestedItems = body.items.map((item, index) => {
+          if (!item || typeof item !== "object") {
+            throw new HttpError(
+              400,
+              "VALIDATION_ERROR",
+              `items[${index}] must be an object`,
+            );
+          }
+          const defectId = requiredString(
+            item.defectId,
+            `items[${index}].defectId`,
+            {
+              max: 200,
+            },
+          );
+          if (uniqueDefectIds.has(defectId)) {
+            throw new HttpError(
+              400,
+              "VALIDATION_ERROR",
+              `Duplicate defect id: ${defectId}`,
+            );
+          }
+          uniqueDefectIds.add(defectId);
+          const extraPrompt = String(item.extraPrompt || "").trim();
+          if (extraPrompt.length > 50_000) {
+            throw new HttpError(
+              400,
+              "VALIDATION_ERROR",
+              `items[${index}].extraPrompt is too long`,
+            );
+          }
+          const attachmentIds = Array.isArray(item.attachmentIds)
+            ? [...new Set(item.attachmentIds.map((value) => String(value)))]
+            : [];
+          if (
+            attachmentIds.length > 20 ||
+            attachmentIds.some(
+              (value) => !value || value.length > 200 || /[\r\n]/u.test(value),
+            )
+          ) {
+            throw new HttpError(
+              400,
+              "VALIDATION_ERROR",
+              `items[${index}].attachmentIds is invalid`,
+            );
+          }
+          return { defectId, extraPrompt, attachmentIds };
+        });
+        this.projectManagementClient.rememberProject(
+          sessionId,
+          relayProjectId,
+          externalProjectId,
+        );
+        const results = [];
+        let createdCount = 0;
+        for (const item of requestedItems) {
+          const idempotencyKey = projectManagementTaskKey({
+            relayProjectId,
+            externalProjectId,
+            defectId: item.defectId,
+          });
+          const existing = this.store.getTaskByIdempotencyKey(idempotencyKey);
+          if (existing) {
+            const linkedTask = this.store.linkProjectManagementTask(
+              existing.id,
+              {
+                externalProjectId,
+                defectId: item.defectId,
+                defectUrl: this.projectManagementClient.defectUrl(
+                  item.defectId,
+                ),
+                ...completionBinding,
+              },
+              actorName,
+            );
+            results.push({
+              defectId: item.defectId,
+              status: "duplicate",
+              task: linkedTask,
+            });
+            continue;
+          }
+          let preparedAttachments = [];
+          try {
+            const defect = await this.projectManagementClient.getDefect(
+              sessionId,
+              item.defectId,
+            );
+            if (!isActionableProjectManagementDefect(defect)) {
+              throw new HttpError(
+                409,
+                "PROJECT_MANAGEMENT_DEFECT_NOT_ACTIONABLE",
+                `轻语缺陷当前状态为“${defect.status || "已结束"}”，不能创建任务，请刷新列表`,
+              );
+            }
+            const downloadedImages =
+              await this.projectManagementClient.downloadDefectImages(
+                sessionId,
+                defect,
+                { limitBytes: this.config.uploadLimitBytes },
+              );
+            preparedAttachments = persistProjectManagementImages(
+              this.config,
+              downloadedImages,
+            );
+            const created = this.store.createTask({
+              projectId: relayProjectId,
+              title: projectManagementTaskTitle(defect),
+              message: projectManagementTaskPrompt(defect, item.extraPrompt),
+              baseBranch:
+                body.baseBranch == null
+                  ? relayProject.defaultBranch
+                  : gitRef(body.baseBranch, "baseBranch"),
+              priority,
+              autoRelease: body.autoRelease !== false,
+              executionProfile: turnExecutionProfile,
+              ...taskCodexSettings,
+              attachments: item.attachmentIds,
+              preparedAttachments,
+              idempotencyKey,
+              userName: session.user?.name || actorName,
+              projectManagement: {
+                externalProjectId,
+                defectId: item.defectId,
+                defectUrl: defect.url,
+                ...completionBinding,
+              },
+            });
+            if (created.duplicate) {
+              removePreparedAttachments(preparedAttachments);
+              preparedAttachments = [];
+            }
+            if (!created.duplicate) createdCount += 1;
+            results.push({
+              defectId: item.defectId,
+              status: created.duplicate ? "duplicate" : "created",
+              task: created.task,
+              turn: created.turn,
+            });
+          } catch (error) {
+            removePreparedAttachments(preparedAttachments);
+            if (error?.status === 401) throw error;
+            results.push({
+              defectId: item.defectId,
+              status: "failed",
+              error: {
+                code: error?.code || "PROJECT_MANAGEMENT_IMPORT_FAILED",
+                message: error?.message || "创建任务失败",
+              },
+            });
+          }
+        }
+        if (createdCount > 0) this.scheduler.notifyQueueChanged();
+        const duplicateCount = results.filter(
+          (item) => item.status === "duplicate",
+        ).length;
+        const failedCount = results.filter(
+          (item) => item.status === "failed",
+        ).length;
+        json(
+          response,
+          createdCount > 0 ? 201 : 200,
+          {
+            ok: failedCount === 0,
+            created: createdCount,
+            duplicates: duplicateCount,
+            failed: failedCount,
+            results,
           },
           cors,
         );
@@ -627,6 +1250,58 @@ export class PipelineHttpServer {
         return;
       }
 
+      const attachmentId = routeId(pathname, "/api/attachments/");
+      if (
+        attachmentId &&
+        (request.method === "GET" || request.method === "HEAD")
+      ) {
+        const attachment = this.store.getAttachment(attachmentId);
+        if (!attachment)
+          throw new HttpError(
+            404,
+            "ATTACHMENT_NOT_FOUND",
+            "Attachment not found",
+          );
+        let stats;
+        try {
+          stats = fs.statSync(attachment.path);
+        } catch {
+          throw new HttpError(
+            404,
+            "ATTACHMENT_FILE_NOT_FOUND",
+            "Attachment file not found",
+          );
+        }
+        if (!stats.isFile())
+          throw new HttpError(
+            404,
+            "ATTACHMENT_FILE_NOT_FOUND",
+            "Attachment file not found",
+          );
+        const contentType = attachmentContentType(attachment.contentType);
+        const headers = {
+          "Content-Type": contentType,
+          "Content-Length": stats.size,
+          "Content-Disposition": attachmentDisposition(
+            attachment.filename,
+            INLINE_ATTACHMENT_TYPES.has(contentType),
+          ),
+          "Cache-Control": "private, max-age=300",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy": "sandbox",
+          ...cors,
+        };
+        response.writeHead(200, headers);
+        if (request.method === "HEAD") {
+          response.end();
+          return;
+        }
+        const stream = fs.createReadStream(attachment.path);
+        stream.on("error", () => response.destroy());
+        stream.pipe(response);
+        return;
+      }
+
       if (request.method === "GET" && pathname === "/api/projects") {
         json(
           response,
@@ -787,6 +1462,7 @@ export class PipelineHttpServer {
               : gitRef(body.branchName, "branchName"),
           priority: integer(body.priority, 0, -100, 100),
           autoRelease: body.autoRelease !== false,
+          executionProfile: executionProfile(body.executionProfile),
           ...taskCodexSettings,
           attachments: body.attachments || body.attachmentIds,
           idempotencyKey: idempotencyKey || null,
@@ -794,6 +1470,44 @@ export class PipelineHttpServer {
         });
         this.scheduler.notifyQueueChanged();
         json(response, 201, { ok: true, ...result }, cors);
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        pathname === "/api/tasks/complete-batch"
+      ) {
+        if (!this.taskCompletionService) {
+          throw new HttpError(
+            503,
+            "TASK_COMPLETION_DISABLED",
+            "自动 MR 合并尚未启用",
+          );
+        }
+        const body = await readJson(request, this.config.requestBodyLimitBytes);
+        if (
+          !Array.isArray(body.taskIds) ||
+          body.taskIds.length === 0 ||
+          body.taskIds.length > 50
+        ) {
+          throw new HttpError(
+            400,
+            "TASK_COMPLETION_BATCH_INVALID",
+            "taskIds must contain 1-50 task IDs",
+          );
+        }
+        const taskIds = body.taskIds.map((taskId, index) =>
+          requiredString(taskId, `taskIds[${index}]`, { max: 200 }),
+        );
+        const result = await this.taskCompletionService.completeMany(
+          taskIds,
+          actorName,
+        );
+        json(
+          response,
+          result.failed ? 207 : 200,
+          { ok: result.failed === 0, ...result },
+          cors,
+        );
         return;
       }
       const taskDetail = routeId(pathname, "/api/tasks/");
@@ -806,7 +1520,7 @@ export class PipelineHttpServer {
           {
             ok: true,
             task,
-            turns: this.store.listTaskTurns(taskDetail),
+            turns: this.store.listTaskTurnsWithAttachments(taskDetail),
             events: this.store.listTaskEvents(taskDetail),
           },
           cors,
@@ -814,7 +1528,7 @@ export class PipelineHttpServer {
         return;
       }
       const taskMutation = pathname.match(
-        /^\/api\/tasks\/([^/]+)\/(messages|cancel|retry|close|reopen)$/,
+        /^\/api\/tasks\/([^/]+)\/(messages|cancel|retry|close|complete-relay-only|reopen)$/,
       );
       if (taskMutation && request.method === "POST") {
         const taskId = decodeURIComponent(taskMutation[1]);
@@ -835,6 +1549,7 @@ export class PipelineHttpServer {
                 ? undefined
                 : integer(body.priority, 0, -100, 100),
             attachments: body.attachments || body.attachmentIds,
+            executionProfile: executionProfile(body.executionProfile),
             userName: actorName,
           });
           this.scheduler.notifyQueueChanged();
@@ -860,10 +1575,45 @@ export class PipelineHttpServer {
           return;
         }
         if (action === "close") {
+          if (!this.taskCompletionService) {
+            throw new HttpError(
+              503,
+              "TASK_COMPLETION_DISABLED",
+              "自动 MR 合并尚未启用",
+            );
+          }
           json(
             response,
             200,
-            { ok: true, task: this.store.closeTask(taskId, actorName) },
+            {
+              ok: true,
+              task: await this.taskCompletionService.complete(
+                taskId,
+                actorName,
+              ),
+            },
+            cors,
+          );
+          return;
+        }
+        if (action === "complete-relay-only") {
+          if (!this.taskCompletionService) {
+            throw new HttpError(
+              503,
+              "TASK_COMPLETION_DISABLED",
+              "任务完成服务尚未启用",
+            );
+          }
+          json(
+            response,
+            200,
+            {
+              ok: true,
+              task: await this.taskCompletionService.completeRelayOnly(
+                taskId,
+                actorName,
+              ),
+            },
             cors,
           );
           return;

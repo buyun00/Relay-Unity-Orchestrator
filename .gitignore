@@ -45,3 +45,6 @@ next-env.d.ts
 /.pipeline-data/
 /.openai/hosting.json
 *.tsbuildinfo
+
+# Local Roslyn tool cache retained for task 63; never source or evidence.
+/scratch/task63-roslyn-48/

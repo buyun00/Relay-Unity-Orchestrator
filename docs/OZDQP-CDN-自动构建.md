@@ -18,6 +18,11 @@ Turn 的 OZDQP Windows CDN 构建。构建请求固定使用 Task 的交付分�
 `build_dispatches` 的异步状态，不会把已成功的 Relay Turn 改成失败，也不会
 阻止 Worker 正常释放。
 
+Packer 返回 Job ID 后，另一个独立监视器通过
+`GET /api/v1/jobs/{jobId}` 回查打包阶段。任务列表显示最新热更状态，任务详情
+底部显示每一轮的打包进度；这些回查同样不参与 Task/Turn 完成判断，也不会占用
+调度工位。
+
 只有以下条件全部满足才会写 outbox：
 
 - `OZDQP_BUILD_ENABLED=true`；
@@ -43,6 +48,7 @@ OZDQP_BUILD_REPOSITORY_URL=http://git.dominogm.com/diaoyu/ozdqp.git
 OZDQP_BUILD_API_KEY=
 OZDQP_BUILD_TIMEOUT_MS=10000
 OZDQP_BUILD_POLL_INTERVAL_MS=1000
+OZDQP_BUILD_STATUS_POLL_INTERVAL_MS=5000
 OZDQP_BUILD_RETRY_SCHEDULE_MS=1000,2000,5000,10000,30000,60000
 OZDQP_BUILD_RETRY_MAX_MS=300000
 ```
@@ -95,6 +101,13 @@ pending -> sending -> accepted
                   \-> failed
 ```
 
+接单后的 Packer 构建状态流为：
+
+```text
+queued -> preparing -> building -> validating -> publishing -> completed
+                                                        \----> failed
+```
+
 - 网络错误、超时、`408/425/429/5xx` 使用退避和抖动重试，并遵守
   `Retry-After`；
 - `400/404/409/422` 作为永久契约错误，除非 `409` 响应已包含可复用的
@@ -111,11 +124,13 @@ GET /api/build-dispatches?status=retrying&limit=100
 ```
 
 SQLite 保存尝试次数、下次重试时间、HTTP 状态、脱敏错误分类、Packer Job ID
-及时间戳。事件流记录：
+以及构建阶段、当前步骤、CDN URL、完成时间和状态回查时间。事件流记录：
 
 - `build.dispatch.queued`
 - `build.dispatch.retrying`
 - `build.dispatch.accepted`
 - `build.dispatch.failed`
+- `build.status.<阶段>`
+- `build.status.unavailable`
 
 事件和 outbox 都不会保存 Packer 的完整错误正文或 API Key。

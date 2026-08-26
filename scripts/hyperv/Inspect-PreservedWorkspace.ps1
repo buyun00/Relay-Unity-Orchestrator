@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$VMName,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$CredentialPath,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$GuestProjectPath,
+    [ValidateNotNullOrEmpty()][string]$ApprovedOverlayPathsJson = '[]',
     [ValidateRange(10, 300)][int]$TimeoutSeconds = 60
 )
 
@@ -41,11 +42,12 @@ $guestSource = [System.IO.File]::ReadAllText(
 )
 $remoteOutput = @(
     Invoke-RelayPowerShellDirect -VMName $VMName -Credential $credential -Stage 'powershell-direct-workspace-inspection' -TimeoutSeconds $TimeoutSeconds -ArgumentList @(
-        $GuestProjectPath, $helperSource, $guestSource
+        $GuestProjectPath, $ApprovedOverlayPathsJson, $helperSource, $guestSource
     ) -ScriptBlock {
-        param($ProjectPath, $HelperSource, $GuestSource)
+        param($ProjectPath, $ApprovedOverlaysJson, $HelperSource, $GuestSource)
         $ErrorActionPreference = 'Stop'
         Set-StrictMode -Version Latest
+        $env:RELAY_APPROVED_OVERLAY_PATHS_JSON = $ApprovedOverlaysJson
         . ([scriptblock]::Create($HelperSource))
         & ([scriptblock]::Create($GuestSource)) -ProjectPath $ProjectPath
     }

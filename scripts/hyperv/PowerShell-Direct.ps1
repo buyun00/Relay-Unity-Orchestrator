@@ -30,7 +30,7 @@ function Invoke-RelayPowerShellDirect {
         [Parameter(Mandatory = $true)][object[]]$ArgumentList,
         [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
         [Parameter(Mandatory = $true)][string]$Stage,
-        [ValidateRange(1, 600)][int]$TimeoutSeconds = 300
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 300
     )
 
     $job = $null
@@ -62,11 +62,22 @@ function Invoke-RelayPowerShellDirect {
             throw (New-RelayStageException -Stage $Stage -Message "PowerShell Direct stage '$Stage' timed out after $TimeoutSeconds seconds; its owned remoting job was stopped." -Stdout $partialOutput -Stderr $partialErrors -TimedOut $true)
         }
 
-        $remoteOutput = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
+        # Keep the streams until the structured failure has been assembled.
+        # Receive-Job without -Keep drains the child Error stream first, which
+        # used to reduce real guest failures to an empty "stage failed" shell.
+        $remoteOutput = @(Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue)
         $remoteErrors = @(
-            $job.ChildJobs |
-                ForEach-Object { $_.Error } |
-                ForEach-Object { [string]$_ }
+            foreach ($childJob in @($job.ChildJobs)) {
+                foreach ($errorRecord in @($childJob.Error)) {
+                    [string]$errorRecord
+                }
+                # Terminating remoting failures can populate only the child
+                # JobStateInfo reason, leaving Error empty. Preserve that
+                # concrete guest exception as part of the stage evidence.
+                if ($null -ne $childJob.JobStateInfo.Reason) {
+                    [string]$childJob.JobStateInfo.Reason
+                }
+            }
         )
         if ($job.State -ne 'Completed' -or $remoteErrors.Count -gt 0) {
             $stdout = @($remoteOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine

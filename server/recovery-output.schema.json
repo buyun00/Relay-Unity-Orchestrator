@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "diagnosis",
+    "changedFiles",
+    "validation",
+    "taskStartEvidence",
+    "risks"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "monitoring", "blocked"]
+    },
+    "summary": { "type": "string" },
+    "diagnosis": { "type": "string" },
+    "changedFiles": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "validation": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "taskStartEvidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

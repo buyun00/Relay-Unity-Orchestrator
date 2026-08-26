@@ -113,6 +113,7 @@ export class CodexSessionRunner {
       this.config.codexReasoningEffort,
     fastMode = this.config.opsCodexFastMode ??
       this.config.codexServiceTier === "fast",
+    timeoutMs = this.config.codexTimeoutMs,
     signal,
     onEvent,
   }) {
@@ -120,6 +121,7 @@ export class CodexSessionRunner {
     const jsonlPath = path.join(logDirectory, `${logName}.jsonl`);
     const stderrPath = path.join(logDirectory, `${logName}.stderr.log`);
     const finalPath = path.join(logDirectory, `${logName}.final.json`);
+    fs.rmSync(finalPath, { force: true });
     const stream = fs.createWriteStream(jsonlPath, {
       flags: "a",
       encoding: "utf8",
@@ -179,7 +181,13 @@ export class CodexSessionRunner {
         env: this.environment(runtimeDirectory),
         input: prompt,
         signal,
-        timeoutMs: this.config.codexTimeoutMs,
+        timeoutMs,
+        completionCheck: () => {
+          if (!fs.existsSync(finalPath)) return false;
+          const raw = fs.readFileSync(finalPath, "utf8").trim();
+          return Boolean(parseJson(raw, null));
+        },
+        completionGraceMs: 5_000,
         onStdout: consume,
         onStderr: (text) => {
           stderrStream.write(text);

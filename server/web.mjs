@@ -2,6 +2,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { HostMetricsSampler } from "./host-metrics.mjs";
 
 const rootDirectory = process.cwd();
 const clientDirectory = path.resolve(rootDirectory, "dist", "client");
@@ -26,6 +27,7 @@ const guardianPort = Number.parseInt(
   10,
 );
 const controlProxyPrefix = "/relay-control";
+const hostMetricsSampler = new HostMetricsSampler();
 let server;
 let shuttingDown = false;
 
@@ -83,6 +85,34 @@ function serveStatic(request, response, filePath) {
   });
   if (request.method === "HEAD") response.end();
   else fs.createReadStream(filePath).pipe(response);
+}
+
+async function serveHostMetrics(request, response) {
+  try {
+    const payload = JSON.stringify(await hostMetricsSampler.getSnapshot());
+    response.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Length": String(Buffer.byteLength(payload)),
+      "Content-Type": "application/json; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+    });
+    if (request.method === "HEAD") response.end();
+    else response.end(payload);
+  } catch (error) {
+    const payload = JSON.stringify({
+      error: {
+        code: "HOST_METRICS_UNAVAILABLE",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+    response.writeHead(503, {
+      "Cache-Control": "no-store",
+      "Content-Length": String(Buffer.byteLength(payload)),
+      "Content-Type": "application/json; charset=utf-8",
+    });
+    if (request.method === "HEAD") response.end();
+    else response.end(payload);
+  }
 }
 
 function proxyRequest(
@@ -248,6 +278,13 @@ await waitForRenderer();
 server = http.createServer((request, response) => {
   const rawUrl = request.url || "/";
   const pathname = new URL(rawUrl, "http://localhost").pathname;
+  if (
+    (pathname === "/_relay/host-metrics" || pathname === "/api/host-metrics") &&
+    ["GET", "HEAD"].includes(request.method || "GET")
+  ) {
+    void serveHostMetrics(request, response);
+    return;
+  }
   if (
     pathname === `${controlProxyPrefix}/api` ||
     pathname.startsWith(`${controlProxyPrefix}/api/`)

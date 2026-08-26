@@ -62,6 +62,52 @@ export interface Project {
   updatedAt?: string;
 }
 
+export interface ProjectManagementUser {
+  id: string;
+  name: string;
+  avatar?: string | null;
+}
+
+export interface ProjectManagementSession {
+  authenticated: boolean;
+  relayUserName?: string | null;
+  user?: ProjectManagementUser | null;
+  login?: {
+    status:
+      "pending" | "scanned" | "confirmed" | "expired" | "cancelled" | "error";
+    qrContent: string;
+    expiresAt: string;
+  } | null;
+}
+
+export interface ProjectManagementProject {
+  id: string;
+  name: string;
+}
+
+export interface ProjectManagementImportedTask {
+  id: string;
+  number: number | string;
+  status: TaskStatus;
+  title: string;
+}
+
+export interface ProjectManagementDefect {
+  id: string;
+  code?: string | null;
+  title: string;
+  content: string;
+  status?: string | null;
+  statusKey?: string | null;
+  priority?: string | null;
+  severity?: string | null;
+  assignee?: string | null;
+  updatedAt?: string | null;
+  images: string[];
+  url: string;
+  importedTask?: ProjectManagementImportedTask | null;
+}
+
 export interface BuildDispatch {
   id: string;
   turnId: string;
@@ -87,6 +133,28 @@ export interface BuildDispatch {
   updatedAt: string;
   acceptedAt?: string | null;
   failedAt?: string | null;
+  buildStatus?:
+    | "queued"
+    | "preparing"
+    | "building"
+    | "validating"
+    | "publishing"
+    | "completed"
+    | "failed"
+    | "unknown"
+    | string
+    | null;
+  buildStep?: string | null;
+  buildCdnUrl?: string | null;
+  buildErrorMessage?: string | null;
+  buildStartedAt?: string | null;
+  buildFinishedAt?: string | null;
+  buildDurationSeconds?: number | null;
+  statusCheckedAt?: string | null;
+  nextStatusCheckAt?: string | null;
+  statusCheckAttemptCount: number;
+  statusCheckErrorCode?: string | null;
+  statusCheckErrorMessage?: string | null;
 }
 
 export interface Worker {
@@ -121,12 +189,24 @@ export interface TurnResult {
   durationSeconds?: number;
 }
 
+export interface Attachment {
+  id: string;
+  filename: string;
+  contentType?: string | null;
+  size: number;
+  createdAt: string;
+}
+
+export type ExecutionProfile = "auto" | "code_only" | "unity_asset";
+
 export interface Turn {
   id: string;
   taskId: string;
   sequence: number;
   userMessage: string;
   authorName: string;
+  attachments?: Attachment[];
+  executionProfile?: ExecutionProfile;
   status: TurnStatus;
   phase?: string;
   workerId?: string | null;
@@ -158,6 +238,27 @@ export interface Task {
   codexModel: string;
   codexReasoningEffort: string;
   codexFastMode: boolean;
+  projectManagement?: {
+    externalProjectId?: string | null;
+    defectId: string;
+    defectUrl?: string | null;
+    relayUserName?: string | null;
+    userId?: string | null;
+    userName?: string | null;
+    resolvedAt?: string | null;
+  } | null;
+  completion?: {
+    status: "idle" | "running" | "failed" | "completed";
+    step?:
+      "merge_request" | "project_management" | "relay" | "relay_only" | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+    mergeRequestIid?: number | null;
+    mergeRequestUrl?: string | null;
+    mergedCommitSha?: string | null;
+    startedAt?: string | null;
+    completedAt?: string | null;
+  };
   createdAt: string;
   updatedAt: string;
   closedAt?: string | null;
@@ -201,6 +302,8 @@ export interface OpsTurn {
   sequence: number;
   trigger: "manual" | "incident" | "followup" | string;
   incidentId?: string | null;
+  targetTaskId?: string | null;
+  parentOpsTurnId?: string | null;
   userMessage: string;
   authorName: string;
   status: string;
@@ -289,6 +392,57 @@ export interface HostVirtualMachine {
   ipAddresses: string[];
 }
 
+export interface HostMetricsSnapshot {
+  sampledAt: string;
+  cacheAgeMs: number;
+  cpu: {
+    available: boolean;
+    usagePercent: number | null;
+    logicalProcessors: number;
+    source: string;
+  };
+  memory: {
+    available: boolean;
+    usagePercent: number | null;
+    totalBytes: number | null;
+    usedBytes: number | null;
+    source: string;
+  };
+  temperature: {
+    available: boolean;
+    celsius: number | null;
+    sensor: string | null;
+    kind: "cpu" | "system" | "gpu" | string | null;
+    source: string | null;
+  };
+  gpu: {
+    available: boolean;
+    usagePercent: number | null;
+    name: string | null;
+    memoryUsedBytes: number | null;
+    memoryTotalBytes: number | null;
+    memoryUsagePercent: number | null;
+    source: string | null;
+  };
+  disk: {
+    available: boolean;
+    usagePercent: number | null;
+    capacityUsagePercent: number | null;
+    metricKind: "activity" | "capacity";
+    totalBytes: number | null;
+    usedBytes: number | null;
+    volumes: Array<{
+      name: string;
+      totalBytes: number;
+      freeBytes: number;
+      usedBytes: number;
+      usagePercent: number | null;
+    }>;
+    source: string;
+  };
+  warning?: string | null;
+}
+
 export interface HostRuntime {
   ready: boolean;
   checkedAt: string;
@@ -332,6 +486,17 @@ export interface Snapshot {
       openIncidents?: number;
       automaticHandling?: boolean;
       automaticDeployment?: boolean;
+      supervisor?: {
+        running?: boolean;
+        intervalMs?: number;
+        model?: string;
+        reasoningEffort?: string;
+        repairModel?: string;
+        repairReasoningEffort?: string;
+        activeTaskCount?: number;
+        lastCheckAt?: string | null;
+        nextCheckAt?: string | null;
+      };
     } | null;
     guardian?: {
       enabled?: boolean;
@@ -374,8 +539,8 @@ export const EMPTY_SNAPSHOT: Snapshot = {
       clearedThroughSequence: 0,
       codexThreadId: null,
       status: "idle",
-      codexModel: "gpt-5.6-sol",
-      codexReasoningEffort: "xhigh",
+      codexModel: "gpt-5.6-luna",
+      codexReasoningEffort: "max",
       codexFastMode: false,
       createdAt: "",
       updatedAt: "",

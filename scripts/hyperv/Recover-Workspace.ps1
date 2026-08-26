@@ -8,6 +8,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$TaskBranch,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$ExpectedRemoteTip,
     [string]$SharePath,
+    [ValidateNotNullOrEmpty()][string]$ApprovedOverlayPathsJson = '[]',
     [ValidateRange(10, 120)][int]$GitNetworkTimeoutSeconds = 45,
     [ValidateRange(60, 600)][int]$PowerShellDirectTimeoutSeconds = 360
 )
@@ -89,14 +90,17 @@ try {
     $remoteOutput = @(
         Invoke-RelayPowerShellDirect -VMName $VMName -Credential $credential -ArgumentList @(
             $GuestProjectPath, $RepoUrl, $BaseBranch, $TaskBranch,
-            $ExpectedRemoteTip, $GitNetworkTimeoutSeconds, $helperSource, $guestSource
+            $ExpectedRemoteTip, $GitNetworkTimeoutSeconds, $ApprovedOverlayPathsJson,
+            $helperSource, $guestSource
         ) -Stage 'powershell-direct-recovery' -TimeoutSeconds $PowerShellDirectTimeoutSeconds -ScriptBlock {
             param(
                 $ProjectPath, $RepositoryUrl, $Base, $Branch,
-                $ExpectedTip, $GitTimeout, $HelperSource, $GuestSource
+                $ExpectedTip, $GitTimeout, $ApprovedOverlaysJson,
+                $HelperSource, $GuestSource
             )
             $ErrorActionPreference = 'Stop'
             Set-StrictMode -Version Latest
+            $env:RELAY_APPROVED_OVERLAY_PATHS_JSON = $ApprovedOverlaysJson
             . ([scriptblock]::Create($HelperSource))
             & ([scriptblock]::Create($GuestSource)) -ProjectPath $ProjectPath -RepositoryUrl $RepositoryUrl -BaseBranch $Base -TaskBranch $Branch -ExpectedRemoteTip $ExpectedTip -GitNetworkTimeoutSeconds $GitTimeout -OutputJson
         }

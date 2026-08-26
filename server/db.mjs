@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   asBoolean,
+  executionProfile,
   HttpError,
   id,
   now,
@@ -296,6 +297,17 @@ function workerFromRow(row) {
 
 function taskFromRow(row) {
   if (!row) return null;
+  const projectManagement = row.project_management_defect_id
+    ? {
+        externalProjectId: row.project_management_external_project_id,
+        defectId: row.project_management_defect_id,
+        defectUrl: row.project_management_defect_url,
+        relayUserName: row.project_management_relay_user_name,
+        userId: row.project_management_user_id,
+        userName: row.project_management_user_name,
+        resolvedAt: row.project_management_resolved_at,
+      }
+    : null;
   return {
     id: row.id,
     number: row.task_number,
@@ -312,6 +324,18 @@ function taskFromRow(row) {
     codexModel: row.codex_model,
     codexReasoningEffort: row.codex_reasoning_effort,
     codexFastMode: asBoolean(row.codex_fast_mode),
+    projectManagement,
+    completion: {
+      status: row.completion_status || "idle",
+      step: row.completion_step || null,
+      errorCode: row.completion_error_code || null,
+      errorMessage: row.completion_error_message || null,
+      mergeRequestIid: row.merge_request_iid || null,
+      mergeRequestUrl: row.merge_request_url || null,
+      mergedCommitSha: row.merged_commit_sha || null,
+      startedAt: row.completion_started_at || null,
+      completedAt: row.completion_completed_at || null,
+    },
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     closedAt: row.closed_at,
@@ -333,6 +357,7 @@ function turnFromRow(row) {
     codexFinal: result,
     result,
     executionMode: row.execution_mode || "full",
+    executionProfile: row.execution_profile || "auto",
     deliveryAudit: parseJson(row.delivery_audit_json, null),
     commitSha: row.commit_sha,
     errorCode: row.error_code,
@@ -391,6 +416,21 @@ function buildDispatchFromRow(row) {
     updatedAt: row.updated_at,
     acceptedAt: row.accepted_at,
     failedAt: row.failed_at,
+    buildStatus: row.build_status,
+    buildStep: row.build_step,
+    buildCdnUrl: row.build_cdn_url,
+    buildErrorMessage: row.build_error_message,
+    buildStartedAt: row.build_started_at,
+    buildFinishedAt: row.build_finished_at,
+    buildDurationSeconds:
+      row.build_duration_seconds == null
+        ? null
+        : Number(row.build_duration_seconds),
+    statusCheckedAt: row.status_checked_at,
+    nextStatusCheckAt: row.next_status_check_at,
+    statusCheckAttemptCount: Number(row.status_check_attempt_count || 0),
+    statusCheckErrorCode: row.status_check_error_code,
+    statusCheckErrorMessage: row.status_check_error_message,
   };
 }
 
@@ -420,6 +460,13 @@ function safeBuildDispatchError(error) {
       "OZDQP API response did not contain an accepted job ID",
     OZDQP_REQUEST_TIMEOUT: "OZDQP API request timed out",
     OZDQP_NETWORK_ERROR: "OZDQP API request failed before receiving a response",
+    OZDQP_STATUS_REQUEST_TIMEOUT: "OZDQP job status request timed out",
+    OZDQP_STATUS_NETWORK_ERROR:
+      "OZDQP job status request failed before receiving a response",
+    OZDQP_STATUS_INVALID_RESPONSE:
+      "OZDQP job status response did not contain a complete job identity",
+    OZDQP_STATUS_IDENTITY_MISMATCH:
+      "OZDQP job status identity did not match the accepted build",
     RELAY_RESTARTED_DURING_DISPATCH:
       "Relay restarted while the OZDQP request was in flight",
   };
@@ -469,6 +516,8 @@ function opsTurnFromRow(row) {
     sequence: Number(row.sequence),
     trigger: row.trigger,
     incidentId: row.incident_id,
+    targetTaskId: row.target_task_id || null,
+    parentOpsTurnId: row.parent_ops_turn_id || null,
     userMessage: row.user_message,
     authorName: row.author_name,
     status: row.status,
@@ -635,6 +684,23 @@ export class Store {
         codex_model TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_MODEL}',
         codex_reasoning_effort TEXT NOT NULL DEFAULT '${DEFAULT_CODEX_REASONING_EFFORT}',
         codex_fast_mode INTEGER NOT NULL DEFAULT ${DEFAULT_CODEX_FAST_MODE ? 1 : 0},
+        project_management_external_project_id TEXT,
+        project_management_defect_id TEXT,
+        project_management_defect_url TEXT,
+        project_management_relay_user_name TEXT,
+        project_management_user_id TEXT,
+        project_management_user_name TEXT,
+        project_management_binding_key TEXT,
+        project_management_resolved_at TEXT,
+        completion_status TEXT NOT NULL DEFAULT 'idle',
+        completion_step TEXT,
+        completion_error_code TEXT,
+        completion_error_message TEXT,
+        merge_request_iid INTEGER,
+        merge_request_url TEXT,
+        merged_commit_sha TEXT,
+        completion_started_at TEXT,
+        completion_completed_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         closed_at TEXT
@@ -651,6 +717,7 @@ export class Store {
         worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
         codex_final_json TEXT,
         execution_mode TEXT NOT NULL DEFAULT 'full',
+        execution_profile TEXT NOT NULL DEFAULT 'auto',
         delivery_audit_json TEXT,
         commit_sha TEXT,
         error_code TEXT,
@@ -686,6 +753,19 @@ export class Store {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS task_prompt_archive (
+        turn_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        task_number INTEGER NOT NULL,
+        task_title TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        author_name TEXT NOT NULL,
+        user_message TEXT NOT NULL,
+        attachments_json TEXT NOT NULL DEFAULT '[]',
+        turn_created_at TEXT NOT NULL,
+        archived_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value_json TEXT NOT NULL,
@@ -717,7 +797,19 @@ export class Store {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         accepted_at TEXT,
-        failed_at TEXT
+        failed_at TEXT,
+        build_status TEXT,
+        build_step TEXT,
+        build_cdn_url TEXT,
+        build_error_message TEXT,
+        build_started_at TEXT,
+        build_finished_at TEXT,
+        build_duration_seconds REAL,
+        status_checked_at TEXT,
+        next_status_check_at TEXT,
+        status_check_attempt_count INTEGER NOT NULL DEFAULT 0,
+        status_check_error_code TEXT,
+        status_check_error_message TEXT
       );
 
       CREATE TABLE IF NOT EXISTS ops_threads (
@@ -759,6 +851,8 @@ export class Store {
         sequence INTEGER NOT NULL,
         trigger TEXT NOT NULL DEFAULT 'manual',
         incident_id TEXT REFERENCES incidents(id) ON DELETE SET NULL,
+        target_task_id TEXT,
+        parent_ops_turn_id TEXT,
         user_message TEXT NOT NULL,
         author_name TEXT NOT NULL DEFAULT 'Relay',
         status TEXT NOT NULL DEFAULT 'queued',
@@ -816,6 +910,8 @@ export class Store {
 
       CREATE INDEX IF NOT EXISTS turns_queue_idx ON turns(status, priority DESC, created_at ASC);
       CREATE INDEX IF NOT EXISTS turns_task_idx ON turns(task_id, sequence DESC);
+      CREATE INDEX IF NOT EXISTS task_prompt_archive_task_idx
+        ON task_prompt_archive(task_id, sequence ASC);
       CREATE INDEX IF NOT EXISTS events_created_idx ON events(id DESC);
       CREATE INDEX IF NOT EXISTS events_task_idx ON events(task_id, id ASC);
       CREATE INDEX IF NOT EXISTS workers_ready_idx ON workers(enabled, status, project_id);
@@ -832,6 +928,73 @@ export class Store {
       CREATE INDEX IF NOT EXISTS build_dispatches_task_idx
         ON build_dispatches(task_id, created_at ASC);
     `);
+    const buildDispatchColumns = this.db
+      .prepare("PRAGMA table_info(build_dispatches)")
+      .all();
+    const buildDispatchMigrations = [
+      [
+        "build_status",
+        "ALTER TABLE build_dispatches ADD COLUMN build_status TEXT",
+      ],
+      ["build_step", "ALTER TABLE build_dispatches ADD COLUMN build_step TEXT"],
+      [
+        "build_cdn_url",
+        "ALTER TABLE build_dispatches ADD COLUMN build_cdn_url TEXT",
+      ],
+      [
+        "build_error_message",
+        "ALTER TABLE build_dispatches ADD COLUMN build_error_message TEXT",
+      ],
+      [
+        "build_started_at",
+        "ALTER TABLE build_dispatches ADD COLUMN build_started_at TEXT",
+      ],
+      [
+        "build_finished_at",
+        "ALTER TABLE build_dispatches ADD COLUMN build_finished_at TEXT",
+      ],
+      [
+        "build_duration_seconds",
+        "ALTER TABLE build_dispatches ADD COLUMN build_duration_seconds REAL",
+      ],
+      [
+        "status_checked_at",
+        "ALTER TABLE build_dispatches ADD COLUMN status_checked_at TEXT",
+      ],
+      [
+        "next_status_check_at",
+        "ALTER TABLE build_dispatches ADD COLUMN next_status_check_at TEXT",
+      ],
+      [
+        "status_check_attempt_count",
+        "ALTER TABLE build_dispatches ADD COLUMN status_check_attempt_count INTEGER NOT NULL DEFAULT 0",
+      ],
+      [
+        "status_check_error_code",
+        "ALTER TABLE build_dispatches ADD COLUMN status_check_error_code TEXT",
+      ],
+      [
+        "status_check_error_message",
+        "ALTER TABLE build_dispatches ADD COLUMN status_check_error_message TEXT",
+      ],
+    ];
+    for (const [columnName, migration] of buildDispatchMigrations) {
+      if (!buildDispatchColumns.some((column) => column.name === columnName)) {
+        this.db.exec(migration);
+      }
+    }
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS build_dispatches_status_check_idx ON build_dispatches(status, next_status_check_at ASC)",
+    );
+    this.db
+      .prepare(
+        `UPDATE build_dispatches
+         SET build_status=COALESCE(build_status, 'queued'),
+           next_status_check_at=COALESCE(next_status_check_at, accepted_at, updated_at)
+         WHERE status='accepted'
+           AND (build_status IS NULL OR build_status<>'completed')`,
+      )
+      .run();
     const projectColumns = this.db.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "unity_health_url")) {
       this.db.exec("ALTER TABLE projects ADD COLUMN unity_health_url TEXT");
@@ -918,6 +1081,78 @@ export class Store {
         `ALTER TABLE tasks ADD COLUMN codex_fast_mode INTEGER NOT NULL DEFAULT ${DEFAULT_CODEX_FAST_MODE ? 1 : 0}`,
       );
     }
+    const taskCompletionMigrations = [
+      [
+        "project_management_external_project_id",
+        "ALTER TABLE tasks ADD COLUMN project_management_external_project_id TEXT",
+      ],
+      [
+        "project_management_defect_id",
+        "ALTER TABLE tasks ADD COLUMN project_management_defect_id TEXT",
+      ],
+      [
+        "project_management_defect_url",
+        "ALTER TABLE tasks ADD COLUMN project_management_defect_url TEXT",
+      ],
+      [
+        "project_management_relay_user_name",
+        "ALTER TABLE tasks ADD COLUMN project_management_relay_user_name TEXT",
+      ],
+      [
+        "project_management_user_id",
+        "ALTER TABLE tasks ADD COLUMN project_management_user_id TEXT",
+      ],
+      [
+        "project_management_user_name",
+        "ALTER TABLE tasks ADD COLUMN project_management_user_name TEXT",
+      ],
+      [
+        "project_management_binding_key",
+        "ALTER TABLE tasks ADD COLUMN project_management_binding_key TEXT",
+      ],
+      [
+        "project_management_resolved_at",
+        "ALTER TABLE tasks ADD COLUMN project_management_resolved_at TEXT",
+      ],
+      [
+        "completion_status",
+        "ALTER TABLE tasks ADD COLUMN completion_status TEXT NOT NULL DEFAULT 'idle'",
+      ],
+      ["completion_step", "ALTER TABLE tasks ADD COLUMN completion_step TEXT"],
+      [
+        "completion_error_code",
+        "ALTER TABLE tasks ADD COLUMN completion_error_code TEXT",
+      ],
+      [
+        "completion_error_message",
+        "ALTER TABLE tasks ADD COLUMN completion_error_message TEXT",
+      ],
+      [
+        "merge_request_iid",
+        "ALTER TABLE tasks ADD COLUMN merge_request_iid INTEGER",
+      ],
+      [
+        "merge_request_url",
+        "ALTER TABLE tasks ADD COLUMN merge_request_url TEXT",
+      ],
+      [
+        "merged_commit_sha",
+        "ALTER TABLE tasks ADD COLUMN merged_commit_sha TEXT",
+      ],
+      [
+        "completion_started_at",
+        "ALTER TABLE tasks ADD COLUMN completion_started_at TEXT",
+      ],
+      [
+        "completion_completed_at",
+        "ALTER TABLE tasks ADD COLUMN completion_completed_at TEXT",
+      ],
+    ];
+    for (const [columnName, migration] of taskCompletionMigrations) {
+      if (!taskColumns.some((column) => column.name === columnName)) {
+        this.db.exec(migration);
+      }
+    }
     const turnColumns = this.db.prepare("PRAGMA table_info(turns)").all();
     if (!turnColumns.some((column) => column.name === "author_name")) {
       this.db.exec(
@@ -929,8 +1164,24 @@ export class Store {
         "ALTER TABLE turns ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'full'",
       );
     }
+    if (!turnColumns.some((column) => column.name === "execution_profile")) {
+      this.db.exec(
+        "ALTER TABLE turns ADD COLUMN execution_profile TEXT NOT NULL DEFAULT 'auto'",
+      );
+    }
     if (!turnColumns.some((column) => column.name === "delivery_audit_json")) {
       this.db.exec("ALTER TABLE turns ADD COLUMN delivery_audit_json TEXT");
+    }
+    const opsTurnColumns = this.db
+      .prepare("PRAGMA table_info(ops_turns)")
+      .all();
+    if (!opsTurnColumns.some((column) => column.name === "target_task_id")) {
+      this.db.exec("ALTER TABLE ops_turns ADD COLUMN target_task_id TEXT");
+    }
+    if (
+      !opsTurnColumns.some((column) => column.name === "parent_ops_turn_id")
+    ) {
+      this.db.exec("ALTER TABLE ops_turns ADD COLUMN parent_ops_turn_id TEXT");
     }
     const eventColumns = this.db.prepare("PRAGMA table_info(events)").all();
     if (!eventColumns.some((column) => column.name === "actor_name")) {
@@ -1002,10 +1253,57 @@ export class Store {
       SET unity_health_url = unity_skill_url
       WHERE unity_health_url IS NULL AND unity_skill_url LIKE '%/health'
     `);
+    for (const turn of this.db
+      .prepare("SELECT id FROM turns ORDER BY created_at ASC")
+      .all()) {
+      this.archiveTaskPrompt(turn.id);
+    }
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS task_prompt_archive_no_update
+      BEFORE UPDATE ON task_prompt_archive
+      BEGIN
+        SELECT RAISE(ABORT, 'TASK_PROMPT_ARCHIVE_IMMUTABLE');
+      END;
+      CREATE TRIGGER IF NOT EXISTS task_prompt_archive_no_delete
+      BEFORE DELETE ON task_prompt_archive
+      BEGIN
+        SELECT RAISE(ABORT, 'TASK_PROMPT_ARCHIVE_IMMUTABLE');
+      END;
+      CREATE TRIGGER IF NOT EXISTS turns_user_message_immutable
+      BEFORE UPDATE OF user_message ON turns
+      WHEN OLD.user_message IS NOT NEW.user_message
+      BEGIN
+        SELECT RAISE(ABORT, 'TASK_PROMPT_IMMUTABLE');
+      END;
+      CREATE TRIGGER IF NOT EXISTS turns_prompt_no_delete
+      BEFORE DELETE ON turns
+      BEGIN
+        SELECT RAISE(ABORT, 'TASK_PROMPT_IMMUTABLE');
+      END;
+      CREATE TRIGGER IF NOT EXISTS tasks_prompt_no_delete
+      BEFORE DELETE ON tasks
+      BEGIN
+        SELECT RAISE(ABORT, 'TASK_PROMPT_IMMUTABLE');
+      END;
+      CREATE TRIGGER IF NOT EXISTS tasks_title_immutable
+      BEFORE UPDATE OF title ON tasks
+      WHEN OLD.title IS NOT NEW.title
+      BEGIN
+        SELECT RAISE(ABORT, 'TASK_PROMPT_IMMUTABLE');
+      END;
+    `);
   }
 
   reconcileInterruptedWork() {
     const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE tasks SET completion_status='failed',
+          completion_error_code='SERVER_RESTARTED_DURING_COMPLETION',
+          completion_error_message='Relay restarted during confirmation; retry resumes from verified completed steps',
+          updated_at=? WHERE completion_status='running'`,
+      )
+      .run(timestamp);
     this.db
       .prepare(
         `UPDATE build_dispatches
@@ -1069,7 +1367,12 @@ export class Store {
       SET status='interrupted', error_code='SERVER_RESTARTED',
         error_message='Relay restarted while this Ops turn was active',
         finished_at='${timestamp}'
-      WHERE status='running';
+      WHERE status='running' AND trigger<>'repair';
+      UPDATE ops_turns
+      SET status='queued', error_code=NULL,
+        error_message='Relay restarted; the unrestricted recovery conversation will resume',
+        started_at=NULL, finished_at=NULL
+      WHERE status='running' AND trigger='repair';
       UPDATE incidents
       SET status='open', updated_at='${timestamp}'
       WHERE status IN ('diagnosing','acting');
@@ -1481,6 +1784,60 @@ export class Store {
     return this.getWorker(workerId);
   }
 
+  getTaskWorkload() {
+    const row = this.db
+      .prepare(
+        `
+        SELECT
+          COALESCE(SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END), 0) AS queued_turns,
+          COALESCE(SUM(CASE WHEN status IN ('preparing','running','saving','cancel_requested') THEN 1 ELSE 0 END), 0) AS executing_turns
+        FROM turns
+        WHERE status IN ('queued','preparing','running','saving','cancel_requested')
+      `,
+      )
+      .get();
+    const queuedTurns = Number(row?.queued_turns || 0);
+    const executingTurns = Number(row?.executing_turns || 0);
+    return {
+      queuedTurns,
+      executingTurns,
+      totalTurns: queuedTurns + executingTurns,
+    };
+  }
+
+  reserveWorkerForCheckpointMaintenance(workerId) {
+    return this.transaction(() => {
+      const workload = this.getTaskWorkload();
+      if (workload.totalTurns > 0) {
+        return {
+          reserved: false,
+          code: "CHECKPOINT_MAINTENANCE_TASK_QUEUE_NOT_EMPTY",
+          workload,
+          worker: this.getWorker(workerId),
+        };
+      }
+
+      const reserved = this.db
+        .prepare(
+          `
+          UPDATE workers
+          SET status='preparing', current_turn_id=NULL, last_error=NULL, updated_at=?
+          WHERE id=? AND enabled=1 AND status='ready' AND current_turn_id IS NULL
+        `,
+        )
+        .run(now(), workerId);
+      return {
+        reserved: reserved.changes === 1,
+        code:
+          reserved.changes === 1
+            ? null
+            : "CHECKPOINT_MAINTENANCE_WORKER_NOT_IDLE",
+        workload,
+        worker: this.getWorker(workerId),
+      };
+    });
+  }
+
   createTask(input) {
     const project = this.getProject(input.projectId);
     if (!project || !project.enabled)
@@ -1527,14 +1884,20 @@ export class Store {
         input.codexReasoningEffort || DEFAULT_CODEX_REASONING_EFFORT;
       const codexFastMode =
         (input.codexFastMode ?? DEFAULT_CODEX_FAST_MODE) ? 1 : 0;
+      const turnExecutionProfile = executionProfile(input.executionProfile);
+      const projectManagement = input.projectManagement || null;
       this.db
         .prepare(
           `
         INSERT INTO tasks (
           id, task_number, idempotency_key, title, created_by, project_id, base_branch, branch_name, status,
           priority, auto_release, codex_model, codex_reasoning_effort, codex_fast_mode,
+          project_management_external_project_id, project_management_defect_id,
+          project_management_defect_url, project_management_relay_user_name,
+          project_management_user_id, project_management_user_name,
+          project_management_binding_key,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
         )
         .run(
@@ -1551,6 +1914,13 @@ export class Store {
           codexModel,
           codexReasoningEffort,
           codexFastMode,
+          projectManagement?.externalProjectId || null,
+          projectManagement?.defectId || null,
+          projectManagement?.defectUrl || null,
+          projectManagement?.relayUserName || null,
+          projectManagement?.userId || null,
+          projectManagement?.userName || null,
+          projectManagement?.bindingKey || null,
           timestamp,
           timestamp,
         );
@@ -1558,9 +1928,9 @@ export class Store {
         .prepare(
           `
         INSERT INTO turns (
-          id, task_id, sequence, user_message, author_name, status, priority, created_at
+          id, task_id, sequence, user_message, author_name, status, priority, execution_profile, created_at
         )
-        VALUES (?, ?, 1, ?, ?, 'queued', ?, ?)
+        VALUES (?, ?, 1, ?, ?, 'queued', ?, ?, ?)
       `,
         )
         .run(
@@ -1569,9 +1939,14 @@ export class Store {
           input.message,
           input.userName || "未记录用户",
           priority,
+          turnExecutionProfile,
           timestamp,
         );
       this.attachUploads(input.attachments, taskId, turnId);
+      for (const attachment of input.preparedAttachments || []) {
+        this.createAttachment({ ...attachment, taskId, turnId });
+      }
+      this.archiveTaskPrompt(turnId);
       const task = this.getTask(taskId);
       const turn = this.getTurn(turnId);
       queueMicrotask(() =>
@@ -1595,6 +1970,72 @@ export class Store {
     );
   }
 
+  getTaskByIdempotencyKey(idempotencyKey) {
+    if (!idempotencyKey) return null;
+    return taskFromRow(
+      this.db
+        .prepare("SELECT * FROM tasks WHERE idempotency_key=?")
+        .get(idempotencyKey),
+    );
+  }
+
+  linkProjectManagementTask(taskId, link, actorName = null) {
+    const task = this.getTask(taskId);
+    if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
+    const existing = this.getTaskProjectManagementLink(taskId);
+    if (
+      existing &&
+      (existing.defectId !== String(link.defectId) ||
+        existing.externalProjectId !== String(link.externalProjectId))
+    ) {
+      throw new HttpError(
+        409,
+        "PROJECT_MANAGEMENT_TASK_LINK_CONFLICT",
+        "Task is already linked to a different project-management defect",
+      );
+    }
+    if (
+      existing?.bindingKey &&
+      (existing.bindingKey !== link.bindingKey || existing.userId)
+    ) {
+      return task;
+    }
+    this.db
+      .prepare(
+        `UPDATE tasks SET project_management_external_project_id=?,
+          project_management_defect_id=?, project_management_defect_url=?,
+          project_management_relay_user_name=?, project_management_user_id=?,
+          project_management_user_name=?, project_management_binding_key=?,
+          updated_at=? WHERE id=?`,
+      )
+      .run(
+        String(link.externalProjectId),
+        String(link.defectId),
+        link.defectUrl || null,
+        link.relayUserName || null,
+        link.userId || null,
+        link.userName || null,
+        link.bindingKey || null,
+        now(),
+        taskId,
+      );
+    if (!existing) {
+      this.emit({
+        taskId,
+        actorName,
+        type: "task.project-management.linked",
+        phase: "created",
+        message: `Task #${task.number} linked to project-management defect ${link.defectId}`,
+        data: {
+          externalProjectId: String(link.externalProjectId),
+          defectId: String(link.defectId),
+          defectUrl: link.defectUrl || null,
+        },
+      });
+    }
+    return this.getTask(taskId);
+  }
+
   listTasks() {
     return this.db
       .prepare("SELECT * FROM tasks ORDER BY updated_at DESC")
@@ -1608,6 +2049,25 @@ export class Store {
     );
   }
 
+  withTurnAttachments(turns, attachments) {
+    const attachmentsByTurn = new Map();
+    for (const attachment of attachments) {
+      const collection = attachmentsByTurn.get(attachment.turnId) || [];
+      collection.push({
+        id: attachment.id,
+        filename: attachment.filename,
+        contentType: attachment.contentType,
+        size: attachment.size,
+        createdAt: attachment.createdAt,
+      });
+      attachmentsByTurn.set(attachment.turnId, collection);
+    }
+    return turns.map((turn) => ({
+      ...turn,
+      attachments: attachmentsByTurn.get(turn.id) || [],
+    }));
+  }
+
   listTurns() {
     return this.db
       .prepare("SELECT * FROM turns ORDER BY created_at DESC")
@@ -1615,11 +2075,33 @@ export class Store {
       .map(turnFromRow);
   }
 
+  listTurnsWithAttachments() {
+    const turns = this.listTurns();
+    const attachments = this.db
+      .prepare(
+        "SELECT * FROM attachments WHERE turn_id IS NOT NULL ORDER BY created_at",
+      )
+      .all()
+      .map(attachmentFromRow);
+    return this.withTurnAttachments(turns, attachments);
+  }
+
   listTaskTurns(taskId) {
     return this.db
       .prepare("SELECT * FROM turns WHERE task_id=? ORDER BY sequence")
       .all(taskId)
       .map(turnFromRow);
+  }
+
+  listTaskTurnsWithAttachments(taskId) {
+    const turns = this.listTaskTurns(taskId);
+    const attachments = this.db
+      .prepare(
+        "SELECT * FROM attachments WHERE task_id=? AND turn_id IS NOT NULL ORDER BY created_at",
+      )
+      .all(taskId)
+      .map(attachmentFromRow);
+    return this.withTurnAttachments(turns, attachments);
   }
 
   hasActiveTurn(taskId) {
@@ -1680,13 +2162,14 @@ export class Store {
           .get(taskId).value,
       );
       const priority = input.priority ?? task.priority;
+      const turnExecutionProfile = executionProfile(input.executionProfile);
       this.db
         .prepare(
           `
         INSERT INTO turns (
-          id, task_id, sequence, user_message, author_name, status, priority, worker_id, created_at
+          id, task_id, sequence, user_message, author_name, status, priority, worker_id, execution_profile, created_at
         )
-        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
       `,
         )
         .run(
@@ -1697,14 +2180,21 @@ export class Store {
           input.userName || "未记录用户",
           priority,
           preservedWorkerId,
+          turnExecutionProfile,
           timestamp,
         );
       this.db
         .prepare(
-          `UPDATE tasks SET status=?, priority=?, closed_at=NULL, updated_at=? WHERE id=?`,
+          `UPDATE tasks SET status=?, priority=?, closed_at=NULL,
+            completion_status='idle', completion_step=NULL,
+            completion_error_code=NULL, completion_error_message=NULL,
+            merge_request_iid=NULL, merge_request_url=NULL,
+            merged_commit_sha=NULL, completion_started_at=NULL,
+            completion_completed_at=NULL, updated_at=? WHERE id=?`,
         )
         .run(executing ? "running" : "queued", priority, timestamp, taskId);
       this.attachUploads(input.attachments, taskId, turnId);
+      this.archiveTaskPrompt(turnId);
       const turn = this.getTurn(turnId);
       queueMicrotask(() =>
         this.emit({
@@ -1768,11 +2258,132 @@ export class Store {
     );
   }
 
+  getAttachment(attachmentId) {
+    return attachmentFromRow(
+      this.db.prepare("SELECT * FROM attachments WHERE id=?").get(attachmentId),
+    );
+  }
+
   listTurnAttachments(turnId) {
     return this.db
       .prepare("SELECT * FROM attachments WHERE turn_id=? ORDER BY created_at")
       .all(turnId)
       .map(attachmentFromRow);
+  }
+
+  archiveTaskPrompt(turnId) {
+    const row = this.db
+      .prepare(
+        `
+        SELECT turns.id AS turn_id, turns.task_id, tasks.task_number,
+          tasks.title AS task_title, turns.sequence, turns.author_name,
+          turns.user_message, turns.created_at AS turn_created_at
+        FROM turns
+        JOIN tasks ON tasks.id=turns.task_id
+        WHERE turns.id=?
+      `,
+      )
+      .get(turnId);
+    if (!row) return null;
+    const attachments = this.listTurnAttachments(turnId).map((attachment) => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      path: attachment.path,
+      contentType: attachment.contentType,
+      size: attachment.size,
+    }));
+    this.db
+      .prepare(
+        `
+        INSERT OR IGNORE INTO task_prompt_archive (
+          turn_id, task_id, task_number, task_title, sequence, author_name,
+          user_message, attachments_json, turn_created_at, archived_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        row.turn_id,
+        row.task_id,
+        row.task_number,
+        row.task_title,
+        row.sequence,
+        row.author_name,
+        row.user_message,
+        stringifyJson(attachments),
+        row.turn_created_at,
+        now(),
+      );
+    return this.db
+      .prepare("SELECT * FROM task_prompt_archive WHERE turn_id=?")
+      .get(turnId);
+  }
+
+  getTaskPromptArchive(taskId) {
+    return this.db
+      .prepare(
+        `
+        SELECT * FROM task_prompt_archive
+        WHERE task_id=?
+        ORDER BY sequence ASC, turn_created_at ASC
+      `,
+      )
+      .all(taskId)
+      .map((row) => ({
+        turnId: row.turn_id,
+        taskId: row.task_id,
+        taskNumber: Number(row.task_number),
+        taskTitle: row.task_title,
+        sequence: Number(row.sequence),
+        authorName: row.author_name,
+        userMessage: row.user_message,
+        attachments: parseJson(row.attachments_json, []),
+        turnCreatedAt: row.turn_created_at,
+        archivedAt: row.archived_at,
+      }));
+  }
+
+  taskPromptFingerprint(taskId) {
+    const archive = this.getTaskPromptArchive(taskId);
+    return createHash("sha256")
+      .update(JSON.stringify(archive), "utf8")
+      .digest("hex");
+  }
+
+  verifyTaskPromptIntegrity(taskId) {
+    const archive = this.getTaskPromptArchive(taskId);
+    const live = this.db
+      .prepare(
+        `
+        SELECT turns.id AS turn_id, turns.sequence, turns.author_name,
+          turns.user_message, tasks.title AS task_title
+        FROM turns
+        JOIN tasks ON tasks.id=turns.task_id
+        WHERE turns.task_id=?
+        ORDER BY turns.sequence ASC
+      `,
+      )
+      .all(taskId);
+    const intact =
+      archive.length === live.length &&
+      archive.every((entry, index) => {
+        const current = live[index];
+        return (
+          current &&
+          entry.turnId === current.turn_id &&
+          entry.sequence === Number(current.sequence) &&
+          entry.authorName === current.author_name &&
+          entry.userMessage === current.user_message &&
+          entry.taskTitle === current.task_title
+        );
+      });
+    return {
+      intact,
+      taskId,
+      fingerprint: this.taskPromptFingerprint(taskId),
+      archivedTurns: archive.length,
+      liveTurns: live.length,
+      archive,
+    };
   }
 
   queuePosition(turnId) {
@@ -2218,13 +2829,28 @@ export class Store {
           `UPDATE build_dispatches
            SET status='accepted', ozdqp_job_id=?, last_http_status=?,
              last_error_code=NULL, last_error_message=NULL, updated_at=?,
-             accepted_at=?, failed_at=NULL
+             accepted_at=?, failed_at=NULL, build_status=?, build_step=?,
+             build_cdn_url=?, build_error_message=NULL,
+             status_checked_at=NULL, next_status_check_at=?,
+             status_check_attempt_count=0, status_check_error_code=NULL,
+             status_check_error_message=NULL
            WHERE id=?`,
         )
         .run(
           String(result.jobId).slice(0, 240),
           result.status || null,
           timestamp,
+          timestamp,
+          String(result.jobStatus || "queued")
+            .trim()
+            .toLowerCase()
+            .slice(0, 80),
+          typeof result.currentStep === "string"
+            ? result.currentStep.trim().slice(0, 500) || null
+            : null,
+          typeof result.cdnUrl === "string"
+            ? result.cdnUrl.trim().slice(0, 2_000) || null
+            : null,
           timestamp,
           dispatchId,
         );
@@ -2238,6 +2864,10 @@ export class Store {
           dispatchId,
           jobId: String(result.jobId).slice(0, 240),
           status: "accepted",
+          buildStatus: String(result.jobStatus || "queued")
+            .trim()
+            .toLowerCase()
+            .slice(0, 80),
           httpStatus: result.status || null,
           deduplicated: result.deduplicated === true,
           attemptCount: dispatch.attemptCount,
@@ -2245,6 +2875,177 @@ export class Store {
       });
     });
     this.notifyEvent(event);
+    return this.getBuildDispatch(dispatchId);
+  }
+
+  listBuildDispatchesForStatusCheck(timestamp = now(), limit = 8) {
+    const boundedLimit = Math.max(1, Math.min(32, Number(limit) || 8));
+    return this.db
+      .prepare(
+        `SELECT * FROM build_dispatches
+         WHERE status='accepted'
+           AND ozdqp_job_id IS NOT NULL
+           AND next_status_check_at IS NOT NULL
+           AND next_status_check_at<=?
+           AND (build_status IS NULL OR build_status<>'completed')
+         ORDER BY next_status_check_at ASC, accepted_at ASC, id ASC
+         LIMIT ?`,
+      )
+      .all(timestamp, boundedLimit)
+      .map(buildDispatchFromRow);
+  }
+
+  updateBuildStatus(dispatchId, job, { nextCheckAt = null } = {}) {
+    const dispatch = this.getBuildDispatch(dispatchId);
+    if (!dispatch || dispatch.status !== "accepted") return dispatch;
+    const timestamp = now();
+    const buildStatus = String(job?.status || "unknown")
+      .trim()
+      .toLowerCase()
+      .slice(0, 80);
+    const buildStep =
+      typeof job?.currentStep === "string"
+        ? job.currentStep.trim().slice(0, 500) || null
+        : null;
+    const buildCdnUrl =
+      typeof job?.cdnUrl === "string"
+        ? job.cdnUrl.trim().slice(0, 2_000) || null
+        : null;
+    const buildErrorMessage =
+      typeof job?.error === "string"
+        ? job.error.trim().slice(0, 2_000) || null
+        : null;
+    const buildStartedAt =
+      typeof job?.startedAt === "string"
+        ? job.startedAt.trim().slice(0, 80) || null
+        : null;
+    const buildFinishedAt =
+      typeof job?.finishedAt === "string"
+        ? job.finishedAt.trim().slice(0, 80) || null
+        : null;
+    const buildDurationSeconds =
+      Number.isFinite(Number(job?.durationSeconds)) &&
+      Number(job.durationSeconds) >= 0
+        ? Number(job.durationSeconds)
+        : null;
+    // Packer can retry the same job ID after a failed attempt. Only a completed
+    // job is immutable; keep failed jobs eligible for slower status checks so
+    // Relay can surface a later queued/preparing/building attempt.
+    const terminal = buildStatus === "completed";
+    const changed =
+      dispatch.buildStatus !== buildStatus ||
+      dispatch.buildStep !== buildStep ||
+      dispatch.buildCdnUrl !== buildCdnUrl ||
+      dispatch.buildErrorMessage !== buildErrorMessage;
+    let event = null;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE build_dispatches
+           SET build_status=?, build_step=?, build_cdn_url=?,
+             build_error_message=?, build_started_at=?, build_finished_at=?,
+             build_duration_seconds=?, status_checked_at=?,
+             next_status_check_at=?, status_check_attempt_count=0,
+             status_check_error_code=NULL, status_check_error_message=NULL,
+             updated_at=?
+           WHERE id=? AND status='accepted'`,
+        )
+        .run(
+          buildStatus,
+          buildStep,
+          buildCdnUrl,
+          buildErrorMessage,
+          buildStartedAt,
+          buildFinishedAt,
+          buildDurationSeconds,
+          timestamp,
+          terminal ? null : nextCheckAt || timestamp,
+          timestamp,
+          dispatchId,
+        );
+      if (!changed) return;
+      const labels = {
+        queued: "queued",
+        preparing: "preparing",
+        building: "building",
+        validating: "validating",
+        publishing: "publishing",
+        completed: "completed and ready to view",
+        failed: "failed",
+      };
+      event = this.insertEvent({
+        taskId: dispatch.taskId,
+        turnId: dispatch.turnId,
+        level:
+          buildStatus === "failed"
+            ? "error"
+            : buildStatus === "completed"
+              ? "success"
+              : "info",
+        type: `build.status.${buildStatus || "unknown"}`,
+        phase: "build-status",
+        message: `OZDQP Windows CDN build ${labels[buildStatus] || buildStatus || "updated"} for ${dispatch.branchName}`,
+        data: {
+          dispatchId,
+          jobId: dispatch.ozdqpJobId,
+          buildStatus,
+          buildStep,
+          cdnUrl: buildCdnUrl,
+          finishedAt: buildFinishedAt,
+          durationSeconds: buildDurationSeconds,
+        },
+      });
+    });
+    if (event) this.notifyEvent(event);
+    return this.getBuildDispatch(dispatchId);
+  }
+
+  recordBuildStatusCheckFailure(
+    dispatchId,
+    error,
+    { nextCheckAt = null } = {},
+  ) {
+    const dispatch = this.getBuildDispatch(dispatchId);
+    if (!dispatch || dispatch.status !== "accepted") return dispatch;
+    const timestamp = now();
+    const safeError = safeBuildDispatchError(error);
+    const attemptCount = dispatch.statusCheckAttemptCount + 1;
+    const shouldNotify = dispatch.statusCheckErrorCode !== safeError.code;
+    let event = null;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE build_dispatches
+           SET status_check_attempt_count=?, status_check_error_code=?,
+             status_check_error_message=?, next_status_check_at=?, updated_at=?
+           WHERE id=? AND status='accepted'`,
+        )
+        .run(
+          attemptCount,
+          safeError.code,
+          safeError.message,
+          nextCheckAt || timestamp,
+          timestamp,
+          dispatchId,
+        );
+      if (!shouldNotify) return;
+      event = this.insertEvent({
+        taskId: dispatch.taskId,
+        turnId: dispatch.turnId,
+        level: "warning",
+        type: "build.status.unavailable",
+        phase: "build-status",
+        message: `OZDQP build progress is temporarily unavailable for ${dispatch.branchName}`,
+        data: {
+          dispatchId,
+          jobId: dispatch.ozdqpJobId,
+          buildStatus: dispatch.buildStatus,
+          code: safeError.code,
+          nextCheckAt: nextCheckAt || timestamp,
+        },
+      });
+    });
+    if (event) this.notifyEvent(event);
     return this.getBuildDispatch(dispatchId);
   }
 
@@ -2703,6 +3504,208 @@ export class Store {
     return this.getTask(taskId);
   }
 
+  getTaskProjectManagementLink(taskId) {
+    const row = this.db
+      .prepare(
+        `SELECT project_management_external_project_id AS externalProjectId,
+          project_management_defect_id AS defectId,
+          project_management_defect_url AS defectUrl,
+          project_management_relay_user_name AS relayUserName,
+          project_management_user_id AS userId,
+          project_management_user_name AS userName,
+          project_management_binding_key AS bindingKey,
+          project_management_resolved_at AS resolvedAt
+        FROM tasks WHERE id=?`,
+      )
+      .get(taskId);
+    if (!row?.defectId) return null;
+    return row;
+  }
+
+  startTaskCompletion(taskId, actorName = null) {
+    const task = this.getTask(taskId);
+    if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
+    const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE tasks SET completion_status='running', completion_step='merge_request',
+          completion_error_code=NULL, completion_error_message=NULL,
+          completion_started_at=?, completion_completed_at=NULL, updated_at=?
+        WHERE id=?`,
+      )
+      .run(timestamp, timestamp, taskId);
+    this.emit({
+      taskId,
+      actorName,
+      type: "task.completion.started",
+      phase: "merge-request",
+      message: `Task #${task.number} completion started with merge request`,
+    });
+    return this.getTask(taskId);
+  }
+
+  recordTaskMerge(taskId, mergeRequest, actorName = null) {
+    const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE tasks SET completion_status='running', completion_step='merge_request',
+          merge_request_iid=?, merge_request_url=?, merged_commit_sha=?,
+          completion_error_code=NULL, completion_error_message=NULL, updated_at=?
+        WHERE id=?`,
+      )
+      .run(
+        mergeRequest?.iid || null,
+        mergeRequest?.webUrl || null,
+        mergeRequest?.mergedCommitSha || null,
+        timestamp,
+        taskId,
+      );
+    this.emit({
+      taskId,
+      actorName,
+      type: "task.completion.merge-succeeded",
+      phase: "merge-request",
+      level: "success",
+      message: `Merge request !${mergeRequest?.iid || "?"} merged into ${mergeRequest?.targetBranch || "the default branch"}`,
+      data: {
+        mergeRequestIid: mergeRequest?.iid || null,
+        mergeRequestUrl: mergeRequest?.webUrl || null,
+        sourceBranch: mergeRequest?.sourceBranch || null,
+        targetBranch: mergeRequest?.targetBranch || null,
+        mergedCommitSha: mergeRequest?.mergedCommitSha || null,
+        sourceBranchDeleted: mergeRequest?.sourceBranchDeleted === true,
+      },
+    });
+    return this.getTask(taskId);
+  }
+
+  startProjectManagementCompletion(taskId, actorName = null) {
+    this.db
+      .prepare(
+        `UPDATE tasks SET completion_status='running', completion_step='project_management',
+          completion_error_code=NULL, completion_error_message=NULL, updated_at=? WHERE id=?`,
+      )
+      .run(now(), taskId);
+    this.emit({
+      taskId,
+      actorName,
+      type: "task.completion.project-management-started",
+      phase: "project-management",
+      message:
+        "Merge succeeded; marking the linked project-management defect resolved",
+    });
+    return this.getTask(taskId);
+  }
+
+  recordProjectManagementResolved(taskId, resolution, actorName = null) {
+    const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE tasks SET project_management_resolved_at=?,
+          completion_status='running', completion_step='project_management',
+          completion_error_code=NULL, completion_error_message=NULL, updated_at=?
+        WHERE id=?`,
+      )
+      .run(timestamp, timestamp, taskId);
+    this.emit({
+      taskId,
+      actorName,
+      type: "task.completion.project-management-resolved",
+      phase: "project-management",
+      level: "success",
+      message: resolution?.alreadyResolved
+        ? "Linked project-management defect was already resolved"
+        : "Linked project-management defect was marked resolved",
+      data: {
+        defectId: resolution?.defectId || null,
+        status: resolution?.status || null,
+        alreadyResolved: resolution?.alreadyResolved === true,
+      },
+    });
+    return this.getTask(taskId);
+  }
+
+  failTaskCompletion(taskId, step, error, actorName = null) {
+    const code = String(error?.code || "TASK_COMPLETION_FAILED").slice(0, 200);
+    const message = String(error?.message || "Task completion failed").slice(
+      0,
+      2_000,
+    );
+    this.db
+      .prepare(
+        `UPDATE tasks SET completion_status='failed', completion_step=?,
+          completion_error_code=?, completion_error_message=?, updated_at=? WHERE id=?`,
+      )
+      .run(step, code, message, now(), taskId);
+    this.emit({
+      taskId,
+      actorName,
+      type: "task.completion.failed",
+      phase:
+        step === "project_management"
+          ? "project-management"
+          : step === "relay"
+            ? "relay"
+            : "merge-request",
+      level: "error",
+      message,
+      data: { code, step },
+    });
+    return this.getTask(taskId);
+  }
+
+  finishTaskCompletion(taskId, actorName = null) {
+    const task = this.getTask(taskId);
+    if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
+    const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE tasks SET status='closed', closed_at=?,
+          completion_status='completed', completion_step='relay',
+          completion_error_code=NULL, completion_error_message=NULL,
+          completion_completed_at=?, updated_at=? WHERE id=?`,
+      )
+      .run(timestamp, timestamp, timestamp, taskId);
+    this.emit({
+      taskId,
+      actorName,
+      type: "task.closed",
+      phase: "relay",
+      level: "success",
+      message: `Task #${task.number} closed after merge and linked-system completion`,
+    });
+    return this.getTask(taskId);
+  }
+
+  finishTaskRelayOnly(taskId, actorName = null) {
+    const task = this.getTask(taskId);
+    if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
+    const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE tasks SET status='closed', closed_at=?,
+          completion_status='completed', completion_step='relay_only',
+          completion_error_code=NULL, completion_error_message=NULL,
+          completion_started_at=?, completion_completed_at=?, updated_at=?
+        WHERE id=?`,
+      )
+      .run(timestamp, timestamp, timestamp, timestamp, taskId);
+    this.emit({
+      taskId,
+      actorName,
+      type: "task.closed",
+      phase: "relay",
+      level: "success",
+      message: `Task #${task.number} closed in Relay only; merge request and linked-system updates were explicitly skipped`,
+      data: {
+        completionMode: "relay_only",
+        mergeRequestSkipped: true,
+        projectManagementSkipped: true,
+      },
+    });
+    return this.getTask(taskId);
+  }
+
   reopenTask(taskId, actorName = null) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
@@ -2710,7 +3713,12 @@ export class Store {
       throw new HttpError(409, "TASK_NOT_CLOSED", "Task is not closed");
     this.db
       .prepare(
-        `UPDATE tasks SET status='waiting_user', closed_at=NULL, updated_at=? WHERE id=?`,
+        `UPDATE tasks SET status='waiting_user', closed_at=NULL,
+          completion_status='idle', completion_step=NULL,
+          completion_error_code=NULL, completion_error_message=NULL,
+          merge_request_iid=NULL, merge_request_url=NULL,
+          merged_commit_sha=NULL, completion_started_at=NULL,
+          completion_completed_at=NULL, updated_at=? WHERE id=?`,
       )
       .run(now(), taskId);
     this.emit({
@@ -2948,12 +3956,39 @@ export class Store {
     );
   }
 
+  findActiveRecoveryTurn(targetTaskId = null) {
+    const row = targetTaskId
+      ? this.db
+          .prepare(
+            `
+            SELECT * FROM ops_turns
+            WHERE trigger='repair' AND target_task_id=?
+              AND status IN ('queued','running')
+            ORDER BY created_at ASC LIMIT 1
+          `,
+          )
+          .get(targetTaskId)
+      : this.db
+          .prepare(
+            `
+            SELECT * FROM ops_turns
+            WHERE trigger='repair' AND target_task_id IS NULL
+              AND status IN ('queued','running')
+            ORDER BY created_at ASC LIMIT 1
+          `,
+          )
+          .get();
+    return opsTurnFromRow(row);
+  }
+
   appendOpsTurn({
     message,
     authorName = "Relay",
     trigger = "manual",
     incidentId = null,
     threadId = "ops-system",
+    targetTaskId = null,
+    parentOpsTurnId = null,
   }) {
     const thread = this.getOpsThread(threadId);
     if (!thread)
@@ -2975,9 +4010,9 @@ export class Store {
       .prepare(
         `
         INSERT INTO ops_turns (
-          id, thread_id, sequence, trigger, incident_id, user_message,
-          author_name, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+          id, thread_id, sequence, trigger, incident_id, target_task_id,
+          parent_ops_turn_id, user_message, author_name, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
       `,
       )
       .run(
@@ -2986,6 +4021,8 @@ export class Store {
         sequence,
         trigger,
         incidentId,
+        targetTaskId,
+        parentOpsTurnId,
         message,
         authorName,
         timestamp,
@@ -3203,6 +4240,28 @@ export class Store {
       )
       .run(stringifyJson(final), timestamp, opsTurnId);
     this.refreshOpsThreadStatus(turn.threadId, timestamp);
+    return this.getOpsTurn(opsTurnId);
+  }
+
+  requeueOpsTurn(opsTurnId, message = null) {
+    const turn = this.getOpsTurn(opsTurnId);
+    if (!turn) return null;
+    const timestamp = now();
+    this.db
+      .prepare(
+        `
+        UPDATE ops_turns
+        SET status='queued', error_code=NULL, error_message=?,
+          started_at=NULL, finished_at=NULL
+        WHERE id=?
+      `,
+      )
+      .run(message, opsTurnId);
+    this.db
+      .prepare(
+        "UPDATE ops_threads SET status='queued', updated_at=? WHERE id=?",
+      )
+      .run(timestamp, turn.threadId);
     return this.getOpsTurn(opsTurnId);
   }
 
@@ -3594,7 +4653,7 @@ export class Store {
   snapshot() {
     const projects = this.listProjects();
     const workers = this.listWorkers();
-    const turns = this.listTurns();
+    const turns = this.listTurnsWithAttachments();
     const tasks = this.listTasks();
     const projectNames = new Map(
       projects.map((project) => [project.id, project.name]),

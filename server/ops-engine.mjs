@@ -11,6 +11,11 @@ import { HttpError } from "./util.mjs";
 const opsSchemaPath = fileURLToPath(
   new URL("./ops-output.schema.json", import.meta.url),
 );
+const recoverySchemaPath = fileURLToPath(
+  new URL("./recovery-output.schema.json", import.meta.url),
+);
+
+const SUPERVISED_TASK_STATUSES = new Set(["queued", "running", "failed"]);
 
 const INCIDENT_EVENT_TYPES = new Set([
   "turn.failed",
@@ -61,11 +66,48 @@ function codexAgentMessage(event) {
   return String(event.item.text || event.item.message || "").trim() || null;
 }
 
+function recoveryProgressMessage(event) {
+  const agentMessage = codexAgentMessage(event);
+  if (agentMessage) return agentMessage;
+  if (!["item.started", "item.completed"].includes(event?.type)) return null;
+  const item = event.item;
+  if (item?.type !== "command_execution") return null;
+  const command = String(item.command || "")
+    .trim()
+    .slice(0, 2_000);
+  if (event.type === "item.started") {
+    return command ? `执行恢复命令：${command}` : "正在执行恢复命令";
+  }
+  const output = String(item.aggregated_output || "")
+    .trim()
+    .slice(-4_000);
+  return [
+    `恢复命令${item.status === "completed" ? "已完成" : "已结束"}${item.exit_code == null ? "" : `（exit ${item.exit_code}）`}`,
+    output || null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function safeJson(value, limit = 180_000) {
   const raw = JSON.stringify(value, null, 2);
   return raw.length > limit
     ? `${raw.slice(0, limit)}\n[context truncated]`
     : raw;
+}
+
+function promptIntegrityExtends(beforeIntegrity, afterIntegrity) {
+  if (!beforeIntegrity || !afterIntegrity?.intact) return false;
+  const beforeArchive = Array.isArray(beforeIntegrity.archive)
+    ? beforeIntegrity.archive
+    : [];
+  const afterArchive = Array.isArray(afterIntegrity.archive)
+    ? afterIntegrity.archive
+    : [];
+  if (afterArchive.length < beforeArchive.length) return false;
+  return beforeArchive.every(
+    (entry, index) => JSON.stringify(afterArchive[index]) === JSON.stringify(entry),
+  );
 }
 
 function recentLogExcerpts(logDirectory) {
@@ -118,20 +160,36 @@ function recentLogExcerpts(logDirectory) {
 
 export class OpsEngine {
   constructor(
-    { config, store, scheduler, repairManager, restartCoordinator = null },
-    { sessionRunner = null } = {},
+    {
+      config,
+      store,
+      scheduler,
+      repairManager,
+      restartCoordinator = null,
+      checkpointMaintenance = null,
+    },
+    { sessionRunner = null, recoverySessionRunner = null } = {},
   ) {
     this.config = config;
     this.store = store;
     this.scheduler = scheduler;
     this.repairManager = repairManager;
     this.restartCoordinator = restartCoordinator;
+    this.checkpointMaintenance = checkpointMaintenance;
     this.sessionRunner = sessionRunner || new CodexSessionRunner(config);
+    this.recoverySessionRunner =
+      recoverySessionRunner || new CodexSessionRunner(config);
     this.running = false;
+    this.stopping = false;
     this.pumping = false;
     this.activeTurns = new Map();
+    this.activeControllers = new Map();
+    this.executions = new Set();
     this.actionChain = Promise.resolve();
     this.unsubscribe = null;
+    this.supervisorTimer = null;
+    this.lastSupervisorCheckAt = null;
+    this.nextSupervisorCheckAt = null;
   }
 
   status() {
@@ -151,22 +209,128 @@ export class OpsEngine {
       openIncidents: openIncidents.length,
       automaticHandling: Boolean(this.config.opsAutoHandle),
       automaticDeployment: Boolean(this.config.opsAutoDeploy),
+      supervisor: {
+        running: Boolean(this.supervisorTimer),
+        intervalMs: this.supervisorIntervalMs(),
+        model: this.config.opsCodexModel || "gpt-5.6-luna",
+        reasoningEffort: this.config.opsCodexReasoningEffort || "max",
+        repairModel: this.config.opsRepairCodexModel || "gpt-5.6-sol",
+        repairReasoningEffort:
+          this.config.opsRepairCodexReasoningEffort || "xhigh",
+        activeTaskCount: this.supervisedTasks().length,
+        lastCheckAt: this.lastSupervisorCheckAt,
+        nextCheckAt: this.nextSupervisorCheckAt,
+      },
     };
+  }
+
+  supervisorIntervalMs() {
+    return Math.max(
+      1_000,
+      Number(this.config.opsSupervisorIntervalMs || 5 * 60 * 1000),
+    );
+  }
+
+  supervisedTasks() {
+    return this.store
+      .listTasks()
+      .filter((task) => SUPERVISED_TASK_STATUSES.has(task.status));
   }
 
   async start() {
     if (this.running || !this.config.opsEnabled) return;
     this.running = true;
+    this.stopping = false;
     this.store.ensureOpsThread();
+    this.store.updateOpsThread("ops-system", {
+      codexModel: this.config.opsCodexModel || "gpt-5.6-luna",
+      codexReasoningEffort: this.config.opsCodexReasoningEffort || "max",
+      codexFastMode: Boolean(this.config.opsCodexFastMode),
+    });
     this.unsubscribe = this.store.onEvent((event) => this.onEvent(event));
     this.scanExistingProblems();
+    this.scheduleNextSupervisorCheck();
+    this.supervisorTimer = setInterval(() => {
+      void this.runSupervisorCheck();
+    }, this.supervisorIntervalMs());
+    this.supervisorTimer.unref?.();
     this.pump();
   }
 
   stop() {
     this.running = false;
+    this.stopping = true;
     this.unsubscribe?.();
     this.unsubscribe = null;
+    if (this.supervisorTimer) clearInterval(this.supervisorTimer);
+    this.supervisorTimer = null;
+    this.nextSupervisorCheckAt = null;
+    for (const controller of this.activeControllers.values()) {
+      controller.abort(
+        Object.assign(
+          new Error("Relay is stopping; recovery will resume after restart"),
+          { code: "OPS_ENGINE_STOPPING" },
+        ),
+      );
+    }
+  }
+
+  waitForIdle(timeoutMs = 15_000) {
+    if (this.executions.size === 0) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const deadline = Date.now() + timeoutMs;
+      const timer = setInterval(() => {
+        if (this.executions.size === 0 || Date.now() >= deadline) {
+          clearInterval(timer);
+          resolve(this.executions.size === 0);
+        }
+      }, 25);
+    });
+  }
+
+  scheduleNextSupervisorCheck() {
+    this.nextSupervisorCheckAt = new Date(
+      Date.now() + this.supervisorIntervalMs(),
+    ).toISOString();
+  }
+
+  runSupervisorCheck({ force = false } = {}) {
+    if (!this.running) return null;
+    this.lastSupervisorCheckAt = new Date().toISOString();
+    this.scheduleNextSupervisorCheck();
+    const tasks = this.supervisedTasks();
+    if (!tasks.length) return null;
+    const activeSystemTurn = this.store
+      .listOpsTurns({ threadId: "ops-system", includeCleared: true })
+      .some((turn) => ["queued", "running"].includes(turn.status));
+    if (activeSystemTurn && !force) return null;
+    const message = [
+      "Five-minute persistent supervisor check.",
+      "Inspect every listed task and decide whether it is progressing normally or needs a fresh unrestricted repair conversation.",
+      ...tasks.map(
+        (task) =>
+          `Task #${task.number} ${task.id}: status=${task.status}; branch=${task.branchName}; updatedAt=${task.updatedAt}`,
+      ),
+    ].join("\n");
+    const turn = this.store.appendOpsTurn({
+      message,
+      trigger: "monitor",
+      authorName: "Relay 5-minute Supervisor",
+      threadId: "ops-system",
+    });
+    this.store.emit({
+      opsTurnId: turn.id,
+      actorName: "Relay 5-minute Supervisor",
+      type: "ops.supervisor.check.queued",
+      phase: "ops",
+      message: `Persistent supervisor queued a check for ${tasks.length} non-terminal task(s)`,
+      data: {
+        taskIds: tasks.map((task) => task.id),
+        intervalMs: this.supervisorIntervalMs(),
+      },
+    });
+    this.pump();
+    return turn;
   }
 
   scanExistingProblems() {
@@ -375,19 +539,24 @@ export class OpsEngine {
       while (this.running && this.activeTurns.size < maxConcurrentSessions) {
         const turn = this.store.claimNextOpsTurn();
         if (!turn) break;
+        const controller = new AbortController();
         this.activeTurns.set(turn.threadId, turn.id);
-        void this.runTurn(turn);
+        this.activeControllers.set(turn.id, controller);
+        const execution = this.runTurn(turn, controller);
+        this.executions.add(execution);
+        void execution.finally(() => this.executions.delete(execution));
       }
     } finally {
       this.pumping = false;
     }
   }
 
-  async runTurn(turn) {
+  async runTurn(turn, controller) {
     try {
-      await this.execute(turn);
+      await this.execute(turn, controller.signal);
     } finally {
       this.activeTurns.delete(turn.threadId);
+      this.activeControllers.delete(turn.id);
       queueMicrotask(() => this.pump());
     }
   }
@@ -400,6 +569,9 @@ export class OpsEngine {
 
   buildContext(turn) {
     const snapshot = this.store.snapshot();
+    const supervisedTasks = snapshot.tasks.filter((task) =>
+      SUPERVISED_TASK_STATUSES.has(task.status),
+    );
     const incident = turn.incidentId
       ? this.store.getIncident(turn.incidentId)
       : null;
@@ -419,8 +591,20 @@ export class OpsEngine {
         : null,
       scheduler: this.scheduler.status(),
       runtime: this.scheduler.runtimeStatus(),
+      checkpointMaintenance: this.checkpointMaintenance?.status?.() || null,
       workers: snapshot.workers,
       recentTasks: snapshot.tasks.slice(0, 30),
+      supervisedTasks: supervisedTasks.map((task) => ({
+        ...task,
+        prompts: this.store.getTaskPromptArchive(task.id),
+      })),
+      activeRecoveryTurns: this.store
+        .listOpsTurns({ includeCleared: true })
+        .filter(
+          (item) =>
+            item.trigger === "repair" &&
+            ["queued", "running"].includes(item.status),
+        ),
       recentEvents: snapshot.events.slice(-100),
       openIncidents: snapshot.ops.incidents.filter((item) => !item.resolvedAt),
       recentLogs: recentLogExcerpts(this.config.logDirectory),
@@ -431,11 +615,21 @@ export class OpsEngine {
     const context = this.buildContext(turn);
     return [
       "You are the persistent Relay system operations Codex.",
+      "You are the always-on five-minute supervisor, not the hands-on repair agent.",
+      "Your durable Codex thread is resumed on every check so you must carry forward prior observations and compare them with current evidence.",
       "Your job is to diagnose any Relay, Hyper-V worker, Unity task, Git delivery, web, Guardian, or Relay-code incident.",
-      "You have broad authority for reversible operations. Never delete files, data, logs, tasks, projects, workers, branches, tags, VMs, checkpoints, or worktrees.",
+      "For each non-terminal task, distinguish normal long-running work from a real stall using task detail, persistent JSONL progress, Worker/Unity health, Git evidence, and delivery state.",
+      "Do not declare a task stuck merely because it is slow. Require concrete stale or contradictory evidence.",
+      "When a real problem needs hands-on work, return a codex.repair action targeting the affected task. That launches a fresh GPT-5.6 Sol xhigh conversation with unrestricted machine access.",
+      "Do not try to compress the repair into this supervisor turn and do not substitute worker.restart when a fresh repair conversation can investigate safely.",
+      "Describe the evidence, fault, and required success condition in codex.repair, but do not add tool bans or operational restrictions that are absent from the immutable user prompt or platform policy. The recovery Codex chooses the repair method.",
+      "The complete immutable task prompt archive in the context is authoritative. Never replace, shorten, rewrite, or lose it.",
       ...actionPolicyPrompt(turn),
       "For an attention worker with a preserved failed task, prefer task.continue with precise recovery instructions so the same Codex thread and workspace are resumed without reset.",
       "Use worker.release only when delivery is already durable. Use worker.restart for infrastructure faults, not to discard uncommitted task work.",
+      "For checkpoint-maintenance incidents, use checkpoint.refresh only after the evidence shows the entire Relay task queue is empty, the worker is idle, and the failure is safely retryable. The action atomically rechecks queued and executing turns plus worker readiness, and never touches a busy or attention workspace. Use codex.repair when Git, UnitySkills, DialogGuard, Hyper-V, or retention state needs hands-on diagnosis.",
+      "Checkpoint-maintenance invariant: never add, commit, or push guest-local .meta drift. The configured remote base branch is authoritative. The guarded refresh restores only pure unstaged Unity-generated .meta drift; if any non-.meta, staged, renamed, or copied work is present, preserve the entire workspace and keep the maintenance gate closed.",
+      "Never delete or manipulate AVHDX/VHDX files. Checkpoint rotation is allowed only through the checkpoint maintenance action, which creates and canary-verifies the new PROJECT_READY before pruning the oldest managed checkpoint.",
       "If Relay code is the root cause, use relay.repair with a complete repair instruction. It creates an isolated worktree, rejects file deletions, validates, commits, fast-forwards, and asks Guardian to restart.",
       "Use relay.restart or web.restart when code changes are unnecessary. Mark an incident resolved only when the supplied state already proves recovery.",
       "",
@@ -456,7 +650,11 @@ export class OpsEngine {
     });
   }
 
-  async execute(turn) {
+  async execute(turn, signal) {
+    if (turn.trigger === "repair") {
+      await this.executeRecoveryTurn(turn, signal);
+      return;
+    }
     const thread = this.store.getOpsThread(turn.threadId);
     if (!thread) {
       this.store.failOpsTurn(
@@ -480,6 +678,7 @@ export class OpsEngine {
         model: thread.codexModel,
         reasoningEffort: thread.codexReasoningEffort,
         fastMode: thread.codexFastMode,
+        signal,
         onEvent: (event) => {
           if (event?.type === "thread.started") {
             this.store.setOpsCodexThread(
@@ -581,6 +780,335 @@ export class OpsEngine {
     }
   }
 
+  buildRecoveryPrompt(turn) {
+    const task = turn.targetTaskId
+      ? this.store.getTask(turn.targetTaskId)
+      : null;
+    const promptIntegrity = task
+      ? this.store.verifyTaskPromptIntegrity(task.id)
+      : null;
+    const taskTurns = task ? this.store.listTaskTurns(task.id) : [];
+    const snapshot = this.store.snapshot();
+    return [
+      "You are a fresh unrestricted Relay recovery Codex running directly on the Windows host.",
+      "Use the same level of initiative and machine access as an interactive Codex desktop conversation.",
+      "You are not limited to the Relay structured action catalog or to a read-only diagnosis. Use shell commands, PowerShell Direct, local APIs, Git, Unity endpoints, service controls, and source edits as needed.",
+      "Work continuously until the underlying fault is repaired and the original user task has actually started again, or until a genuine external/user-only blocker is proven.",
+      "Do not return merely because you found a likely cause or launched an asynchronous action. Inspect its result, repair follow-on failures, and verify the task state.",
+      "The one non-negotiable invariant is task-prompt preservation: never delete, replace, shorten, rewrite, or summarize away the original task title, any user turn, or its attachment references.",
+      "Continue the existing Task and Codex thread/workspace whenever they exist. Do not create a replacement task as a shortcut.",
+      "A database-level immutable archive protects every prompt. Confirm its fingerprint before and after recovery.",
+      "Treat the supervisor's recovery assignment as diagnostic context and a required outcome, not as an extra action restriction. Unless a constraint comes from the immutable user prompt, current user authorization, or platform policy, choose any repair method and use any available tool.",
+      "For checkpoint-maintenance recovery, never add, commit, or push guest-local .meta drift. Treat the configured remote base branch as authoritative and use the guarded checkpoint refresh to restore pure unstaged Unity-generated .meta-only drift. Preserve and report the entire workspace instead if any non-.meta, staged, renamed, or copied change is present.",
+      "If Relay itself must restart, make the change durable and use the normal Guardian-controlled restart. This recovery turn is re-queued after Relay restart and will resume the same Codex conversation.",
+      "Follow platform safety rules and the user's authorized scope, but do not impose the old Ops action-catalog, read-only sandbox, or no-op diagnosis restrictions on yourself.",
+      "",
+      `Recovery assignment:\n${turn.userMessage}`,
+      "",
+      task
+        ? `Target task:\n${JSON.stringify(
+            {
+              task,
+              turns: taskTurns,
+              immutablePromptArchive: promptIntegrity.archive,
+              promptFingerprint: promptIntegrity.fingerprint,
+            },
+            null,
+            2,
+          )}`
+        : "No single task was targeted; repair the Relay infrastructure fault described above.",
+      "",
+      `Current authoritative Relay snapshot:\n${safeJson(snapshot)}`,
+    ].join("\n");
+  }
+
+  async waitForTaskRestart(taskId, signal) {
+    const timeoutMs = Math.max(
+      0,
+      Number(this.config.opsRepairTaskStartWaitMs ?? 120_000),
+    );
+    const deadline = Date.now() + timeoutMs;
+    let task = this.store.getTask(taskId);
+    while (
+      task &&
+      task.status === "queued" &&
+      Date.now() < deadline &&
+      !signal?.aborted
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      task = this.store.getTask(taskId);
+    }
+    return task;
+  }
+
+  async ensureTaskRestarted(taskId, signal) {
+    let task = this.store.getTask(taskId);
+    if (!task) {
+      throw Object.assign(
+        new Error(`Recovery target task ${taskId} vanished`),
+        {
+          code: "RECOVERY_TASK_MISSING",
+        },
+      );
+    }
+    if (task.status === "failed" && !this.store.hasActiveTurn(taskId)) {
+      this.scheduler.retryTask(taskId, "Relay Repair Codex");
+      task = this.store.getTask(taskId);
+    } else if (task.status === "queued") {
+      this.scheduler.notifyQueueChanged();
+    }
+    if (task.status === "queued") {
+      task = await this.waitForTaskRestart(taskId, signal);
+    }
+    return task;
+  }
+
+  async executeRecoveryTurn(turn, signal) {
+    const thread = this.store.getOpsThread(turn.threadId);
+    if (!thread) {
+      this.store.failOpsTurn(
+        turn.id,
+        Object.assign(new Error("Recovery Codex conversation not found"), {
+          code: "RECOVERY_THREAD_NOT_FOUND",
+        }),
+      );
+      return;
+    }
+    const beforeIntegrity = turn.targetTaskId
+      ? this.store.verifyTaskPromptIntegrity(turn.targetTaskId)
+      : null;
+    if (beforeIntegrity && !beforeIntegrity.intact) {
+      this.store.failOpsTurn(
+        turn.id,
+        Object.assign(
+          new Error(
+            `Task prompt integrity was already broken before recovery ${turn.id}`,
+          ),
+          { code: "TASK_PROMPT_INTEGRITY_BROKEN" },
+        ),
+      );
+      return;
+    }
+    this.emit(turn, "新的 GPT-5.6 Sol xhigh 全权限修复对话已启动", "info", {
+      targetTaskId: turn.targetTaskId,
+      promptFingerprint: beforeIntegrity?.fingerprint || null,
+    });
+    try {
+      const result = await this.recoverySessionRunner.run({
+        cwd: this.config.projectRoot,
+        threadId: thread.codexThreadId,
+        prompt: this.buildRecoveryPrompt(turn),
+        schemaPath: recoverySchemaPath,
+        logDirectory: path.join(
+          this.config.logDirectory,
+          "ops",
+          "recoveries",
+          turn.id,
+        ),
+        logName: "codex",
+        sandbox: "danger-full-access",
+        model: this.config.opsRepairCodexModel || "gpt-5.6-sol",
+        reasoningEffort: this.config.opsRepairCodexReasoningEffort || "xhigh",
+        fastMode: Boolean(this.config.opsRepairCodexFastMode),
+        timeoutMs: Number(this.config.opsRepairCodexTimeoutMs || 0),
+        signal,
+        onEvent: (event) => {
+          if (event?.type === "thread.started") {
+            this.store.setOpsCodexThread(
+              turn.threadId,
+              event.thread_id || event.threadId || event.thread?.id,
+            );
+          }
+          const message = recoveryProgressMessage(event);
+          if (message) this.emit(turn, message);
+        },
+      });
+      this.store.setOpsCodexThread(turn.threadId, result.threadId);
+      const afterIntegrity = turn.targetTaskId
+        ? this.store.verifyTaskPromptIntegrity(turn.targetTaskId)
+        : null;
+      if (
+        afterIntegrity &&
+        !promptIntegrityExtends(beforeIntegrity, afterIntegrity)
+      ) {
+        throw Object.assign(
+          new Error(
+            `Recovery ${turn.id} changed or removed protected task prompt data; the immutable archive remains available for recovery`,
+          ),
+          { code: "TASK_PROMPT_INTEGRITY_CHANGED" },
+        );
+      }
+      const task =
+        turn.targetTaskId && result.final.status === "completed"
+          ? await this.ensureTaskRestarted(turn.targetTaskId, signal)
+          : turn.targetTaskId
+            ? this.store.getTask(turn.targetTaskId)
+            : null;
+      const taskStarted =
+        !task ||
+        ["running", "waiting_user", "closed"].includes(task.status) ||
+        (task.status === "queued" && this.store.hasActiveTurn(task.id));
+      const final = {
+        ...result.final,
+        status:
+          result.final.status === "completed" && !taskStarted
+            ? "monitoring"
+            : result.final.status,
+        promptIntegrity: afterIntegrity
+          ? {
+              intact: afterIntegrity.intact,
+              startedFingerprint: beforeIntegrity.fingerprint,
+              fingerprint: afterIntegrity.fingerprint,
+              archivedTurns: afterIntegrity.archivedTurns,
+              addedArchivedTurns: Math.max(
+                0,
+                afterIntegrity.archivedTurns - beforeIntegrity.archivedTurns,
+              ),
+            }
+          : null,
+        taskState: task
+          ? {
+              id: task.id,
+              number: task.number,
+              status: task.status,
+              codexThreadId: task.codexThreadId,
+              branchName: task.branchName,
+            }
+          : null,
+      };
+      this.store.completeOpsTurn(turn.id, final);
+      this.emit(
+        turn,
+        taskStarted
+          ? "修复对话已完成，原任务提示词完整且任务已恢复到可运行状态"
+          : "修复对话已结束，但原任务尚未启动；五分钟监督会继续追踪",
+        taskStarted ? "info" : "warning",
+        {
+          status: final.status,
+          targetTaskId: turn.targetTaskId,
+          taskStatus: task?.status || null,
+          promptFingerprint: afterIntegrity?.fingerprint || null,
+        },
+      );
+    } catch (error) {
+      if (this.stopping && error?.code === "OPS_ENGINE_STOPPING") {
+        this.store.requeueOpsTurn(
+          turn.id,
+          "Relay is restarting; this unrestricted recovery conversation will resume",
+        );
+        return;
+      }
+      this.store.failOpsTurn(turn.id, error);
+      this.emit(turn, error?.message || String(error), "error", {
+        code: error?.code || "RECOVERY_TURN_FAILED",
+        targetTaskId: turn.targetTaskId,
+        promptFingerprint: beforeIntegrity?.fingerprint || null,
+      });
+      if (turn.incidentId) {
+        this.store.reopenIncident(
+          turn.incidentId,
+          error?.message || String(error),
+        );
+      }
+    }
+  }
+
+  queueRecoveryConversation(turn, action, diagnosis) {
+    const incident = turn.incidentId
+      ? this.store.getIncident(turn.incidentId)
+      : null;
+    const targetTaskId =
+      (action.targetId && this.store.getTask(action.targetId)?.id) ||
+      incident?.taskId ||
+      null;
+    const task = targetTaskId ? this.store.getTask(targetTaskId) : null;
+    if (
+      turn.trigger === "monitor" &&
+      !turn.incidentId &&
+      task &&
+      !SUPERVISED_TASK_STATUSES.has(task.status)
+    ) {
+      this.store.emit({
+        taskId: targetTaskId,
+        opsTurnId: turn.id,
+        actorName: "Relay Persistent Supervisor",
+        type: "ops.recovery.skipped",
+        phase: "ops",
+        message: `Skipped stale automatic recovery for terminal task #${task.number}`,
+        data: {
+          targetTaskId,
+          taskStatus: task.status,
+          reason: "target-left-supervised-state-before-action",
+        },
+      });
+      return {
+        pending: false,
+        skipped: true,
+        targetTaskId,
+        taskStatus: task.status,
+        reason: "target-left-supervised-state-before-action",
+      };
+    }
+    const active = this.store.findActiveRecoveryTurn(targetTaskId);
+    if (active) {
+      return {
+        pending: true,
+        deduplicated: true,
+        recoveryTurnId: active.id,
+        recoveryThreadId: active.threadId,
+        targetTaskId,
+      };
+    }
+    const recoveryThread = this.store.createOpsThread({
+      title: task
+        ? `自动修复 #${task.number} · ${new Date().toLocaleString("zh-CN")}`
+        : `系统全权限修复 · ${new Date().toLocaleString("zh-CN")}`,
+      codexModel: this.config.opsRepairCodexModel || "gpt-5.6-sol",
+      codexReasoningEffort:
+        this.config.opsRepairCodexReasoningEffort || "xhigh",
+      codexFastMode: Boolean(this.config.opsRepairCodexFastMode),
+    });
+    const recoveryTurn = this.store.appendOpsTurn({
+      threadId: recoveryThread.id,
+      message: [
+        action.message || diagnosis.diagnosis,
+        `Supervisor reason: ${action.reason}`,
+        `Required verification: ${diagnosis.verification}`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      trigger: "repair",
+      incidentId: turn.incidentId,
+      targetTaskId,
+      parentOpsTurnId: turn.id,
+      authorName: "Relay Persistent Supervisor",
+    });
+    this.store.emit({
+      taskId: targetTaskId,
+      opsTurnId: recoveryTurn.id,
+      incidentId: turn.incidentId,
+      actorName: "Relay Persistent Supervisor",
+      type: "ops.recovery.spawned",
+      phase: "ops",
+      message: task
+        ? `Spawned unrestricted GPT-5.6 Sol xhigh recovery conversation for task #${task.number}`
+        : "Spawned unrestricted GPT-5.6 Sol xhigh infrastructure recovery conversation",
+      data: {
+        parentOpsTurnId: turn.id,
+        recoveryThreadId: recoveryThread.id,
+        recoveryTurnId: recoveryTurn.id,
+        targetTaskId,
+      },
+    });
+    queueMicrotask(() => this.pump());
+    return {
+      pending: true,
+      recoveryTurnId: recoveryTurn.id,
+      recoveryThreadId: recoveryThread.id,
+      targetTaskId,
+    };
+  }
+
   async executeAction(turn, proposed, diagnosis) {
     const action = this.store.createOpsAction({
       opsTurnId: turn.id,
@@ -650,7 +1178,8 @@ export class OpsEngine {
     const targetId =
       action.targetId ||
       (action.type.startsWith("task.") ? incident?.taskId : null) ||
-      (action.type.startsWith("worker.") ? incident?.workerId : null);
+      (action.type.startsWith("worker.") ? incident?.workerId : null) ||
+      (action.type.startsWith("checkpoint.") ? incident?.workerId : null);
     const actorName = "Relay Ops Codex";
     switch (action.type) {
       case "task.continue": {
@@ -740,6 +1269,33 @@ export class OpsEngine {
           reason: action.reason,
         });
         return { pending: true };
+      case "checkpoint.refresh": {
+        if (!this.checkpointMaintenance) {
+          throw new HttpError(
+            503,
+            "CHECKPOINT_MAINTENANCE_NOT_RUNNING",
+            "Checkpoint maintenance is not running",
+          );
+        }
+        const result = await this.checkpointMaintenance.runNow({
+          workerId: targetId,
+          reason: action.reason || diagnosis.diagnosis,
+        });
+        if (!result?.ok) {
+          throw Object.assign(
+            new Error(
+              result?.results
+                ?.filter((item) => !item.ok)
+                .map((item) => item.error)
+                .join("; ") || "Checkpoint refresh did not complete",
+            ),
+            { code: "CHECKPOINT_REFRESH_FAILED", details: result },
+          );
+        }
+        return result;
+      }
+      case "codex.repair":
+        return this.queueRecoveryConversation(turn, action, diagnosis);
       case "incident.resolve":
         if (turn.incidentId) {
           this.store.updateIncident(turn.incidentId, {

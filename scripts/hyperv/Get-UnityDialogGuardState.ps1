@@ -60,7 +60,11 @@ $state | Add-Member -NotePropertyName guardProcessRunning `
     -NotePropertyValue ($null -ne $result.processId) -Force
 $state | Add-Member -NotePropertyName observedProcessId `
     -NotePropertyValue $result.processId -Force
-$lastScan = [DateTime]::Parse([string]$state.lastScanAt).ToUniversalTime()
+$lastScan = [DateTimeOffset]::Parse(
+    [string]$state.lastScanAt,
+    [Globalization.CultureInfo]::InvariantCulture,
+    [Globalization.DateTimeStyles]::AssumeUniversal
+).UtcDateTime
 $state | Add-Member -NotePropertyName heartbeatAgeSeconds `
     -NotePropertyValue ([Math]::Round(([DateTime]::UtcNow - $lastScan).TotalSeconds, 3)) `
     -Force

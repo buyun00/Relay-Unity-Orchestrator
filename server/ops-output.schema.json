@@ -42,6 +42,8 @@
               "relay.restart",
               "web.restart",
               "guardian.restart",
+              "checkpoint.refresh",
+              "codex.repair",
               "incident.resolve"
             ]
           },

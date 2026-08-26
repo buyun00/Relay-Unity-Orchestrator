@@ -2,7 +2,7 @@
 
 Relay 是一个运行在 Hyper-V 宿主机上的自建调度与管理系统，不依赖 Sites 或其他托管网页服务。它把一个长期任务拆成可排队的多轮执行：没有空闲虚拟机时自动等待；工位释放后，Codex 对话、Git 分支、提交锚点和完整历史仍然保留。用户可以在同一任务中继续追加微调，而不必重新描述上下文。
 
-Relay 同时内置持久化“系统助手”。任务、Worker、Git 交付、Relay 进程或网页出现异常时，系统会自动创建事故并唤醒专用 Ops Codex；它可以继续保留中的任务、探测或重启 Worker、控制调度器、拉起服务，并在判断为 Relay 自身缺陷时进入隔离 Git worktree 完成修复、全量验证、提交、部署与失败回滚。网页还可创建多个相互独立、可并行运行的人工对话，每条对话分别保存 Codex thread、模型、推理深度与 Fast 设置。清屏只隐藏当前对话的已有轮次，不删除 Codex 上下文或审计记录。自动动作不提供删除数据的入口。独立 Guardian 与 Relay 相互探活和拉起，主 API 不可用时仍可从 Guardian 恢复页继续与 Emergency Codex 对话。
+Relay 同时内置持久化“系统助手”。GPT-5.6 Luna Max 常驻监督会话会在存在非终态 Task 时每 5 分钟复用同一个 Codex thread，综合 Task、JSONL、Worker、Unity、Git 和交付证据判断是否真正卡住。发现故障后，系统会新建 GPT-5.6 Sol xhigh 全权限修复会话；它不受旧版只读沙箱和动作目录限制，可直接修复宿主机、Hyper-V、Unity、Git、Relay 代码与服务，并持续到原 Task 恢复运行。Task 标题、每轮用户提示词和附件引用会写入 SQLite 不可变归档并在修复前后校验，修复不能用替代 Task 绕过原需求。网页仍可创建多个相互独立、可并行运行的人工对话，每条对话分别保存 Codex thread、模型、推理深度与 Fast 设置。独立 Guardian 与 Relay 相互探活和拉起，主 API 不可用时仍可从 Guardian 恢复页继续与 Emergency Codex 对话。
 
 完整权限边界、数据模型、恢复流程和部署方式见 [`docs/系统Codex与Guardian.md`](./docs/系统Codex与Guardian.md)。
 
@@ -30,7 +30,7 @@ Unity 保存 → 来宾 commit / push → 远程 SHA 核验
 
 ### 1. 连接控制服务
 
-打开 `http://localhost:3000`；从其他局域网设备访问时，将 `localhost` 换成宿主机 IP。局域网 HTTP 网页默认连接同一主机的 `4317` 端口；HTTPS/Cloudflare 页面通过网页生产服务的同源 `/relay-control/api` 代理连接，避免浏览器混合内容和单独 API 隧道的传输延迟。首次进入只需填写使用者名称，不需要访问令牌或密码；名称保存在当前浏览器中，并记录到任务发起人、每轮消息作者和人工操作事件里，方便多人共用时区分使用者。
+打开 `http://localhost:3000`；从其他局域网设备访问时，将 `localhost` 换成宿主机 IP。局域网 HTTP 网页默认连接同一主机的 `4317` 端口；HTTPS/Cloudflare 页面通过网页生产服务的同源 `/relay-control/api` 代理连接，避免浏览器混合内容和单独 API 隧道的传输延迟。首次进入只需填写使用者名称，不需要访问令牌或密码；名称保存在当前浏览器中，并记录到任务发起人、每轮消息作者、人工操作事件和每日访问审计日志里，方便多人共用时区分使用者。
 
 首次使用前应在“项目”页添加项目环境，并在“工位”页添加和启用至少一个兼容的 Hyper-V 工位。系统页应显示控制服务实时连接正常、Codex 已登录且调度器未暂停。
 
@@ -118,6 +118,14 @@ Windows CDN 构建；配置、幂等、重试、恢复和审计说明见
 - `guest-tools/unity-dialog-guard/`：安装在子机交互桌面的 Unity 弹窗守护程序、规则、自学习和登录自启动脚本。
 - `tests/server/`：不触碰真实基础设施的状态机与安全回归测试。
 - `.pipeline-data/`：本地 SQLite、附件和 Codex JSONL 日志（已被 Git 忽略）。
+
+每日访问审计默认保存在
+`.pipeline-data/logs/daily-audit/relay-audit-YYYY-MM-DD.log`。文件采用一行一条
+JSON 的追加格式，包含使用者与 IP、API 路径、方法、响应状态、耗时和成功交付
+记录；每天结束或服务停止时追加 `daily_summary`。其中
+`actualCompletedTaskCount` 按任务创建人和任务 ID 去重，
+`deliveredTurnCount` 按成功交付轮次的作者统计。日志不会保存请求体、Cookie、
+授权头或查询参数值。
 
 ## 核心数据模型
 

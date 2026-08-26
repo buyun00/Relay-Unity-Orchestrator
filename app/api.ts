@@ -1,8 +1,23 @@
-import { EMPTY_SNAPSHOT, type PipelineEvent, type Snapshot } from "./types";
+import {
+  EMPTY_SNAPSHOT,
+  type HostMetricsSnapshot,
+  type PipelineEvent,
+  type Snapshot,
+} from "./types";
 
 const API_KEY = "relay-api-base";
 const USER_NAME_KEY = "relay-user-name";
+const USER_COOKIE_NAME = "relay-user";
 const HTTPS_API_PREFIX = "/relay-control";
+
+function persistUserCookie(value: string) {
+  const secure = window.location.protocol === "https:" ? "; Secure" : "";
+  if (value) {
+    document.cookie = `${USER_COOKIE_NAME}=${encodeURIComponent(value)}; Path=/; Max-Age=31536000; SameSite=Lax${secure}`;
+  } else {
+    document.cookie = `${USER_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax${secure}`;
+  }
+}
 
 export function getApiBase(): string {
   if (typeof window === "undefined") return "http://127.0.0.1:4317";
@@ -27,13 +42,16 @@ export function setApiBase(value: string) {
 
 export function getUserName(): string {
   if (typeof window === "undefined") return "";
-  return window.localStorage.getItem(USER_NAME_KEY)?.trim() ?? "";
+  const userName = window.localStorage.getItem(USER_NAME_KEY)?.trim() ?? "";
+  persistUserCookie(userName);
+  return userName;
 }
 
 export function setUserName(value: string) {
   const normalized = value.trim().replace(/\s+/gu, " ").slice(0, 80);
   if (normalized) window.localStorage.setItem(USER_NAME_KEY, normalized);
   else window.localStorage.removeItem(USER_NAME_KEY);
+  persistUserCookie(normalized);
   return normalized;
 }
 
@@ -64,6 +82,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers,
     cache: "no-store",
+    credentials: "include",
   });
   const contentType = response.headers.get("content-type") ?? "";
   const payload = contentType.includes("application/json")
@@ -212,6 +231,25 @@ export function fetchSnapshot(signal?: AbortSignal) {
   });
 }
 
+export async function fetchHostMetrics(signal?: AbortSignal) {
+  const response = await fetch("/_relay/host-metrics", {
+    cache: "no-store",
+    signal,
+  });
+  const payload = (await response.json()) as
+    HostMetricsSnapshot | { error?: { message?: string } };
+  if (!response.ok || !("sampledAt" in payload)) {
+    throw new ApiError(
+      response.status,
+      "error" in payload
+        ? (payload.error?.message ?? "宿主机性能采样暂不可用")
+        : "宿主机性能采样暂不可用",
+      payload,
+    );
+  }
+  return payload;
+}
+
 export function fetchTaskEvents(taskId: string) {
   return api<{ events?: PipelineEvent[] }>(
     `/api/tasks/${encodeURIComponent(taskId)}`,
@@ -230,6 +268,7 @@ export async function uploadFile(
     method: "POST",
     headers,
     body: file,
+    credentials: "include",
   });
   const payload = (await response.json()) as {
     error?: string | { message?: string };
@@ -252,7 +291,9 @@ export async function subscribeEvents(
   onEvent: (event?: PipelineEvent) => void,
   onDisconnect: () => void,
 ): Promise<() => void> {
-  const source = new EventSource(`${getApiBase()}/api/events`);
+  const source = new EventSource(`${getApiBase()}/api/events`, {
+    withCredentials: true,
+  });
   const handleEvent = (event: MessageEvent<string>) => {
     try {
       onEvent(JSON.parse(event.data) as PipelineEvent);

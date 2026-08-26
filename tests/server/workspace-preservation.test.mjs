@@ -214,7 +214,7 @@ function runHostWorkspaceScript(
 }
 
 function inspectThroughHost(t, project) {
-  return runHostWorkspaceScript(t, inspectHostScript, project, "", 3);
+  return runHostWorkspaceScript(t, inspectHostScript, project, "", 4);
 }
 
 function verifyThroughHost(t, project, auditedFiles) {
@@ -228,7 +228,7 @@ function verifyThroughHost(t, project, auditedFiles) {
       `-ExpectedHead ${powershellQuote(head)}`,
       `-AuditedFilesJson ${powershellQuote(JSON.stringify(auditedFiles))}`,
     ].join(" "),
-    6,
+    7,
   );
 }
 
@@ -238,6 +238,7 @@ function prepare(
   branch = taskBranch,
   mode = "new",
   audit = null,
+  approvedOverlayPaths = [],
 ) {
   const args = [
     "-NoLogo",
@@ -268,6 +269,10 @@ function prepare(
     cwd: path.resolve("."),
     encoding: "utf8",
     windowsHide: true,
+    env: {
+      ...process.env,
+      RELAY_APPROVED_OVERLAY_PATHS_JSON: JSON.stringify(approvedOverlayPaths),
+    },
   });
   return JSON.parse(stdout.trim());
 }
@@ -742,6 +747,130 @@ test("recovery preserves every tracked and untracked task-0017 file before targe
       `checkout: moving from main to ${result.preservedBranch.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`,
       "u",
     ),
+  );
+});
+
+test("new preparation ignores only explicitly approved skip-worktree overlays", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-approved-overlays");
+  const overlayPaths = [
+    "baloot_client/Packages/manifest.json",
+    "baloot_client/Packages/packages-lock.json",
+  ];
+  const overlayContents = [
+    '{"base":2,"unitySkills":"local"}\n',
+    '{"lock":2,"unitySkills":"local"}\n',
+  ];
+  git(project, "update-index", "--skip-worktree", "--", ...overlayPaths);
+  for (let index = 0; index < overlayPaths.length; index += 1) {
+    write(
+      path.join(project, ...overlayPaths[index].split("/")),
+      overlayContents[index],
+    );
+  }
+
+  const refused = prepare(
+    project,
+    repository,
+    "codex/task-unapproved-overlays",
+  );
+  assert.equal(refused.ready, false);
+  assert.equal(refused.code, "WORKSPACE_DIRTY_REFUSED");
+  assert.deepEqual(refused.blockedPaths.sort(), [...overlayPaths].sort());
+  assert.equal(git(project, "branch", "--show-current"), "main");
+
+  const result = prepare(
+    project,
+    repository,
+    "codex/task-approved-overlays",
+    "new",
+    null,
+    overlayPaths,
+  );
+  assert.equal(result.ready, true, JSON.stringify(result, null, 2));
+  assert.deepEqual(result.statusBefore, []);
+  assert.deepEqual(result.statusAfter, []);
+  assert.equal(
+    git(project, "branch", "--show-current"),
+    "codex/task-approved-overlays",
+  );
+  for (let index = 0; index < overlayPaths.length; index += 1) {
+    assert.equal(
+      fs.readFileSync(
+        path.join(project, ...overlayPaths[index].split("/")),
+        "utf8",
+      ),
+      overlayContents[index],
+    );
+  }
+});
+
+test("new preparation preserves approved overlays when the base branch changes them", (t) => {
+  const repository = createRepository(t);
+  const project = clone(repository, "guest-approved-overlay-base-update");
+  const overlayPaths = [
+    "baloot_client/Packages/manifest.json",
+    "baloot_client/Packages/packages-lock.json",
+  ];
+  const overlayContents = [
+    '{"base":2,"unitySkills":"local"}\n',
+    '{"lock":2,"unitySkills":"local"}\n',
+  ];
+  git(project, "update-index", "--skip-worktree", "--", ...overlayPaths);
+  for (let index = 0; index < overlayPaths.length; index += 1) {
+    write(
+      path.join(project, ...overlayPaths[index].split("/")),
+      overlayContents[index],
+    );
+  }
+
+  const publisher = clone(repository, "publisher-approved-overlay-base-update");
+  git(publisher, "config", "user.name", "Relay Test");
+  git(publisher, "config", "user.email", "relay@test.invalid");
+  write(
+    path.join(publisher, ...overlayPaths[1].split("/")),
+    '{"lock":3,"remoteBaseChanged":true}\n',
+  );
+  git(publisher, "add", "--", overlayPaths[1]);
+  git(publisher, "commit", "-m", "advance base package lock");
+  git(publisher, "push", "origin", "main");
+
+  const result = prepare(
+    project,
+    repository,
+    "codex/task-approved-overlay-base-update",
+    "new",
+    null,
+    overlayPaths,
+  );
+  assert.equal(result.ready, true, JSON.stringify(result, null, 2));
+  assert.equal(result.approvedOverlayPreservationVerified, true);
+  assert.deepEqual(
+    result.approvedOverlayPreservation.map(({ path: overlayPath, reapplied }) => [
+      overlayPath,
+      reapplied,
+    ]),
+    overlayPaths.map((overlayPath) => [overlayPath, true]),
+  );
+  assert.equal(
+    git(project, "branch", "--show-current"),
+    "codex/task-approved-overlay-base-update",
+  );
+  assert.equal(git(project, "status", "--porcelain"), "");
+  for (let index = 0; index < overlayPaths.length; index += 1) {
+    assert.equal(
+      fs.readFileSync(
+        path.join(project, ...overlayPaths[index].split("/")),
+        "utf8",
+      ),
+      overlayContents[index],
+    );
+  }
+  assert.deepEqual(
+    git(project, "ls-files", "-v", "--", ...overlayPaths)
+      .split(/\r?\n/u)
+      .map((line) => line.slice(0, 1)),
+    ["S", "S"],
   );
 });
 
@@ -1673,6 +1802,40 @@ test("curl 18 is retried once with bounded backoff and then succeeds", () => {
   assert.deepEqual(result.waits, [1000]);
 });
 
+test("temporary DNS resolution failure is retried with bounded backoff", () => {
+  const helper = workspaceGitScript.replaceAll("'", "''");
+  const result = runPowerShellJson(
+    [
+      "$ProgressPreference = 'SilentlyContinue'",
+      ". '" + helper + "'",
+      "$script:waits = New-Object System.Collections.Generic.List[int]",
+      "$runner = { param($Repo,$Args,$Env,$Timeout,$Stage,$Attempt) if ($Attempt -eq 1) { [pscustomobject]@{ exitCode=128; stdoutBytes=[byte[]]@(); stdout=''; stderr='fatal: unable to access remote: Could not resolve host: git.example.invalid'; stage=$Stage; timedOut=$false; timeoutSeconds=$Timeout; durationMs=5 } } else { [pscustomobject]@{ exitCode=0; stdoutBytes=[byte[]]@(); stdout='ok'; stderr=''; stage=$Stage; timedOut=$false; timeoutSeconds=$Timeout; durationMs=4 } } }",
+      "$waiter = { param($Milliseconds,$Attempt) $script:waits.Add([int]$Milliseconds) }",
+      "$value = Invoke-RelayGitWithRetry -RepositoryPath '.' -Arguments @('fetch') -Stage 'task-branch-fetch' -TimeoutSeconds 30 -MaximumAttempts 3 -InitialBackoffMilliseconds 1000 -ProcessInvoker $runner -BackoffWaiter $waiter",
+      "[pscustomobject]@{ attempts=@($value.attempts); waits=@($script:waits) } | ConvertTo-Json -Depth 8 -Compress",
+    ].join("; "),
+  );
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0].transient, true);
+  assert.equal(result.attempts[0].backoffMilliseconds, 1000);
+  assert.equal(result.attempts[1].exitCode, 0);
+  assert.deepEqual(result.waits, [1000]);
+});
+
+test("initial preparation gives a cold shared-remote fetch one bounded transfer window", () => {
+  const source = fs.readFileSync(guestScript, "utf8");
+  const hostSource = fs.readFileSync(
+    path.resolve("scripts/hyperv/Prepare-Workspace.ps1"),
+    "utf8",
+  );
+  assert.match(source, /\$prepareBranchFetchTimeoutSeconds = 270/u);
+  assert.match(
+    source,
+    /'prepare-branch-fetch' @\{\} \$prepareBranchFetchTimeoutSeconds 1 0/u,
+  );
+  assert.match(hostSource, /\[int\]\$TimeoutSeconds = 340/u);
+});
+
 test("three exhausted transient failures retain every attempt and backoff", () => {
   const helper = workspaceGitScript.replaceAll("'", "''");
   const result = runPowerShellJson(
@@ -1702,7 +1865,7 @@ test("PowerShell Direct timeout stops only its owned job and reports the exact s
       "$ProgressPreference = 'SilentlyContinue'",
       ". '" + helper + "'",
       "function global:Invoke-Command { param([string]$VMName,[pscredential]$Credential,[object[]]$ArgumentList,[scriptblock]$ScriptBlock,[switch]$AsJob) $global:ownedJob = Start-Job -ScriptBlock { Start-Sleep -Seconds 30 }; return $global:ownedJob }",
-      "$credential = New-Object System.Management.Automation.PSCredential('test',(ConvertTo-SecureString 'test' -AsPlainText -Force))",
+      "$secure = New-Object System.Security.SecureString; $secure.AppendChar('x'); $credential = New-Object System.Management.Automation.PSCredential('test',$secure)",
       "$started = [DateTime]::UtcNow",
       "try { Invoke-RelayPowerShellDirect -VMName 'fake' -Credential $credential -ArgumentList @('owned') -ScriptBlock {} -Stage 'powershell-direct-recovery' -TimeoutSeconds 1 | Out-Null; throw 'expected timeout' } catch { [pscustomobject]@{ message=$_.Exception.Message; stage=$_.Exception.Data['relayStage']; timedOut=$_.Exception.Data['relayTimedOut']; elapsedMs=[int]([DateTime]::UtcNow-$started).TotalMilliseconds; ownedJobRemoved=$null -eq (Get-Job -Id $global:ownedJob.Id -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress }",
     ].join("; "),
@@ -1712,6 +1875,22 @@ test("PowerShell Direct timeout stops only its owned job and reports the exact s
   assert.match(result.message, /owned remoting job was stopped/u);
   assert.ok(result.elapsedMs < 10_000);
   assert.equal(result.ownedJobRemoved, true);
+});
+
+test("PowerShell Direct retains the guest error stream after receiving job output", () => {
+  const helper = powerShellDirectScript.replaceAll("'", "''");
+  const result = runPowerShellJson(
+    [
+      "$ProgressPreference = 'SilentlyContinue'",
+      ". '" + helper + "'",
+      "function global:Invoke-Command { param([string]$VMName,[pscredential]$Credential,[object[]]$ArgumentList,[scriptblock]$ScriptBlock,[switch]$AsJob) Start-Job -ScriptBlock { Write-Error 'guest checkout detail' } }",
+      "$secure = New-Object System.Security.SecureString; $secure.AppendChar('x'); $credential = New-Object System.Management.Automation.PSCredential('test',$secure)",
+      "try { Invoke-RelayPowerShellDirect -VMName 'fake' -Credential $credential -ArgumentList @('detail') -ScriptBlock {} -Stage 'powershell-direct-detail' -TimeoutSeconds 10 | Out-Null; throw 'expected guest failure' } catch { [pscustomobject]@{ message=$_.Exception.Message; stage=$_.Exception.Data['relayStage']; stderr=$_.Exception.Data['relayStderr'] } | ConvertTo-Json -Compress }",
+    ].join("; "),
+  );
+  assert.equal(result.stage, "powershell-direct-detail");
+  assert.match(result.message, /guest checkout detail/u);
+  assert.match(result.stderr, /guest checkout detail/u);
 });
 
 test("recovery source suppresses prompts and forbids deletion or global Git mutation", () => {
@@ -1728,7 +1907,14 @@ test("recovery source suppresses prompts and forbids deletion or global Git muta
   assert.match(gitSource, /GIT_TERMINAL_PROMPT.*0/u);
   assert.match(gitSource, /GCM_INTERACTIVE.*Never/u);
   assert.match(gitSource, /WaitForExit\(\$TimeoutSeconds \* 1000\)/u);
+  assert.match(gitSource, /Stop-RelayOwnedChildProcesses/u);
+  assert.match(gitSource, /Get-CimInstance Win32_Process/u);
   assert.match(gitSource, /\$process\.Kill\(\)/u);
+  assert.match(gitSource, /WaitForExit\(5000\)/u);
+  assert.match(gitSource, /WaitAll\(\$streamTasks, 5000\)/u);
+  assert.doesNotMatch(gitSource, /\$process\.WaitForExit\(\)/u);
+  assert.match(gitSource, /ValidateRange\(1, 1200\)/u);
+  assert.match(directSource, /ValidateRange\(1, 3600\)/u);
   assert.match(recoverySource, /ls-remote.*--exit-code.*--refs/su);
   assert.match(recoverySource, /fetch.*--no-tags.*--no-prune/su);
   assert.match(

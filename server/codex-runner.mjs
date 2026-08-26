@@ -48,16 +48,61 @@ function attachmentPrompt(attachment) {
   }
 }
 
+function workerUnityEndpoints(context) {
+  const resolvedSkillUrl = resolveWorkerTemplate(
+    context.project.unitySkillUrl,
+    context.worker,
+  );
+  const resolvedHealthUrl = resolveWorkerTemplate(
+    context.project.unityHealthUrl,
+    context.worker,
+  );
+  const candidate = resolvedSkillUrl || resolvedHealthUrl;
+  if (!candidate) return { baseUrl: null, mcpUrl: null };
+  try {
+    const url = new URL(candidate);
+    const baseUrl = url.origin;
+    return { baseUrl, mcpUrl: `${baseUrl}/mcp` };
+  } catch {
+    return { baseUrl: null, mcpUrl: resolvedSkillUrl || null };
+  }
+}
+
 function buildPrompt(context) {
+  const profile = context.turn.executionProfile || "auto";
+  const unityEndpoints = workerUnityEndpoints(context);
+  const workerUnityRoute = unityEndpoints.baseUrl
+    ? [
+        `Relay's authoritative Unity endpoint for this assigned Worker ${context.worker.name} is ${unityEndpoints.baseUrl}.`,
+        "If a local AGENTS override or prior thread mentions another Worker's Unity IP, ignore that stale endpoint for this turn. Never send Unity or UnitySkills requests to a different Worker.",
+      ]
+    : [];
   const attachmentNote = context.attachments.length
     ? `\nAttachments supplied by the user for this turn:\n${context.attachments.map(attachmentPrompt).join("\n")}`
     : "";
+  const routeInstructions = {
+    code_only: [
+      "Relay executionProfile=code_only for this turn.",
+      "Work strictly through code, text, Git evidence, and static checks. Do not probe, start, wait for, restart, or repair Unity, UnitySkills, or UnityDialogGuard. Do not treat missing Unity compilation or Console evidence as a blocker.",
+    ],
+    auto: [
+      "Relay executionProfile=auto for this turn: begin on the code-only route.",
+      "Unity, UI, layout, Panel, View, and Prefab keywords do not by themselves justify Unity automation. Escalate to UnitySkills only after code-level investigation identifies the exact serialized asset or Editor operation required and explains why code alone cannot complete the request. Do not repair Unity merely to obtain optional validation evidence.",
+      ...workerUnityRoute,
+      `Only after that explicit escalation, if Unity or UnitySkills times out, inspect pending guest dialogs with ${dialogStateScript} using VMName ${context.worker.vmName} and CredentialPath ${context.worker.credentialPath}. For an unknown dialog, use ${dialogActionScript} only with the exact dialogId/buttonId returned by the state interface, and never authorize a high-risk action without explicit user authority.`,
+    ],
+    unity_asset: [
+      "Relay executionProfile=unity_asset for this turn.",
+      "Use the configured Unity Skill to inspect or edit the requested real scenes, prefabs, components, hierarchy, serialized bindings, or other Editor state.",
+      ...workerUnityRoute,
+      `If Unity or its Skill times out, inspect pending guest dialogs before treating the timeout as terminal. Read them with ${dialogStateScript} using VMName ${context.worker.vmName} and CredentialPath ${context.worker.credentialPath}.`,
+      `For an unknown dialog, reason from its title, text, screenshot, and enumerated buttons, then use ${dialogActionScript} only with the exact dialogId/buttonId returned by the state interface. Never authorize a high-risk action without explicit user authority.`,
+    ],
+  }[profile] || ["Relay executionProfile=auto for this turn."];
   return [
     `You are executing turn ${context.turn.sequence} for persistent task #${context.task.number}: ${context.task.title}.`,
     `Work only on branch ${context.task.branchName}. The workspace is managed externally; do not switch branches or push.`,
-    "Use the configured Unity Skill whenever the task requires inspecting or editing scenes, prefabs, or serialized Unity assets.",
-    `If Unity or its Skill times out, inspect pending guest dialogs before treating the timeout as terminal. Read them with ${dialogStateScript} using VMName ${context.worker.vmName} and CredentialPath ${context.worker.credentialPath}.`,
-    `For an unknown dialog, reason from its title, text, screenshot, and enumerated buttons, then use ${dialogActionScript} only with the exact dialogId/buttonId returned by the state interface. Never authorize a high-risk action without explicit user authority.`,
+    ...routeInstructions,
     "Complete the requested change, validate proportionally, and return the required structured result.",
     "",
     context.turn.userMessage,
@@ -192,11 +237,8 @@ export class CodexRunner {
       "-c",
       `features.fast_mode=${codexFastMode}`,
     ];
-    const unitySkillUrl = resolveWorkerTemplate(
-      context.project.unitySkillUrl,
-      context.worker,
-    );
-    if (unitySkillUrl) {
+    const unitySkillUrl = workerUnityEndpoints(context).mcpUrl;
+    if (unitySkillUrl && context.turn.executionProfile === "unity_asset") {
       args.push(
         "-c",
         `mcp_servers.unity.url=${JSON.stringify(unitySkillUrl)}`,

@@ -41,6 +41,20 @@ export function integer(
   return Math.min(maximum, Math.max(minimum, parsed));
 }
 
+const EXECUTION_PROFILES = new Set(["auto", "code_only", "unity_asset"]);
+
+export function executionProfile(value, fallback = "auto") {
+  if (value == null || value === "") return fallback;
+  if (typeof value !== "string" || !EXECUTION_PROFILES.has(value)) {
+    throw new HttpError(
+      400,
+      "INVALID_EXECUTION_PROFILE",
+      "executionProfile must be auto, code_only, or unity_asset",
+    );
+  }
+  return value;
+}
+
 export function requiredString(value, field, { max = 10_000 } = {}) {
   if (typeof value !== "string" || !value.trim()) {
     throw new HttpError(400, "VALIDATION_ERROR", `${field} is required`);

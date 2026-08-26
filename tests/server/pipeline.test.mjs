@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { FakeAdapter } from "./fake-adapter.mjs";
+import { DailyAuditLogger } from "../../server/daily-audit-log.mjs";
 import { Store } from "../../server/db.mjs";
 import { PipelineHttpServer } from "../../server/http.mjs";
 import { Scheduler } from "../../server/scheduler.mjs";
@@ -1544,10 +1545,21 @@ test("browser preflight accepts the task idempotency header", async (t) => {
     store,
     adapter: new FakeAdapter(config),
   });
-  const api = new PipelineHttpServer({ config, store, scheduler });
+  const auditLog = new DailyAuditLogger({
+    directory: path.join(config.logDirectory, "daily-audit"),
+    timeZone: "UTC",
+    rotationIntervalMs: 0,
+  });
+  const api = new PipelineHttpServer({
+    config,
+    store,
+    scheduler,
+    auditLog,
+  });
   const address = await api.listen();
   t.after(async () => {
     await api.close();
+    auditLog.close();
     store.close();
     fs.rmSync(config.dataDirectory, { recursive: true, force: true });
   });
@@ -1582,6 +1594,38 @@ test("browser preflight accepts the task idempotency header", async (t) => {
     /X-Pipeline-User/i,
   );
 
+  const imageBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const uploadResponse = await fetch(`${base}/api/uploads`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "image/png",
+      "X-File-Name": encodeURIComponent("参考图.png"),
+      "X-Pipeline-User": encodeURIComponent("林"),
+    },
+    body: imageBytes,
+  });
+  assert.equal(uploadResponse.status, 201);
+  const uploadPayload = await uploadResponse.json();
+  assert.equal(uploadPayload.attachment.filename, "参考图.png");
+  const notesBytes = Buffer.from("Original task attachment notes.\n", "utf8");
+  const notesUploadResponse = await fetch(`${base}/api/uploads`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "text/plain",
+      "X-File-Name": encodeURIComponent("说明 100%20.txt"),
+      "X-Pipeline-User": encodeURIComponent("林"),
+    },
+    body: notesBytes,
+  });
+  assert.equal(notesUploadResponse.status, 201);
+  const notesUploadPayload = await notesUploadResponse.json();
+  assert.equal(notesUploadPayload.attachment.filename, "说明 100%20.txt");
+
   const response = await fetch(`${base}/api/tasks`, {
     method: "POST",
     headers: {
@@ -1589,6 +1633,7 @@ test("browser preflight accepts the task idempotency header", async (t) => {
       "Content-Type": "application/json",
       "Idempotency-Key": "browser-create-task-test",
       "X-Pipeline-User": encodeURIComponent("林"),
+      "CF-Connecting-IP": "203.0.113.45",
     },
     body: JSON.stringify({
       projectId: project.id,
@@ -1597,6 +1642,11 @@ test("browser preflight accepts the task idempotency header", async (t) => {
       codexModel: "gpt-5.6-luna",
       codexReasoningEffort: "max",
       codexFastMode: true,
+      executionProfile: "code_only",
+      attachmentIds: [
+        uploadPayload.attachment.id,
+        notesUploadPayload.attachment.id,
+      ],
     }),
   });
   assert.equal(response.status, 201);
@@ -1608,6 +1658,132 @@ test("browser preflight accepts the task idempotency header", async (t) => {
   assert.equal(firstPayload.task.codexModel, "gpt-5.6-luna");
   assert.equal(firstPayload.task.codexReasoningEffort, "max");
   assert.equal(firstPayload.task.codexFastMode, true);
+  assert.equal(firstPayload.turn.executionProfile, "code_only");
+  const taskDetailResponse = await fetch(
+    `${base}/api/tasks/${encodeURIComponent(firstPayload.task.id)}`,
+  );
+  assert.equal(taskDetailResponse.status, 200);
+  const taskDetailPayload = await taskDetailResponse.json();
+  assert.equal(
+    taskDetailPayload.turns[0].userMessage,
+    "Verify browser task creation",
+  );
+  assert.equal(taskDetailPayload.turns[0].executionProfile, "code_only");
+  assert.equal(taskDetailPayload.turns[0].attachments.length, 2);
+  const detailImage = taskDetailPayload.turns[0].attachments.find(
+    (attachment) => attachment.id === uploadPayload.attachment.id,
+  );
+  assert.deepEqual(detailImage, {
+    id: uploadPayload.attachment.id,
+    filename: "参考图.png",
+    contentType: "image/png",
+    size: imageBytes.length,
+    createdAt: uploadPayload.attachment.createdAt,
+  });
+  const detailNotes = taskDetailPayload.turns[0].attachments.find(
+    (attachment) => attachment.id === notesUploadPayload.attachment.id,
+  );
+  assert.deepEqual(detailNotes, {
+    id: notesUploadPayload.attachment.id,
+    filename: "说明 100%20.txt",
+    contentType: "text/plain",
+    size: notesBytes.length,
+    createdAt: notesUploadPayload.attachment.createdAt,
+  });
+  assert.ok(
+    taskDetailPayload.turns[0].attachments.every(
+      (attachment) => !("path" in attachment),
+    ),
+  );
+
+  const snapshotResponse = await fetch(`${base}/api/snapshot`);
+  assert.equal(snapshotResponse.status, 200);
+  const snapshotPayload = await snapshotResponse.json();
+  const snapshotTurn = snapshotPayload.turns.find(
+    (turn) => turn.id === firstPayload.turn.id,
+  );
+  assert.equal(snapshotTurn.userMessage, "Verify browser task creation");
+  assert.deepEqual(
+    snapshotTurn.attachments
+      .map((attachment) => attachment.filename)
+      .sort((left, right) => left.localeCompare(right)),
+    ["参考图.png", "说明 100%20.txt"].sort((left, right) =>
+      left.localeCompare(right),
+    ),
+  );
+
+  const attachmentUrl = `${base}/api/attachments/${encodeURIComponent(uploadPayload.attachment.id)}`;
+  const attachmentResponse = await fetch(attachmentUrl, {
+    headers: { Origin: origin },
+  });
+  assert.equal(attachmentResponse.status, 200);
+  assert.equal(attachmentResponse.headers.get("content-type"), "image/png");
+  assert.match(
+    attachmentResponse.headers.get("content-disposition") || "",
+    /^inline;/u,
+  );
+  assert.match(
+    attachmentResponse.headers.get("content-disposition") || "",
+    /filename\*=UTF-8''/u,
+  );
+  assert.equal(
+    attachmentResponse.headers.get("x-content-type-options"),
+    "nosniff",
+  );
+  assert.equal(
+    attachmentResponse.headers.get("access-control-allow-origin"),
+    origin,
+  );
+  assert.deepEqual(
+    Buffer.from(await attachmentResponse.arrayBuffer()),
+    imageBytes,
+  );
+
+  const notesAttachmentUrl = `${base}/api/attachments/${encodeURIComponent(notesUploadPayload.attachment.id)}`;
+  const notesAttachmentResponse = await fetch(notesAttachmentUrl);
+  assert.equal(notesAttachmentResponse.status, 200);
+  assert.equal(
+    notesAttachmentResponse.headers.get("content-type"),
+    "text/plain",
+  );
+  assert.match(
+    notesAttachmentResponse.headers.get("content-disposition") || "",
+    /^attachment;/u,
+  );
+  assert.match(
+    notesAttachmentResponse.headers.get("content-disposition") || "",
+    /%E8%AF%B4%E6%98%8E%20100%2520\.txt/u,
+  );
+  assert.deepEqual(
+    Buffer.from(await notesAttachmentResponse.arrayBuffer()),
+    notesBytes,
+  );
+
+  const attachmentHead = await fetch(attachmentUrl, { method: "HEAD" });
+  assert.equal(attachmentHead.status, 200);
+  assert.equal(
+    Number(attachmentHead.headers.get("content-length")),
+    imageBytes.length,
+  );
+
+  const missingAttachment = await fetch(`${base}/api/attachments/missing`);
+  assert.equal(missingAttachment.status, 404);
+  const accessEntries = fs
+    .readFileSync(auditLog.currentFilePath, "utf8")
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.ok(
+    accessEntries.some(
+      (entry) =>
+        entry.type === "access" &&
+        entry.method === "POST" &&
+        entry.path === "/api/tasks" &&
+        entry.user === "林" &&
+        entry.ip === "203.0.113.45" &&
+        entry.statusCode === 201,
+    ),
+  );
 
   const repeated = await fetch(`${base}/api/tasks`, {
     method: "POST",
@@ -1629,6 +1805,18 @@ test("browser preflight accepts the task idempotency header", async (t) => {
   assert.equal(repeatedPayload.duplicate, true);
   assert.equal(store.listTasks().length, 1);
 
+  const followUpUploadResponse = await fetch(`${base}/api/uploads`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "image/png",
+      "X-File-Name": encodeURIComponent("第二轮截图.png"),
+    },
+    body: imageBytes,
+  });
+  assert.equal(followUpUploadResponse.status, 201);
+  const followUpUploadPayload = await followUpUploadResponse.json();
+
   const followUp = await fetch(
     `${base}/api/tasks/${encodeURIComponent(firstPayload.task.id)}/messages`,
     {
@@ -1638,12 +1826,26 @@ test("browser preflight accepts the task idempotency header", async (t) => {
         "Content-Type": "application/json",
         "X-Pipeline-User": encodeURIComponent("产品组小王"),
       },
-      body: JSON.stringify({ message: "Add a second user's refinement" }),
+      body: JSON.stringify({
+        message: "Add a second user's refinement",
+        executionProfile: "unity_asset",
+        attachmentIds: [followUpUploadPayload.attachment.id],
+      }),
     },
   );
   assert.equal(followUp.status, 201);
   const followUpPayload = await followUp.json();
   assert.equal(followUpPayload.turn.authorName, "产品组小王");
+  assert.equal(followUpPayload.turn.executionProfile, "unity_asset");
+  const detailAfterFollowUp = await fetch(
+    `${base}/api/tasks/${encodeURIComponent(firstPayload.task.id)}`,
+  ).then((item) => item.json());
+  const followUpDetail = detailAfterFollowUp.turns.find(
+    (turn) => turn.id === followUpPayload.turn.id,
+  );
+  assert.equal(followUpDetail.attachments.length, 1);
+  assert.equal(followUpDetail.attachments[0].filename, "第二轮截图.png");
+  assert.ok(!("path" in followUpDetail.attachments[0]));
   assert.ok(
     store
       .listTaskEvents(firstPayload.task.id)
@@ -1651,6 +1853,22 @@ test("browser preflight accepts the task idempotency header", async (t) => {
         (event) =>
           event.type === "turn.queued" && event.actorName === "产品组小王",
       ),
+  );
+
+  const invalidExecutionProfile = await fetch(`${base}/api/tasks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: project.id,
+      title: "Invalid route",
+      message: "Reject unknown route",
+      executionProfile: "always_unity",
+    }),
+  });
+  assert.equal(invalidExecutionProfile.status, 400);
+  assert.equal(
+    (await invalidExecutionProfile.json()).error.code,
+    "INVALID_EXECUTION_PROFILE",
   );
 
   const removedSessionRoute = await fetch(`${base}/api/session`, {

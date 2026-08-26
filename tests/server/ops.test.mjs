@@ -31,12 +31,18 @@ function configFor(dataDirectory) {
     opsAutoDeploy: false,
     opsMaxAttempts: 4,
     opsMaxConcurrentSessions: 4,
+    opsSupervisorIntervalMs: 60_000,
     codexModel: "test-model",
     codexReasoningEffort: "high",
     codexServiceTier: "default",
     opsCodexModel: "test-model",
     opsCodexReasoningEffort: "high",
     opsCodexFastMode: false,
+    opsRepairCodexModel: "gpt-5.6-sol",
+    opsRepairCodexReasoningEffort: "xhigh",
+    opsRepairCodexFastMode: false,
+    opsRepairCodexTimeoutMs: 0,
+    opsRepairTaskStartWaitMs: 10,
   };
 }
 
@@ -188,6 +194,84 @@ class ActionProposingOpsSession {
           },
         ],
         verification: "Wait for the continued task turn.",
+      },
+    };
+  }
+}
+
+class PersistentSupervisorSession {
+  calls = [];
+
+  constructor(taskId = null) {
+    this.taskId = taskId;
+  }
+
+  async run(options) {
+    this.calls.push(options);
+    options.onEvent?.({
+      type: "thread.started",
+      thread_id: "persistent-luna-supervisor",
+    });
+    return {
+      threadId: "persistent-luna-supervisor",
+      final: {
+        status: this.taskId ? "action_required" : "monitoring",
+        summary: this.taskId
+          ? "A fresh unrestricted recovery conversation is required."
+          : "The active task is progressing normally.",
+        diagnosis: this.taskId
+          ? "The task is queued behind a recoverable infrastructure fault."
+          : "No real stall was found.",
+        confidence: 0.99,
+        actions: this.taskId
+          ? [
+              {
+                type: "codex.repair",
+                targetId: this.taskId,
+                message:
+                  "Repair the infrastructure and prove the original task can start.",
+                reason: "The task cannot start without hands-on recovery.",
+              },
+            ]
+          : [],
+        verification: "Verify the original task prompt and running state.",
+      },
+    };
+  }
+}
+
+class UnrestrictedRecoverySession {
+  calls = [];
+
+  constructor(onRun = null) {
+    this.onRun = onRun;
+  }
+
+  async run(options) {
+    this.calls.push(options);
+    await this.onRun?.(options);
+    options.onEvent?.({
+      type: "thread.started",
+      thread_id: "fresh-sol-recovery-thread",
+    });
+    options.onEvent?.({
+      type: "item.started",
+      item: {
+        id: "repair-command",
+        type: "command_execution",
+        command: "powershell.exe -File Repair-And-Resume.ps1",
+      },
+    });
+    return {
+      threadId: "fresh-sol-recovery-thread",
+      final: {
+        status: "completed",
+        summary: "The infrastructure is ready and the original task is queued.",
+        diagnosis: "A recoverable test fault was repaired.",
+        changedFiles: [],
+        validation: ["Relay queue accepted the original task."],
+        taskStartEvidence: ["The original task still has its queued turn."],
+        risks: [],
       },
     };
   }
@@ -594,4 +678,354 @@ test("System Codex conversation API creates, configures, sends, and clears a thr
     }).length,
     1,
   );
+});
+
+test("five-minute supervisor reuses Luna Max and spawns a fresh unrestricted Sol xhigh recovery conversation", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-persistent-supervisor-test-"),
+  );
+  const config = {
+    ...configFor(dataDirectory),
+    opsCodexModel: "gpt-5.6-luna",
+    opsCodexReasoningEffort: "max",
+  };
+  const store = new Store(config);
+  const { project } = seed(store);
+  const originalPrompt =
+    "Keep this exact user prompt, repair the system, and start my original task.";
+  const { task } = store.createTask({
+    projectId: project.id,
+    title: "Prompt-preserved task",
+    message: originalPrompt,
+    userName: "Tester",
+  });
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const supervisor = new PersistentSupervisorSession(task.id);
+  const recovery = new UnrestrictedRecoverySession();
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    {
+      sessionRunner: supervisor,
+      recoverySessionRunner: recovery,
+    },
+  );
+  t.after(async () => {
+    ops.stop();
+    await ops.waitForIdle();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  await ops.start();
+  const monitorTurn = ops.runSupervisorCheck({ force: true });
+  assert.equal(monitorTurn.trigger, "monitor");
+  await waitUntil(
+    () =>
+      store
+        .listOpsTurns({ includeCleared: true })
+        .some(
+          (turn) => turn.trigger === "repair" && turn.status === "completed",
+        ),
+    "unrestricted recovery conversation",
+  );
+
+  assert.equal(supervisor.calls[0].model, "gpt-5.6-luna");
+  assert.equal(supervisor.calls[0].reasoningEffort, "max");
+  assert.equal(supervisor.calls[0].sandbox, "read-only");
+  assert.match(supervisor.calls[0].prompt, /five-minute supervisor/iu);
+  assert.equal(recovery.calls[0].model, "gpt-5.6-sol");
+  assert.equal(recovery.calls[0].reasoningEffort, "xhigh");
+  assert.equal(recovery.calls[0].sandbox, "danger-full-access");
+  assert.equal(recovery.calls[0].timeoutMs, 0);
+  assert.match(recovery.calls[0].prompt, new RegExp(originalPrompt, "u"));
+
+  const recoveryTurn = store
+    .listOpsTurns({ includeCleared: true })
+    .find((turn) => turn.trigger === "repair");
+  assert.equal(recoveryTurn.targetTaskId, task.id);
+  assert.equal(recoveryTurn.parentOpsTurnId, monitorTurn.id);
+  assert.equal(
+    store.getOpsThread(recoveryTurn.threadId).codexThreadId,
+    "fresh-sol-recovery-thread",
+  );
+  assert.equal(
+    store.getOpsThread(recoveryTurn.threadId).codexModel,
+    "gpt-5.6-sol",
+  );
+  assert.equal(
+    store.getOpsThread(recoveryTurn.threadId).codexReasoningEffort,
+    "xhigh",
+  );
+  assert.equal(store.verifyTaskPromptIntegrity(task.id).intact, true);
+  assert.equal(store.listTaskTurns(task.id)[0].userMessage, originalPrompt);
+});
+
+test("five-minute supervisor skips a stale repair after the target task finishes", (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-stale-supervisor-repair-test-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "Task that finishes during supervisor diagnosis",
+    message: "Finish before the stale repair action is dispatched.",
+    userName: "Tester",
+  });
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const recovery = new UnrestrictedRecoverySession();
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { recoverySessionRunner: recovery },
+  );
+  t.after(() => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  store.completeTurn(turn.id, {
+    codexFinal: { status: "completed", summary: "Task finished." },
+    commitSha: "b".repeat(40),
+  });
+  assert.equal(store.getTask(task.id).status, "waiting_user");
+  store.ensureOpsThread();
+  const monitorTurn = store.appendOpsTurn({
+    threadId: "ops-system",
+    message: "Stale monitor snapshot",
+    trigger: "monitor",
+    authorName: "Relay 5-minute Supervisor",
+  });
+  const result = ops.queueRecoveryConversation(
+    monitorTurn,
+    {
+      type: "codex.repair",
+      targetId: task.id,
+      message: "Repair the stale task.",
+      reason: "The old snapshot still showed it running.",
+    },
+    { diagnosis: "Stale task state." },
+  );
+
+  assert.deepEqual(result, {
+    pending: false,
+    skipped: true,
+    targetTaskId: task.id,
+    taskStatus: "waiting_user",
+    reason: "target-left-supervised-state-before-action",
+  });
+  assert.equal(recovery.calls.length, 0);
+  assert.equal(
+    store
+      .listOpsTurns({ includeCleared: true })
+      .some((candidate) => candidate.trigger === "repair"),
+    false,
+  );
+  assert.ok(
+    store
+      .listEvents({ limit: 100 })
+      .some((event) => event.type === "ops.recovery.skipped"),
+  );
+});
+
+test("unrestricted recovery preserves its starting archive while allowing a concurrent append-only user turn", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-recovery-append-only-prompt-test-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  const { task } = store.createTask({
+    projectId: project.id,
+    title: "Append-only prompt task",
+    message: "Preserve this original request exactly.",
+    userName: "Original user",
+  });
+  const startingIntegrity = store.verifyTaskPromptIntegrity(task.id);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const supervisor = new PersistentSupervisorSession(task.id);
+  const recovery = new UnrestrictedRecoverySession(() => {
+    store.appendTurn(task.id, {
+      message: "A concurrent user refinement must be appended, not mistaken for a rewrite.",
+      userName: "Concurrent user",
+    });
+  });
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    {
+      sessionRunner: supervisor,
+      recoverySessionRunner: recovery,
+    },
+  );
+  t.after(async () => {
+    ops.stop();
+    await ops.waitForIdle();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  await ops.start();
+  ops.runSupervisorCheck({ force: true });
+  const recoveryTurn = await waitUntil(
+    () =>
+      store
+        .listOpsTurns({ includeCleared: true })
+        .find((turn) => turn.trigger === "repair" && turn.status === "completed"),
+    "append-only recovery conversation",
+  );
+
+  const finalIntegrity = store.verifyTaskPromptIntegrity(task.id);
+  assert.equal(finalIntegrity.intact, true);
+  assert.equal(finalIntegrity.archivedTurns, 2);
+  assert.equal(
+    finalIntegrity.archive[0].userMessage,
+    startingIntegrity.archive[0].userMessage,
+  );
+  assert.equal(
+    finalIntegrity.archive[1].userMessage,
+    "A concurrent user refinement must be appended, not mistaken for a rewrite.",
+  );
+  assert.notEqual(finalIntegrity.fingerprint, startingIntegrity.fingerprint);
+  assert.equal(recoveryTurn.final.promptIntegrity.intact, true);
+  assert.equal(
+    recoveryTurn.final.promptIntegrity.startedFingerprint,
+    startingIntegrity.fingerprint,
+  );
+  assert.equal(
+    recoveryTurn.final.promptIntegrity.fingerprint,
+    finalIntegrity.fingerprint,
+  );
+  assert.equal(recoveryTurn.final.promptIntegrity.addedArchivedTurns, 1);
+});
+
+test("task prompts are archived immutably before unrestricted recovery can run", (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-prompt-archive-test-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  t.after(() => {
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "Immutable original title",
+    message: "Immutable original user request",
+    userName: "Tester",
+  });
+  const archive = store.getTaskPromptArchive(task.id);
+  assert.equal(archive.length, 1);
+  assert.equal(archive[0].turnId, turn.id);
+  assert.equal(archive[0].taskTitle, "Immutable original title");
+  assert.equal(archive[0].userMessage, "Immutable original user request");
+  assert.equal(store.verifyTaskPromptIntegrity(task.id).intact, true);
+
+  assert.throws(
+    () =>
+      store.db
+        .prepare("UPDATE turns SET user_message='changed' WHERE id=?")
+        .run(turn.id),
+    /TASK_PROMPT_IMMUTABLE/u,
+  );
+  assert.throws(
+    () =>
+      store.db
+        .prepare("UPDATE tasks SET title='changed' WHERE id=?")
+        .run(task.id),
+    /TASK_PROMPT_IMMUTABLE/u,
+  );
+  assert.throws(
+    () =>
+      store.db
+        .prepare("DELETE FROM task_prompt_archive WHERE turn_id=?")
+        .run(turn.id),
+    /TASK_PROMPT_ARCHIVE_IMMUTABLE/u,
+  );
+});
+
+test("the persistent supervisor stays quiet without tasks and checks after the configured interval", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-supervisor-interval-test-"),
+  );
+  const config = {
+    ...configFor(dataDirectory),
+    opsSupervisorIntervalMs: 40,
+  };
+  const store = new Store(config);
+  const { project } = seed(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const supervisor = new PersistentSupervisorSession();
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { sessionRunner: supervisor },
+  );
+  t.after(async () => {
+    ops.stop();
+    await ops.waitForIdle();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  await ops.start();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(supervisor.calls.length, 0);
+  store.createTask({
+    projectId: project.id,
+    title: "Periodic check",
+    message: "Watch this task every configured interval.",
+    userName: "Tester",
+  });
+  await waitUntil(
+    () => supervisor.calls.length >= 1,
+    "scheduled persistent supervisor check",
+  );
+  const turn = store
+    .listOpsTurns({ includeCleared: true })
+    .find((candidate) => candidate.trigger === "monitor");
+  assert.ok(turn);
+  assert.match(turn.userMessage, /Five-minute persistent supervisor check/u);
 });

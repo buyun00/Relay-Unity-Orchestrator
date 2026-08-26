@@ -36,6 +36,9 @@ $script:verifiedFiles = @()
 $script:taskBranchCreated = $false
 $script:currentBranch = $null
 $script:candidateDiagnostics = $null
+$script:approvedOverlayPreservation = @()
+$script:approvedOverlayBackupDirectory = $null
+$script:approvedOverlayPreservationVerified = $false
 
 if (-not (Get-Command Invoke-RelayGit -CommandType Function -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot 'Workspace-Git.ps1')
@@ -499,6 +502,184 @@ function Set-RepositoryIdentity {
     Invoke-Git @('config', '--local', 'user.email', $AuthorEmail) | Out-Null
 }
 
+function Get-WorkspaceFileSha256([string]$LiteralPath) {
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return @(
+            $algorithm.ComputeHash($stream) |
+                ForEach-Object { $_.ToString('x2') }
+        ) -join ''
+    } finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Invoke-TaskCheckoutPreservingApprovedOverlays {
+    param(
+        [Parameter(Mandatory = $true)][bool]$LocalTaskExists,
+        [Parameter(Mandatory = $true)][string]$SourceReference
+    )
+
+    $approvedPaths = @(Get-RelayApprovedOverlayPaths $ProjectPath)
+    $skipPaths = @(Get-RelaySkipWorktreePaths $ProjectPath)
+    $activeOverlayPaths = @(
+        $approvedPaths |
+            Where-Object { $skipPaths -contains $_ } |
+            Where-Object {
+                Test-Path -LiteralPath (Join-Path $ProjectPath $_) -PathType Leaf
+            }
+    )
+    if ($activeOverlayPaths.Count -eq 0) {
+        if ($LocalTaskExists) {
+            Invoke-Git @('checkout', $Branch) | Out-Null
+        } else {
+            Invoke-Git @('checkout', '-b', $Branch, $SourceReference) | Out-Null
+            $script:taskBranchCreated = $true
+        }
+        return
+    }
+
+    $gitDirectoryValue = Get-GitValue @('rev-parse', '--git-dir')
+    $gitDirectory = if ([System.IO.Path]::IsPathRooted($gitDirectoryValue)) {
+        [System.IO.Path]::GetFullPath($gitDirectoryValue)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $ProjectPath $gitDirectoryValue))
+    }
+    $backupRoot = Join-Path $gitDirectory 'relay-approved-overlay-backups'
+    if (-not (Test-Path -LiteralPath $backupRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $backupRoot | Out-Null
+    }
+    $backupName = '{0}-{1}-{2}' -f (
+        ($Branch -replace '[^A-Za-z0-9._-]+', '-').Trim('-', '.')
+    ), [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'), (
+        [Guid]::NewGuid().ToString('N').Substring(0, 12)
+    )
+    $backupDirectory = Join-Path $backupRoot $backupName
+    New-Item -ItemType Directory -Path $backupDirectory | Out-Null
+    $script:approvedOverlayBackupDirectory = $backupDirectory
+
+    $projectRoot = [System.IO.Path]::GetFullPath($ProjectPath).TrimEnd('\', '/') +
+        [System.IO.Path]::DirectorySeparatorChar
+    $snapshots = New-Object System.Collections.Generic.List[object]
+    $snapshotIndex = 0
+    foreach ($overlayPath in $activeOverlayPaths) {
+        $normalizedPath = ConvertTo-RelayGitPath $overlayPath
+        $absolutePath = [System.IO.Path]::GetFullPath(
+            (Join-Path $ProjectPath $normalizedPath)
+        )
+        if (
+            -not $absolutePath.StartsWith(
+                $projectRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            -not (Test-Path -LiteralPath $absolutePath -PathType Leaf)
+        ) {
+            throw "Approved overlay '$normalizedPath' is not a regular project file."
+        }
+        $backupFile = Join-Path $backupDirectory (
+            '{0:D4}.overlay' -f $snapshotIndex
+        )
+        Copy-Item -LiteralPath $absolutePath -Destination $backupFile
+        $sourceSha256 = Get-WorkspaceFileSha256 $absolutePath
+        $backupSha256 = Get-WorkspaceFileSha256 $backupFile
+        if ($backupSha256 -ne $sourceSha256) {
+            throw "Approved overlay backup verification failed for '$normalizedPath'."
+        }
+        $snapshots.Add([pscustomobject]@{
+            path = $normalizedPath
+            absolutePath = $absolutePath
+            backupFile = $backupFile
+            sha256 = $sourceSha256
+            gitBlob = Get-RelayPathBlob $ProjectPath $normalizedPath
+            reapplied = $false
+        })
+        $snapshotIndex += 1
+    }
+    $manifest = [pscustomobject]@{
+        version = 1
+        branch = $Branch
+        source = $SourceReference
+        createdAtUtc = [DateTime]::UtcNow.ToString('o')
+        files = @($snapshots | Select-Object path, backupFile, sha256, gitBlob)
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $backupDirectory 'manifest.json'),
+        ($manifest | ConvertTo-Json -Depth 8),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+
+    $checkoutFailure = $null
+    $reapplyFailures = New-Object System.Collections.Generic.List[string]
+    $literalPathEnvironment = @{ GIT_LITERAL_PATHSPECS = '1' }
+    try {
+        foreach ($snapshot in $snapshots) {
+            Invoke-Git @(
+                'update-index', '--no-skip-worktree', '--', $snapshot.path
+            ) $literalPathEnvironment | Out-Null
+            # The verified backup is durable before the tracked baseline is
+            # materialized, so checkout can advance even when the approved
+            # local dependency overlay differs from both branch tips.
+            Invoke-Git @('checkout', 'HEAD', '--', $snapshot.path) `
+                $literalPathEnvironment | Out-Null
+        }
+        if ($LocalTaskExists) {
+            Invoke-Git @('checkout', $Branch) | Out-Null
+        } else {
+            Invoke-Git @('checkout', '-b', $Branch, $SourceReference) | Out-Null
+            $script:taskBranchCreated = $true
+        }
+    } catch {
+        $checkoutFailure = $_
+    } finally {
+        foreach ($snapshot in $snapshots) {
+            try {
+                Copy-Item -LiteralPath $snapshot.backupFile `
+                    -Destination $snapshot.absolutePath -Force
+                Invoke-Git @(
+                    'update-index', '--skip-worktree', '--', $snapshot.path
+                ) $literalPathEnvironment | Out-Null
+                $reappliedSha256 = Get-WorkspaceFileSha256 `
+                    $snapshot.absolutePath
+                $reappliedBlob = Get-RelayPathBlob $ProjectPath $snapshot.path
+                if (
+                    $reappliedSha256 -ne $snapshot.sha256 -or
+                    $reappliedBlob -ne $snapshot.gitBlob
+                ) {
+                    throw "Approved overlay '$($snapshot.path)' did not match its verified backup after checkout."
+                }
+                $snapshot.reapplied = $true
+            } catch {
+                $reapplyFailures.Add(
+                    "$($snapshot.path): $($_.Exception.Message)"
+                )
+            }
+        }
+    }
+    $script:approvedOverlayPreservation = @(
+        $snapshots |
+            ForEach-Object {
+                [pscustomobject]@{
+                    path = $_.path
+                    sha256 = $_.sha256
+                    gitBlob = $_.gitBlob
+                    reapplied = [bool]$_.reapplied
+                }
+            }
+    )
+    $script:approvedOverlayPreservationVerified = (
+        $reapplyFailures.Count -eq 0 -and
+        @($snapshots | Where-Object { -not $_.reapplied }).Count -eq 0
+    )
+    if ($reapplyFailures.Count -gt 0) {
+        throw "Approved overlay reapply failed; verified backups remain at '$backupDirectory': $($reapplyFailures -join '; ')"
+    }
+    if ($null -ne $checkoutFailure) {
+        throw $checkoutFailure
+    }
+}
+
 $preservedBranch = $null
 $preservedCommit = $null
 $preservedFiles = @()
@@ -835,10 +1016,15 @@ $taskTipQuery = Invoke-RelayGitWithRetry $ProjectPath @(
 $taskRemoteExists = -not [string]::IsNullOrWhiteSpace($taskTipQuery.result.stdout)
 $fetchBranch = if ($taskRemoteExists) { $Branch } else { $Base }
 $fetchDestination = "refs/remotes/origin/$fetchBranch"
+# Restored PROJECT_READY workers can be several large packs behind a shared
+# remote. Keep the fetch bounded below the outer 340-second PowerShell Direct
+# budget, leaving time for branch and overlay verification after one cold
+# transfer instead of killing and restarting it every 45 seconds.
+$prepareBranchFetchTimeoutSeconds = 270
 Invoke-RelayGitWithRetry $ProjectPath @(
     'fetch', '--no-tags', '--no-prune', 'origin',
     "refs/heads/$($fetchBranch):$fetchDestination"
-) 'prepare-branch-fetch' @{} 45 3 1000 | Out-Null
+) 'prepare-branch-fetch' @{} $prepareBranchFetchTimeoutSeconds 1 0 | Out-Null
 Set-RepositoryIdentity
 $source = if ($RequestedMode -eq 'recovery' -or $preservedCommit) {
     "origin/$Base"
@@ -923,12 +1109,8 @@ if ($preservedCommit) {
         ) $literalPathEnvironment | Out-Null
     }
 }
-if ($localTaskExists) {
-    Invoke-Git @('checkout', $Branch) | Out-Null
-} else {
-    Invoke-Git @('checkout', '-b', $Branch, $source) | Out-Null
-    $script:taskBranchCreated = $true
-}
+Invoke-TaskCheckoutPreservingApprovedOverlays `
+    -LocalTaskExists $localTaskExists -SourceReference $source
 
 $head = Get-GitValue @('rev-parse', 'HEAD')
 $checkedOutBranch = Get-GitValue @('branch', '--show-current')
@@ -995,5 +1177,8 @@ $result = [pscustomobject]@{
     taskBranch = $Branch
     taskBranchCreated = $script:taskBranchCreated
     currentBranch = $checkedOutBranch
+    approvedOverlayPreservation = @($script:approvedOverlayPreservation)
+    approvedOverlayBackupDirectory = $script:approvedOverlayBackupDirectory
+    approvedOverlayPreservationVerified = $script:approvedOverlayPreservationVerified
 }
 Complete-Result $result

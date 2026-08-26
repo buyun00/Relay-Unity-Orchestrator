@@ -80,8 +80,27 @@ function context() {
       id: "turn-real",
       sequence: 1,
       userMessage: "Perform a real integration test",
+      executionProfile: "unity_asset",
     },
     attachments: [],
+  };
+}
+
+function exactDeliveryAudit() {
+  return {
+    version: 1,
+    ready: true,
+    exact: true,
+    safeForDeliveryRetry: true,
+    completeFileSet: true,
+    branch: "codex/task-0001-real-host-task",
+    head: "d".repeat(40),
+    changedFiles: [],
+    validation: ["host integration fixture"],
+    files: [],
+    blockedPaths: [],
+    fingerprint: "a".repeat(64),
+    source: "workspace",
   };
 }
 
@@ -265,7 +284,11 @@ test("worker probing and preparation omit Skill health endpoints", async () => {
         : { ready: true };
     return { exitCode: 0, stdout: JSON.stringify(payload), stderr: "" };
   };
-  const adapter = new HyperVAdapter(config(), {
+  const approvedOverlayPaths = [
+    "baloot_client/Packages/manifest.json",
+    "baloot_client/Packages/packages-lock.json",
+  ];
+  const adapter = new HyperVAdapter(config({ approvedOverlayPaths }), {
     processRunner,
     codex: { inspect: async () => ({}) },
   });
@@ -287,6 +310,58 @@ test("worker probing and preparation omit Skill health endpoints", async () => {
   assert.ok(preparation);
   assert.equal(healthProbe.args.includes("-HealthUrl"), false);
   assert.equal(preparation.args.includes("-UnityHealthUrl"), false);
+  const approvedIndex = preparation.args.indexOf("-ApprovedOverlayPathsJson");
+  assert.equal(
+    preparation.args[approvedIndex + 1],
+    JSON.stringify(approvedOverlayPaths),
+  );
+});
+
+test("workspace audit host scripts scope approved overlays to their guest process", () => {
+  for (const scriptFile of [
+    "Prepare-Workspace.ps1",
+    "Inspect-PreservedWorkspace.ps1",
+    "Verify-PreservedWorkspace.ps1",
+    "Recover-Workspace.ps1",
+    "Get-DeliveryWorkspaceAudit.ps1",
+  ]) {
+    const source = fs.readFileSync(
+      new URL(`../../scripts/hyperv/${scriptFile}`, import.meta.url),
+      "utf8",
+    );
+    assert.match(source, /\$ApprovedOverlayPathsJson/u, scriptFile);
+    assert.match(
+      source,
+      /\$env:RELAY_APPROVED_OVERLAY_PATHS_JSON\s*=/u,
+      scriptFile,
+    );
+  }
+});
+
+test("workspace preparation proves host SMB before mutating the guest workspace", () => {
+  const source = fs.readFileSync(
+    new URL("../../scripts/hyperv/Prepare-Workspace.ps1", import.meta.url),
+    "utf8",
+  );
+  const smbPreflight = source.indexOf(
+    "is not reachable before guest workspace preparation",
+  );
+  const guestPreparation = source.indexOf("Invoke-RelayPowerShellDirect");
+  const smbPostflight = source.indexOf(
+    "became unreachable after guest workspace preparation",
+  );
+
+  assert.ok(smbPreflight >= 0, "SMB preflight is missing");
+  assert.ok(guestPreparation >= 0, "guest preparation call is missing");
+  assert.ok(smbPostflight >= 0, "SMB postflight is missing");
+  assert.ok(
+    smbPreflight < guestPreparation,
+    "SMB must be proven before the guest branch can change",
+  );
+  assert.ok(
+    guestPreparation < smbPostflight,
+    "SMB must also be rechecked after guest preparation",
+  );
 });
 
 test("PowerShell readiness scripts do not probe Skill or DialogGuard", () => {
@@ -1048,6 +1123,7 @@ test("worker start and restart wait for PowerShell Direct before health probing"
 test("workspace preparation and finalization receive a repository-local Git identity", async () => {
   const calls = [];
   const deliveredSha = "9".repeat(40);
+  const deliveryAudit = exactDeliveryAudit();
   const processRunner = async (command, args) => {
     calls.push({ script: scriptName(args), args });
     if (scriptName(args) === "Finalize-Workspace.ps1") {
@@ -1063,6 +1139,13 @@ test("workspace preparation and finalization receive a repository-local Git iden
         stderr: "",
       };
     }
+    if (scriptName(args) === "Get-DeliveryWorkspaceAudit.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(deliveryAudit),
+        stderr: "",
+      };
+    }
     return {
       exitCode: 0,
       stdout: JSON.stringify({ ready: true, commitSha: "abc123" }),
@@ -1075,7 +1158,7 @@ test("workspace preparation and finalization receive a repository-local Git iden
   });
 
   await adapter.prepare(context(), {});
-  const delivery = await adapter.finalize(context(), {});
+  const delivery = await adapter.finalize(context(), { deliveryAudit });
   assert.deepEqual(delivery, {
     ready: true,
     commitSha: deliveredSha,
@@ -1094,6 +1177,23 @@ test("workspace preparation and finalization receive a repository-local Git iden
     assert.equal(call.args[nameIndex + 1], "Relay Test Worker");
     assert.equal(call.args[emailIndex + 1], "relay-test@localhost");
   }
+  const finalization = calls.find(
+    (call) => call.script === "Finalize-Workspace.ps1",
+  );
+  const auditIndex = finalization.args.indexOf("-ExpectedAuditJson");
+  assert.deepEqual(
+    JSON.parse(finalization.args[auditIndex + 1]),
+    deliveryAudit,
+  );
+  assert.deepEqual(
+    calls.map((call) => call.script),
+    [
+      "Ensure-WorkerReady.ps1",
+      "Prepare-Workspace.ps1",
+      "Get-DeliveryWorkspaceAudit.ps1",
+      "Finalize-Workspace.ps1",
+    ],
+  );
 
   for (const scriptFile of [
     "Prepare-Workspace.Guest.ps1",
@@ -1106,11 +1206,20 @@ test("workspace preparation and finalization receive a repository-local Git iden
     assert.match(source, /config', '--local', 'user\.name'/);
     assert.match(source, /config', '--local', 'user\.email'/);
   }
+  const finalizeSource = fs.readFileSync(
+    new URL("../../scripts/hyperv/Finalize-Workspace.ps1", import.meta.url),
+    "utf8",
+  );
+  assert.match(finalizeSource, /ExpectedAuditJson/);
+  assert.match(finalizeSource, /Assert-ExactAuditedWorkspace/);
+  assert.match(finalizeSource, /DELIVERY_WORKSPACE_CHANGED_AFTER_AUDIT/);
+  assert.doesNotMatch(finalizeSource, /Invoke-Git\s+@\('add',\s*'-A'/);
 });
 
 test("Unity save receives only an explicit guest-loopback request URL instead of the corporate authority", async () => {
   const calls = [];
   const deliveredSha = "8".repeat(40);
+  const deliveryAudit = exactDeliveryAudit();
   const processRunner = async (command, args) => {
     calls.push({ script: scriptName(args), args });
     if (scriptName(args) === "Finalize-Workspace.ps1") {
@@ -1122,6 +1231,13 @@ test("Unity save receives only an explicit guest-loopback request URL instead of
           pushed: true,
           verified: true,
         }),
+        stderr: "",
+      };
+    }
+    if (scriptName(args) === "Get-DeliveryWorkspaceAudit.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(deliveryAudit),
         stderr: "",
       };
     }
@@ -1143,7 +1259,7 @@ test("Unity save receives only an explicit guest-loopback request URL instead of
   deliveryContext.project.unitySaveUrl =
     "http://{corporateIp}:8090/skill/editor_execute_menu";
 
-  await adapter.finalize(deliveryContext, {});
+  await adapter.finalize(deliveryContext, { deliveryAudit });
 
   const save = calls.find((call) => call.script === "Save-UnityProject.ps1");
   assert.ok(save);
@@ -1154,6 +1270,45 @@ test("Unity save receives only an explicit guest-loopback request URL instead of
     "http://127.0.0.1:8090/skill/editor_execute_menu",
   );
   assert.equal(save.args[guestIndex + 1], "http://127.0.0.1:8090");
+  assert.deepEqual(
+    calls.map((call) => call.script),
+    [
+      "Save-UnityProject.ps1",
+      "Get-DeliveryWorkspaceAudit.ps1",
+      "Finalize-Workspace.ps1",
+    ],
+  );
+});
+
+test("checkpoint refresh resolves project Unity URLs for the selected worker", async () => {
+  const calls = [];
+  const processRunner = async (command, args) => {
+    calls.push({ script: scriptName(args), args });
+    return { exitCode: 0, stdout: "{}", stderr: "" };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+  const refreshContext = context();
+  refreshContext.project.defaultBranch = "main";
+  refreshContext.project.unitySaveUrl =
+    "http://{internalIp}:8090/skill/editor_execute_menu";
+
+  await adapter.refreshWorkerCheckpoint(
+    refreshContext.worker,
+    refreshContext.project,
+  );
+
+  const refresh = calls.find(
+    (call) => call.script === "Update-ProjectReadyCheckpoint.ps1",
+  );
+  assert.ok(refresh);
+  const unitySaveIndex = refresh.args.indexOf("-UnitySaveUrl");
+  assert.equal(
+    refresh.args[unitySaveIndex + 1],
+    "http://172.30.240.11:8090/skill/editor_execute_menu",
+  );
 });
 
 test("Codex preflight uses the configured executable and persistent CODEX_HOME", async () => {
@@ -1235,12 +1390,98 @@ test("Codex turns pin the Relay model, reasoning effort, and standard speed", as
   assert.ok(args.indexOf('model_reasoning_effort="xhigh"') < execIndex);
   assert.ok(args.indexOf('service_tier="default"') < execIndex);
   assert.ok(args.indexOf("features.fast_mode=false") < execIndex);
+  assert.ok(args.includes("mcp_servers.unity.required=true"));
   assert.equal(args.at(-1), "-");
   const prompt = options.input;
   assert.match(prompt, /Get-UnityDialogGuardState\.ps1/);
   assert.match(prompt, /Invoke-UnityDialogGuardAction\.ps1/);
   assert.match(prompt, /VMName unity-worker-01/);
   assert.match(prompt, /Never authorize a high-risk action/);
+});
+
+test("Relay execution profiles keep code turns away from Unity and gate auto escalation", async (t) => {
+  const logDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runner-route-"),
+  );
+  t.after(() => fs.rmSync(logDirectory, { recursive: true, force: true }));
+  const calls = [];
+  const runner = new CodexRunner(config({ logDirectory }), {
+    processRunner: async (command, args, options) => {
+      calls.push({ command, args, options });
+      options.onStdout?.(
+        `${JSON.stringify({
+          type: "thread.started",
+          thread_id: `thread-route-${calls.length}`,
+        })}\n`,
+      );
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  const codeContext = context();
+  codeContext.turn.executionProfile = "code_only";
+  await runner.run(codeContext, {});
+  const codeCall = calls.at(-1);
+  assert.match(codeCall.options.input, /executionProfile=code_only/);
+  assert.match(
+    codeCall.options.input,
+    /Do not probe, start, wait for, restart, or repair Unity/,
+  );
+  assert.doesNotMatch(codeCall.options.input, /Get-UnityDialogGuardState\.ps1/);
+  assert.ok(!codeCall.args.some((arg) => arg.includes("mcp_servers.unity")));
+
+  const autoContext = context();
+  autoContext.turn.executionProfile = "auto";
+  await runner.run(autoContext, {});
+  const autoCall = calls.at(-1);
+  assert.match(autoCall.options.input, /executionProfile=auto/);
+  assert.match(
+    autoCall.options.input,
+    /exact serialized asset or Editor operation/,
+  );
+  assert.match(autoCall.options.input, /Only after that explicit escalation/);
+  assert.match(
+    autoCall.options.input,
+    /authoritative Unity endpoint for this assigned Worker unity-worker-01 is http:\/\/172\.30\.240\.11:8090/,
+  );
+  assert.match(
+    autoCall.options.input,
+    /Never send Unity or UnitySkills requests to a different Worker/,
+  );
+  assert.ok(!autoCall.args.some((arg) => arg.includes("mcp_servers.unity")));
+});
+
+test("Unity routing falls back to the assigned Worker's resolved health origin", async (t) => {
+  const logDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-codex-runner-unity-route-"),
+  );
+  t.after(() => fs.rmSync(logDirectory, { recursive: true, force: true }));
+  const calls = [];
+  const runner = new CodexRunner(config({ logDirectory }), {
+    processRunner: async (command, args, options) => {
+      calls.push({ command, args, options });
+      options.onStdout?.(
+        `${JSON.stringify({
+          type: "thread.started",
+          thread_id: "thread-worker-unity-route",
+        })}\n`,
+      );
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  const routedContext = context();
+  routedContext.worker.name = "unity-worker-02";
+  routedContext.worker.internalIp = "172.30.240.12";
+  routedContext.project.unitySkillUrl = null;
+
+  await runner.run(routedContext, {});
+
+  const call = calls.at(-1);
+  assert.match(
+    call.options.input,
+    /assigned Worker unity-worker-02 is http:\/\/172\.30\.240\.12:8090/,
+  );
+  assert.ok(call.args.includes('mcp_servers.unity.url="http://172.30.240.12:8090/mcp"'));
 });
 
 test("task 17 invokes Codex resume with the existing durable thread instead of starting a new one", async (t) => {

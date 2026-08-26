@@ -234,10 +234,22 @@ $result = Invoke-Command -VMName $VMName -Credential $credential -ArgumentList @
         throw "DELIVERY_WORKSPACE_CHANGED_AFTER_AUDIT: workspace changed during commit: $([string]::Join(', ', $remainingPaths))."
     }
     $localSha = (Invoke-Git @('rev-parse', 'HEAD') | Select-Object -Last 1).ToString().Trim()
-    Invoke-Git @('push', '--set-upstream', 'origin', $Branch) | Out-Null
+    $pushError = $null
+    try {
+        Invoke-Git @('push', '--set-upstream', 'origin', $Branch) | Out-Null
+    } catch {
+        # Concurrent recovery/delivery can race while creating the same remote
+        # branch. The native push may lose that create race even though the
+        # winning writer published this exact commit. Reconcile only an exact
+        # remote SHA match; every divergent or unverifiable result still fails.
+        $pushError = $_
+    }
     $remoteLine = (Invoke-Git @('ls-remote', 'origin', "refs/heads/$Branch") | Select-Object -Last 1).ToString().Trim()
     $remoteSha = ($remoteLine -split '\s+')[0]
     if ([string]::IsNullOrWhiteSpace($remoteSha) -or $remoteSha -ne $localSha) {
+        if ($null -ne $pushError) {
+            throw $pushError
+        }
         throw "Remote verification failed. Local SHA '$localSha'; remote SHA '$remoteSha'."
     }
     [pscustomobject]@{
@@ -246,6 +258,8 @@ $result = Invoke-Command -VMName $VMName -Credential $credential -ArgumentList @
         pushed = $true
         verified = $true
         hadChanges = $hasChanges
+        pushAccepted = $null -eq $pushError
+        reconciledExistingRemote = $null -ne $pushError
     }
 }
 

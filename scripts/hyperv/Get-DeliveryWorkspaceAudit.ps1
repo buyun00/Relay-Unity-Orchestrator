@@ -7,7 +7,8 @@ param(
     [AllowNull()][string]$ExpectedHead,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ChangedFilesJson,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ValidationJson,
-    [AllowNull()][string]$ExpectedAuditJson
+    [AllowNull()][string]$ExpectedAuditJson,
+    [ValidateNotNullOrEmpty()][string]$ApprovedOverlayPathsJson = '[]'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,15 +34,16 @@ $guestSource = [System.IO.File]::ReadAllText(
     [System.Text.Encoding]::UTF8
 )
 
-$argumentList = New-Object object[] 8
+$argumentList = New-Object object[] 9
 $argumentList[0] = $GuestProjectPath
 $argumentList[1] = $TaskBranch
 $argumentList[2] = $ExpectedHead
 $argumentList[3] = $ChangedFilesJson
 $argumentList[4] = $ValidationJson
 $argumentList[5] = $ExpectedAuditJson
-$argumentList[6] = $helperSource
-$argumentList[7] = $guestSource
+$argumentList[6] = $ApprovedOverlayPathsJson
+$argumentList[7] = $helperSource
+$argumentList[8] = $guestSource
 
 $remoteOutput = @(
     Invoke-Command -VMName $VMName -Credential $credential `
@@ -54,11 +56,13 @@ $remoteOutput = @(
                 $ChangedFilesJson,
                 $ValidationJson,
                 $ExpectedAuditJson,
+                $ApprovedOverlaysJson,
                 $HelperSource,
                 $GuestSource
             )
             $ErrorActionPreference = 'Stop'
             Set-StrictMode -Version Latest
+            $env:RELAY_APPROVED_OVERLAY_PATHS_JSON = $ApprovedOverlaysJson
             . ([scriptblock]::Create($HelperSource))
             & ([scriptblock]::Create($GuestSource)) `
                 -ProjectPath $ProjectPath `

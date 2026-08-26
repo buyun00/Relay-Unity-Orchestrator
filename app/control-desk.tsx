@@ -8,6 +8,7 @@ import {
   Bot,
   Box,
   Check,
+  CheckCheck,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -19,18 +20,23 @@ import {
   Cpu,
   Database,
   Eraser,
+  ExternalLink,
   FileCode2,
+  FileText,
   FolderGit2,
   GitBranch,
   GitCommitHorizontal,
   HardDrive,
   HeartPulse,
   History,
+  ImagePlus,
   Inbox,
   Layers3,
   LayoutDashboard,
+  ListChecks,
   LoaderCircle,
   Menu,
+  MemoryStick,
   MessageSquareText,
   MessageSquarePlus,
   MonitorCog,
@@ -44,29 +50,34 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  ScanLine,
   Search,
   Server,
   Settings,
   ShieldCheck,
   Square,
   TerminalSquare,
+  Thermometer,
   Trash2,
   Wifi,
   WifiOff,
   X,
   Zap,
 } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 import {
   type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import {
   api,
+  fetchHostMetrics,
   fetchSnapshot,
   fetchTaskEvents,
   getApiBase,
@@ -78,20 +89,26 @@ import {
 } from "./api";
 import {
   EMPTY_SNAPSHOT,
+  type Attachment,
+  type BuildDispatch,
+  type ExecutionProfile,
   type HealthState,
+  type HostMetricsSnapshot,
   type HostVirtualMachine,
   type OpsThread,
   type OpsTurn,
   type PipelineEvent,
   type Project,
+  type ProjectManagementDefect,
+  type ProjectManagementProject,
+  type ProjectManagementSession,
   type Snapshot,
   type Task,
   type Turn,
   type Worker,
 } from "./types";
 
-type ViewName =
-  "dashboard" | "ops" | "tasks" | "workers" | "projects" | "settings" | "task";
+type ViewName = "dashboard" | "tasks" | "system" | "task";
 type Toast = {
   id: number;
   kind: "success" | "error" | "info";
@@ -105,6 +122,27 @@ type ConfirmState = {
   requireText?: string;
   action: () => Promise<void>;
 };
+type ProjectManagementDraft = {
+  extraPrompt: string;
+  files: File[];
+};
+type ProjectManagementBatchItem = ProjectManagementDraft & {
+  defectId: string;
+};
+type ProjectManagementImportResult = {
+  ok: boolean;
+  created: number;
+  duplicates: number;
+  failed: number;
+  results: Array<{
+    defectId: string;
+    status: "created" | "duplicate" | "failed";
+    task?: Task;
+    error?: { code?: string; message?: string };
+  }>;
+};
+
+const PROJECT_MANAGEMENT_IMPORT_CHUNK_SIZE = 30;
 
 const LIVE_TURN = new Set([
   "queued",
@@ -126,6 +164,32 @@ const TASK_PRIORITY_OPTIONS = [
   { value: 10, label: "较高", detail: "优先于普通任务" },
   { value: 0, label: "普通", detail: "按当前队列顺序" },
 ] as const;
+
+const EXECUTION_PROFILE_OPTIONS = [
+  {
+    value: "auto",
+    label: "自动判断（代码优先）",
+    detail: "默认不碰 Unity；只有确认必须操作序列化资产时才升级",
+  },
+  {
+    value: "code_only",
+    label: "仅代码",
+    detail: "禁止探测、等待或修复 Unity 与 UnitySkills",
+  },
+  {
+    value: "unity_asset",
+    label: "Unity 资源 / Prefab",
+    detail: "明确需要读取或修改真实 Prefab、Scene、组件或序列化绑定",
+  },
+] as const;
+
+function executionProfileLabel(value?: ExecutionProfile) {
+  return (
+    EXECUTION_PROFILE_OPTIONS.find(
+      (option) => option.value === (value ?? "auto"),
+    )?.label ?? "自动判断（代码优先）"
+  );
+}
 
 const CODEX_MODEL_OPTIONS = [
   {
@@ -354,7 +418,7 @@ const taskStatusLabel: Record<string, string> = {
   waiting_user: "等待你确认",
   waiting_review: "等待审阅",
   needs_attention: "需要处理",
-  closed: "已关闭",
+  closed: "已完成",
   cancelled: "已取消",
 };
 
@@ -369,6 +433,15 @@ const turnStatusLabel: Record<string, string> = {
   interrupted: "已中断",
 };
 
+const buildStageSequence = [
+  ["queued", "排队"],
+  ["preparing", "准备"],
+  ["building", "构建"],
+  ["validating", "校验"],
+  ["publishing", "发布"],
+  ["completed", "可查看"],
+] as const;
+
 const workerStatusLabel: Record<string, string> = {
   ready: "空闲",
   busy: "使用中",
@@ -378,6 +451,19 @@ const workerStatusLabel: Record<string, string> = {
   offline: "离线",
   stopped: "已关闭",
   restarting: "重启中",
+};
+
+const opsStatusLabel: Record<string, string> = {
+  idle: "待命",
+  queued: "排队中",
+  running: "执行中",
+  completed: "已完成",
+  failed: "失败",
+  monitoring: "持续观察",
+  action_required: "需要修复",
+  open: "待处理",
+  acting: "修复中",
+  resolved: "已解决",
 };
 
 const phaseLabel: Record<string, string> = {
@@ -425,12 +511,9 @@ const phaseSequence = [
 ];
 
 const navItems: { view: ViewName; label: string; icon: typeof Activity }[] = [
-  { view: "ops", label: "系统助手", icon: Bot },
   { view: "dashboard", label: "调度台", icon: LayoutDashboard },
   { view: "tasks", label: "任务", icon: MessageSquareText },
-  { view: "workers", label: "工位", icon: Server },
-  { view: "projects", label: "项目", icon: FolderGit2 },
-  { view: "settings", label: "系统", icon: Settings },
+  { view: "system", label: "系统", icon: Settings },
 ];
 
 function cx(...values: Array<string | false | null | undefined>) {
@@ -497,6 +580,197 @@ function latestTurn(snapshot: Snapshot, taskId: string) {
     .sort((a, b) => b.sequence - a.sequence)[0];
 }
 
+function taskBuildDispatches(snapshot: Snapshot, taskId: string) {
+  return snapshot.buildDispatches
+    .filter((dispatch) => dispatch.taskId === taskId)
+    .sort(
+      (a, b) =>
+        b.turnSequence - a.turnSequence ||
+        b.createdAt.localeCompare(a.createdAt),
+    );
+}
+
+function buildStatusView(dispatch: BuildDispatch) {
+  if (dispatch.status === "pending") {
+    return {
+      key: "pending",
+      label: "等待拉起打包",
+      detail: "交付已经完成，后台即将联系打包机。",
+      tone: "running",
+      stageIndex: -1,
+    };
+  }
+  if (dispatch.status === "sending") {
+    return {
+      key: "sending",
+      label: "正在拉起打包机",
+      detail: "任务已经完成；这里只等待打包机接单。",
+      tone: "running",
+      stageIndex: -1,
+    };
+  }
+  if (dispatch.status === "retrying") {
+    return {
+      key: "retrying",
+      label: "拉起失败，自动重试",
+      detail:
+        dispatch.lastErrorMessage ?? "打包机暂不可用，后台会使用同一请求重试。",
+      tone: "warning",
+      stageIndex: -1,
+    };
+  }
+  if (dispatch.status === "failed") {
+    return {
+      key: "dispatch-failed",
+      label: "未能拉起打包",
+      detail: dispatch.lastErrorMessage ?? "打包请求未被打包机接受。",
+      tone: "error",
+      stageIndex: -1,
+    };
+  }
+
+  const status = dispatch.buildStatus || "queued";
+  const stageIndex = buildStageSequence.findIndex(([key]) => key === status);
+  const labels: Record<string, string> = {
+    queued: "已进入打包队列",
+    preparing: "正在准备打包",
+    building: "正在构建热更",
+    validating: "正在校验产物",
+    publishing: "正在发布热更",
+    completed: "热更已就绪，可以查看",
+    failed: "热更打包失败",
+    unknown: "打包机已接单",
+  };
+  return {
+    key: status,
+    label: labels[status] ?? `打包状态：${status}`,
+    detail:
+      dispatch.buildErrorMessage ??
+      dispatch.buildStep ??
+      (dispatch.statusCheckErrorMessage
+        ? `${dispatch.statusCheckErrorMessage}，后台会继续刷新。`
+        : "打包独立运行，不占用任务工位。"),
+    tone:
+      status === "completed"
+        ? "success"
+        : status === "failed"
+          ? "error"
+          : dispatch.statusCheckErrorCode
+            ? "warning"
+            : "running",
+    stageIndex,
+  };
+}
+
+function BuildStatusPill({ dispatch }: { dispatch: BuildDispatch }) {
+  const view = buildStatusView(dispatch);
+  return (
+    <span className={cx("build-status-pill", `build-tone-${view.tone}`)}>
+      {view.tone === "success" ? (
+        <CheckCircle2 size={13} />
+      ) : view.tone === "error" ? (
+        <AlertTriangle size={13} />
+      ) : (
+        <LoaderCircle
+          className={view.tone === "running" ? "spin" : ""}
+          size={13}
+        />
+      )}
+      热更：{view.label}
+    </span>
+  );
+}
+
+function BuildProgressCard({ dispatch }: { dispatch: BuildDispatch }) {
+  const view = buildStatusView(dispatch);
+  const completedStages = Math.max(0, view.stageIndex + 1);
+  const progress =
+    view.key === "failed" || view.key === "dispatch-failed"
+      ? 0
+      : view.stageIndex < 0
+        ? 8
+        : ((view.stageIndex + 1) / buildStageSequence.length) * 100;
+  const progressLabel =
+    view.key === "completed"
+      ? "已完成"
+      : view.stageIndex < 0
+        ? "等待打包机接单"
+        : `第 ${completedStages}/${buildStageSequence.length} 阶段`;
+  return (
+    <article className={cx("build-progress-card", `build-tone-${view.tone}`)}>
+      <div className="build-progress-head">
+        <div className="build-progress-icon">
+          {view.tone === "success" ? (
+            <CheckCircle2 size={20} />
+          ) : view.tone === "error" ? (
+            <AlertTriangle size={20} />
+          ) : (
+            <Box size={20} />
+          )}
+        </div>
+        <div>
+          <span>第 {dispatch.turnSequence} 轮 · Windows CDN</span>
+          <h3>{view.label}</h3>
+        </div>
+        <code>{compactSha(dispatch.commitSha)}</code>
+      </div>
+      <div className="build-progress-summary">
+        <span>打包进度</span>
+        <strong>
+          {Math.round(progress)}% <em>{progressLabel}</em>
+        </strong>
+      </div>
+      <div
+        className="build-progress-track"
+        role="progressbar"
+        aria-label={`第 ${dispatch.turnSequence} 轮热更打包进度`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(progress)}
+        aria-valuetext={`${progressLabel}，${Math.round(progress)}%`}
+      >
+        <span style={{ width: `${progress}%` }} />
+      </div>
+      <div className="build-stage-list" aria-hidden="true">
+        {buildStageSequence.map(([key, label], index) => (
+          <span
+            className={cx(
+              index <= view.stageIndex && "reached",
+              key === view.key && "current",
+            )}
+            key={key}
+          >
+            <i />
+            {label}
+          </span>
+        ))}
+      </div>
+      <p className="build-progress-detail">{view.detail}</p>
+      <div className="build-progress-meta">
+        <span>Job：{dispatch.ozdqpJobId ?? "等待接单"}</span>
+        <span>
+          {dispatch.buildFinishedAt
+            ? `完成于 ${relativeTime(dispatch.buildFinishedAt)}`
+            : dispatch.statusCheckedAt
+              ? `更新于 ${relativeTime(dispatch.statusCheckedAt)}`
+              : `创建于 ${relativeTime(dispatch.createdAt)}`}
+        </span>
+        {dispatch.buildDurationSeconds != null && (
+          <span>
+            耗时 {Math.max(1, Math.round(dispatch.buildDurationSeconds / 60))}{" "}
+            分钟
+          </span>
+        )}
+        {dispatch.buildCdnUrl && view.key === "completed" && (
+          <a href={dispatch.buildCdnUrl} target="_blank" rel="noreferrer">
+            打开热更地址 <ArrowRight size={13} />
+          </a>
+        )}
+      </div>
+    </article>
+  );
+}
+
 function StatusBadge({ status, label }: { status: string; label?: string }) {
   return (
     <span className={cx("status-badge", `status-${status}`)}>
@@ -505,6 +779,7 @@ function StatusBadge({ status, label }: { status: string; label?: string }) {
         taskStatusLabel[status] ??
         turnStatusLabel[status] ??
         workerStatusLabel[status] ??
+        opsStatusLabel[status] ??
         status}
     </span>
   );
@@ -800,19 +1075,29 @@ export default function ControlDesk() {
   useEffect(() => {
     const applyLocation = () => {
       const params = new URLSearchParams(window.location.search);
-      const nextView = params.get("view") as ViewName | null;
+      const requestedView = params.get("view");
       const taskId = params.get("task");
+      if (requestedView === "ops") {
+        setView("dashboard");
+        window.history.replaceState({}, "", "?view=dashboard");
+        return;
+      }
+      if (
+        requestedView &&
+        ["workers", "projects", "settings"].includes(requestedView)
+      ) {
+        setView("system");
+        window.history.replaceState(
+          {},
+          "",
+          `?view=system#system-${requestedView}`,
+        );
+        return;
+      }
+      const nextView = requestedView as ViewName | null;
       if (
         nextView &&
-        [
-          "ops",
-          "dashboard",
-          "tasks",
-          "workers",
-          "projects",
-          "settings",
-          "task",
-        ].includes(nextView)
+        ["dashboard", "tasks", "system", "task"].includes(nextView)
       ) {
         setView(nextView);
         if (nextView === "task" && taskId) setSelectedTaskId(taskId);
@@ -822,6 +1107,19 @@ export default function ControlDesk() {
     window.addEventListener("popstate", applyLocation);
     return () => window.removeEventListener("popstate", applyLocation);
   }, []);
+
+  useEffect(() => {
+    if (view !== "system" || !window.location.hash) return;
+    const sectionId = window.location.hash.slice(1);
+    const timer = window.setTimeout(
+      () =>
+        document
+          .getElementById(sectionId)
+          ?.scrollIntoView({ behavior: "smooth", block: "start" }),
+      50,
+    );
+    return () => window.clearTimeout(timer);
+  }, [view]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -873,6 +1171,110 @@ export default function ControlDesk() {
     [notify, refresh],
   );
 
+  const requestTaskCompletion = (task: Task) => {
+    const linkedDefect = task.projectManagement?.defectId;
+    const retrying = task.completion?.status === "failed";
+    setConfirm({
+      title: retrying ? "重试确认完成" : "确认完成并自动合并",
+      description: linkedDefect
+        ? `将严格按顺序执行：先创建或复用 MR 并合并到主分支；确认合并成功后，把绑定的轻语缺陷 ${linkedDefect} 设为“已解决”；最后才把 Relay 任务标记为已完成。任一步失败都会立即停止，后续步骤不会执行。`
+        : "将严格按顺序执行：先创建或复用 MR 并合并到主分支；确认合并成功后，才把 Relay 任务标记为已完成。任一步失败都会立即停止。",
+      confirmLabel: retrying ? "重试完成" : "确认完成",
+      action: () =>
+        runMutation(
+          () =>
+            api(`/api/tasks/${task.id}/close`, {
+              method: "POST",
+            }),
+          linkedDefect
+            ? "MR、轻语缺陷和 Relay 任务均已完成"
+            : "MR 已合并，Relay 任务已完成",
+        ).then(() => undefined),
+    });
+  };
+
+  const requestRelayOnlyCompletion = (task: Task) => {
+    setConfirm({
+      title: "仅完成 Relay 任务",
+      description:
+        "这会直接把当前任务标记为已完成，不会创建或合并 MR，也不会修改绑定的轻语缺陷状态。任务分支和历史记录仍会保留。",
+      confirmLabel: "仅完成 Relay",
+      danger: true,
+      action: () =>
+        runMutation(
+          () =>
+            api(`/api/tasks/${task.id}/complete-relay-only`, {
+              method: "POST",
+            }),
+          "Relay 任务已完成；MR 和轻语操作均已跳过",
+        ).then(() => undefined),
+    });
+  };
+
+  const requestBatchTaskCompletion = (tasks: Task[]) => {
+    const candidates = tasks.filter((task) => task.status === "waiting_user");
+    if (!candidates.length) {
+      notify("请先选择待确认任务", "info");
+      return;
+    }
+    setConfirm({
+      title: `批量确认完成 ${candidates.length} 个任务`,
+      description:
+        "系统会按所选顺序逐个处理，避免多个 MR 同时抢占主分支。每个任务内部仍严格执行：GitLab MR 合并 → 对应轻语账号设为“已解决”（如有关联）→ Relay 标记已完成。某个任务失败时只停止该任务的后续步骤，其余所选任务会继续处理。",
+      confirmLabel: `一键完成 ${candidates.length} 个`,
+      action: async () => {
+        setBusy(true);
+        try {
+          setConfirm((current) =>
+            current
+              ? {
+                  ...current,
+                  description: `Relay 后台正在按顺序处理 ${candidates.length} 个任务。每条任务都会依次完成 MR、轻语（如有关联）和 Relay；你可以保持当前页面等待结果。`,
+                }
+              : current,
+          );
+          const result = await api<{
+            completed: number;
+            failed: number;
+            results: Array<{
+              taskId: string;
+              number?: string | number | null;
+              status: "completed" | "failed";
+            }>;
+          }>("/api/tasks/complete-batch", {
+            method: "POST",
+            body: JSON.stringify({
+              taskIds: candidates.map((task) => task.id),
+            }),
+          });
+          if (result.failed) {
+            const failedNumbers = result.results
+              .filter((item) => item.status === "failed")
+              .slice(0, 4)
+              .map((item) => item.number || item.taskId)
+              .join("、");
+            notify(
+              `批量完成结束：成功 ${result.completed} 个，失败 ${result.failed} 个（${failedNumbers}${result.failed > 4 ? " 等" : ""}）。失败任务已保留在待确认列表，可修复后重试。`,
+              "error",
+            );
+          } else {
+            notify(`已按顺序完成 ${result.completed} 个任务`);
+          }
+        } catch (error) {
+          notify(
+            error instanceof Error
+              ? `${error.message}；请刷新列表确认后台结果`
+              : "批量完成请求失败，请刷新列表确认后台结果",
+            "error",
+          );
+        } finally {
+          await refresh(true);
+          setBusy(false);
+        }
+      },
+    });
+  };
+
   const navigate = (next: ViewName, id?: string) => {
     setView(next);
     setMobileNav(false);
@@ -884,6 +1286,20 @@ export default function ControlDesk() {
           ? `?view=task&task=${encodeURIComponent(id)}`
           : `?view=${next}`;
     window.history.pushState({}, "", `${window.location.pathname}${query}`);
+    if (next === "system" && id) {
+      window.history.replaceState(
+        {},
+        "",
+        `${window.location.pathname}?view=system#system-${id}`,
+      );
+      window.setTimeout(
+        () =>
+          document
+            .querySelector(`#system-${id}`)
+            ?.scrollIntoView({ behavior: "smooth", block: "start" }),
+        40,
+      );
+    }
   };
 
   const selectedTask =
@@ -1078,7 +1494,10 @@ export default function ControlDesk() {
               <span>搜索任务</span>
               <kbd>/</kbd>
             </button>
-            <IconButton label="通知设置" onClick={() => navigate("settings")}>
+            <IconButton
+              label="通知设置"
+              onClick={() => navigate("system", "settings")}
+            >
               <Bell size={18} />
             </IconButton>
             <button
@@ -1099,7 +1518,7 @@ export default function ControlDesk() {
               onTask={(id) => navigate("task", id)}
               onWorker={(id) => {
                 setSelectedWorkerId(id);
-                navigate("workers");
+                navigate("system", "workers");
               }}
               onCreate={() => setCreateTaskOpen(true)}
             />
@@ -1107,7 +1526,10 @@ export default function ControlDesk() {
           {view === "tasks" && (
             <TasksPage
               snapshot={snapshot}
+              busy={busy}
               onTask={(id) => navigate("task", id)}
+              onComplete={requestTaskCompletion}
+              onCompleteMany={requestBatchTaskCompletion}
               onCreate={() => setCreateTaskOpen(true)}
             />
           )}
@@ -1124,27 +1546,20 @@ export default function ControlDesk() {
               busy={busy}
               onBack={() => navigate("tasks")}
               onRefresh={() => void refresh()}
-              onAskOps={() =>
-                void runMutation(
-                  () =>
-                    api("/api/ops/messages", {
-                      method: "POST",
-                      body: JSON.stringify({
-                        message: `请检查任务 ${selectedTask.number}（${selectedTask.title}）当前的完整状态、最近错误和 Worker 现场；如果存在异常，请立即执行不删除数据的恢复。任务 ID：${selectedTask.id}`,
-                      }),
+              onMessage={async (message, executionProfile, files) => {
+                const ok = await runMutation(async () => {
+                  const attachments = [];
+                  for (const file of files)
+                    attachments.push(await uploadFile(file));
+                  return api(`/api/tasks/${selectedTask.id}/messages`, {
+                    method: "POST",
+                    body: JSON.stringify({
+                      message,
+                      executionProfile,
+                      attachmentIds: attachments.map((item) => item.id),
                     }),
-                  "任务上下文已交给系统 Codex",
-                )
-              }
-              onMessage={async (message) => {
-                const ok = await runMutation(
-                  () =>
-                    api(`/api/tasks/${selectedTask.id}/messages`, {
-                      method: "POST",
-                      body: JSON.stringify({ message }),
-                    }),
-                  "新的微调已加入执行队列",
-                );
+                  });
+                }, "新的微调已加入执行队列");
                 return ok;
               }}
               onCancel={() =>
@@ -1173,22 +1588,8 @@ export default function ControlDesk() {
                   "本轮已重新加入队列",
                 )
               }
-              onClose={() =>
-                setConfirm({
-                  title: "结束这条长期任务",
-                  description:
-                    "任务会被标记为已关闭，完整对话、每轮结果、分支和提交仍然保留。关闭后也可以重新打开并继续微调。",
-                  confirmLabel: "确认完成",
-                  action: () =>
-                    runMutation(
-                      () =>
-                        api(`/api/tasks/${selectedTask.id}/close`, {
-                          method: "POST",
-                        }),
-                      "任务已关闭",
-                    ).then(() => undefined),
-                })
-              }
+              onClose={() => requestTaskCompletion(selectedTask)}
+              onCloseRelayOnly={() => requestRelayOnlyCompletion(selectedTask)}
               onReopen={() =>
                 void runMutation(
                   () =>
@@ -1215,107 +1616,31 @@ export default function ControlDesk() {
               }
             />
           )}
-          {view === "ops" && (
-            <OpsPage
+          {view === "system" && (
+            <SystemPage
               snapshot={snapshot}
-              busy={busy}
-              onTask={(id) => navigate("task", id)}
-              onSend={async (threadId, message) => {
-                let submitted: OpsTurn | null = null;
-                const ok = await runMutation(async () => {
-                  const response = await api<{
-                    ok: boolean;
-                    turn: OpsTurn;
-                  }>("/api/ops/messages", {
-                    method: "POST",
-                    body: JSON.stringify({ threadId, message }),
-                  });
-                  submitted = response.turn;
-                }, "消息已交给系统 Codex");
-                return ok ? submitted : null;
-              }}
-              onCreateThread={async (input) => {
-                let created: OpsThread | null = null;
-                const ok = await runMutation(async () => {
-                  const response = await api<{
-                    ok: boolean;
-                    thread: OpsThread;
-                  }>("/api/ops/threads", {
-                    method: "POST",
-                    body: JSON.stringify(input),
-                  });
-                  created = response.thread;
-                }, "系统对话已创建");
-                return ok ? created : null;
-              }}
-              onUpdateThread={(threadId, input) =>
-                runMutation(
-                  () =>
-                    api(`/api/ops/threads/${encodeURIComponent(threadId)}`, {
-                      method: "PATCH",
-                      body: JSON.stringify(input),
-                    }),
-                  "对话设置已更新",
-                )
-              }
-              onClearThread={(threadId) =>
-                runMutation(
-                  () =>
-                    api(
-                      `/api/ops/threads/${encodeURIComponent(threadId)}/clear`,
-                      { method: "POST" },
-                    ),
-                  "当前对话已清屏，上下文和审计记录仍保留",
-                )
-              }
-              onDiagnose={(incidentId) =>
-                void runMutation(
-                  () =>
-                    api(`/api/incidents/${incidentId}/diagnose`, {
-                      method: "POST",
-                    }),
-                  "事故已重新交给系统 Codex",
-                )
-              }
-              onResolve={(incidentId) =>
-                void runMutation(
-                  () =>
-                    api(`/api/incidents/${incidentId}/resolve`, {
-                      method: "POST",
-                    }),
-                  "事故已标记为解决",
-                )
-              }
-            />
-          )}
-          {view === "workers" && (
-            <WorkersPage
-              snapshot={snapshot}
-              selected={selectedWorker}
-              onSelect={setSelectedWorkerId}
-              onAction={workerAction}
-              onCreate={() => {
+              selectedWorker={selectedWorker}
+              connected={connected}
+              connectionChecked={connectionChecked}
+              onSelectWorker={setSelectedWorkerId}
+              onWorkerAction={workerAction}
+              onCreateWorker={() => {
                 setEditingWorker(null);
                 setWorkerEditorOpen(true);
               }}
-              onEdit={(worker) => {
+              onEditWorker={(worker) => {
                 setEditingWorker(worker);
                 setWorkerEditorOpen(true);
               }}
-            />
-          )}
-          {view === "projects" && (
-            <ProjectsPage
-              snapshot={snapshot}
-              onCreate={() => {
+              onCreateProject={() => {
                 setEditingProject(null);
                 setProjectEditorOpen(true);
               }}
-              onEdit={(project) => {
+              onEditProject={(project) => {
                 setEditingProject(project);
                 setProjectEditorOpen(true);
               }}
-              onDelete={(project) =>
+              onDeleteProject={(project) =>
                 setConfirm({
                   title: `删除项目 ${project.name}`,
                   description:
@@ -1333,13 +1658,6 @@ export default function ControlDesk() {
                     ).then(() => undefined),
                 })
               }
-            />
-          )}
-          {view === "settings" && (
-            <SettingsPage
-              snapshot={snapshot}
-              connected={connected}
-              connectionChecked={connectionChecked}
               onSaved={() => void refresh()}
               notify={notify}
             />
@@ -1384,6 +1702,76 @@ export default function ControlDesk() {
                 error instanceof Error ? error.message : "创建任务失败",
                 "error",
               );
+            } finally {
+              setBusy(false);
+            }
+          }}
+          onBatchSubmit={async (payload, items) => {
+            setBusy(true);
+            try {
+              const uploadedItems = [];
+              for (const item of items) {
+                const attachments = [];
+                for (const file of item.files) {
+                  attachments.push(await uploadFile(file));
+                }
+                uploadedItems.push({
+                  defectId: item.defectId,
+                  extraPrompt: item.extraPrompt,
+                  attachmentIds: attachments.map((attachment) => attachment.id),
+                });
+              }
+              const result: ProjectManagementImportResult = {
+                ok: true,
+                created: 0,
+                duplicates: 0,
+                failed: 0,
+                results: [],
+              };
+              for (
+                let index = 0;
+                index < uploadedItems.length;
+                index += PROJECT_MANAGEMENT_IMPORT_CHUNK_SIZE
+              ) {
+                const chunk = await api<ProjectManagementImportResult>(
+                  "/api/project-management/import",
+                  {
+                    method: "POST",
+                    body: JSON.stringify({
+                      ...payload,
+                      items: uploadedItems.slice(
+                        index,
+                        index + PROJECT_MANAGEMENT_IMPORT_CHUNK_SIZE,
+                      ),
+                    }),
+                  },
+                );
+                result.ok = result.ok && chunk.ok;
+                result.created += chunk.created;
+                result.duplicates += chunk.duplicates;
+                result.failed += chunk.failed;
+                result.results.push(...chunk.results);
+              }
+              const summary = [
+                result.created > 0 && `新建 ${result.created} 个`,
+                result.duplicates > 0 && `跳过重复 ${result.duplicates} 个`,
+                result.failed > 0 && `失败 ${result.failed} 个`,
+              ]
+                .filter(Boolean)
+                .join("，");
+              notify(
+                summary || "没有需要创建的任务",
+                result.failed > 0 ? "error" : "success",
+              );
+              await refresh(true);
+              if (result.failed === 0) setCreateTaskOpen(false);
+              return result;
+            } catch (error) {
+              notify(
+                error instanceof Error ? error.message : "批量创建任务失败",
+                "error",
+              );
+              throw error;
             } finally {
               setBusy(false);
             }
@@ -1560,7 +1948,7 @@ function Dashboard({
         </div>
       </section>
 
-      <div className="dashboard-grid">
+      <div className="dashboard-grid dashboard-command-grid">
         <section className="workspace-panel task-rail-panel">
           <div className="section-heading">
             <div>
@@ -1647,73 +2035,353 @@ function Dashboard({
           )}
         </section>
 
-        <section className="workspace-panel worker-pool-panel">
-          <div className="section-heading">
-            <div>
-              <span className="section-kicker">资源层</span>
-              <h2>工位池</h2>
-            </div>
-            <span className="soft-count">{snapshot.workers.length}</span>
-          </div>
-          <div className="worker-node-list">
-            {snapshot.workers.map((worker) => {
-              const turn = snapshot.turns.find(
-                (item) => item.id === worker.currentTurnId,
-              );
-              const task =
-                turn && snapshot.tasks.find((item) => item.id === turn.taskId);
-              return (
-                <button
-                  className="worker-node"
-                  key={worker.id}
-                  onClick={() => onWorker(worker.id)}
-                >
-                  <span className={cx("worker-orb", `worker-${worker.status}`)}>
-                    {worker.status === "preparing" ? (
-                      <LoaderCircle size={17} />
-                    ) : (
-                      <Server size={16} />
-                    )}
-                  </span>
-                  <span className="worker-node-copy">
-                    <strong>{worker.name}</strong>
-                    <small>
-                      {task
-                        ? `${task.number} · 第 ${turn?.sequence} 轮`
-                        : workerStatusLabel[worker.status]}
-                    </small>
-                  </span>
-                  <HealthStrip health={worker.health} />
-                  <ChevronRight size={16} />
-                </button>
-              );
-            })}
-            {snapshot.workers.length === 0 && (
-              <EmptyState
-                icon={Server}
-                title="还没有工位"
-                description="添加 Hyper-V 工位后，它们会在这里形成可分配的资源池。"
-              />
-            )}
-          </div>
-        </section>
+        <MonitorWorktree snapshot={snapshot} onTask={onTask} />
       </div>
 
-      <section className="event-stream-section">
-        <div className="section-heading horizontal">
+      <section className="workspace-panel worker-pool-panel dashboard-worker-pool">
+        <div className="section-heading">
           <div>
-            <span className="section-kicker">审计流</span>
-            <h2>最近发生</h2>
+            <span className="section-kicker">资源层</span>
+            <h2>当前工位池</h2>
           </div>
-          <span className="stream-caption">保留最近 120 条</span>
+          <span className="soft-count">{snapshot.workers.length}</span>
         </div>
-        <EventStream
-          events={snapshot.events.slice(-8).reverse()}
-          tasks={snapshot.tasks}
-          onTask={onTask}
-        />
+        <div className="worker-node-list">
+          {snapshot.workers.map((worker) => {
+            const turn = snapshot.turns.find(
+              (item) => item.id === worker.currentTurnId,
+            );
+            const task =
+              turn && snapshot.tasks.find((item) => item.id === turn.taskId);
+            return (
+              <button
+                className="worker-node"
+                key={worker.id}
+                onClick={() => onWorker(worker.id)}
+              >
+                <span className={cx("worker-orb", `worker-${worker.status}`)}>
+                  {worker.status === "preparing" ? (
+                    <LoaderCircle size={17} />
+                  ) : (
+                    <Server size={16} />
+                  )}
+                </span>
+                <span className="worker-node-copy">
+                  <strong>{worker.name}</strong>
+                  <small>
+                    {task
+                      ? `${task.number} · 第 ${turn?.sequence} 轮`
+                      : workerStatusLabel[worker.status]}
+                  </small>
+                </span>
+                <HealthStrip health={worker.health} />
+                <ChevronRight size={16} />
+              </button>
+            );
+          })}
+          {snapshot.workers.length === 0 && (
+            <EmptyState
+              icon={Server}
+              title="还没有工位"
+              description="添加 Hyper-V 工位后，它们会在这里形成可分配的资源池。"
+            />
+          )}
+        </div>
       </section>
     </div>
+  );
+}
+
+function monitorTurnLabel(turn: OpsTurn) {
+  if (turn.trigger === "monitor") return `Luna 巡检 · 第 ${turn.sequence} 轮`;
+  if (turn.trigger === "incident")
+    return `Luna 事故诊断 · 第 ${turn.sequence} 轮`;
+  if (turn.trigger === "followup") return `Luna 复核 · 第 ${turn.sequence} 轮`;
+  return `Luna 系统轮次 · 第 ${turn.sequence} 轮`;
+}
+
+function systemEventKind(event: PipelineEvent) {
+  if (
+    event.level === "error" ||
+    /failed|error|unhealthy|attention/i.test(event.type)
+  )
+    return { label: "任务出错", tone: "error", icon: AlertTriangle };
+  if (/resolved|recovered|repair.*completed/i.test(event.type))
+    return { label: "错误已解决", tone: "recovered", icon: ShieldCheck };
+  if (/delivered|released|closed|completed|accepted/i.test(event.type))
+    return { label: "任务完成", tone: "success", icon: CheckCircle2 };
+  if (/queued|started|prepare|workspace|restore/i.test(event.type))
+    return { label: "开始任务", tone: "running", icon: Play };
+  return { label: "系统信息", tone: "info", icon: Activity };
+}
+
+function isMonitorSystemEvent(event: PipelineEvent) {
+  return (
+    event.level === "error" ||
+    /^(task\.|turn\.(queued|prepare|workspace|restore|unity|codex|delivery|commit|push|delivered|released|cancelled)|worker\.(unhealthy|action)|ops\.(supervisor|recovery|incident|action)|guardian\.|system\.runtime|build\.dispatch\.(accepted|failed))/i.test(
+      event.type,
+    )
+  );
+}
+
+function MonitorWorktree({
+  snapshot,
+  onTask,
+}: {
+  snapshot: Snapshot;
+  onTask: (id: string) => void;
+}) {
+  const ops = snapshot.ops;
+  const supervisor = snapshot.server.ops?.supervisor;
+  const systemThread =
+    ops.threads.find((thread) => thread.isSystem) ?? ops.thread;
+  const rootTurns = ops.turns
+    .filter(
+      (turn) =>
+        turn.threadId === systemThread.id &&
+        ["monitor", "incident", "followup"].includes(turn.trigger),
+    )
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const repairTurns = ops.turns
+    .filter((turn) => turn.trigger === "repair")
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const rootIds = new Set(rootTurns.map((turn) => turn.id));
+  const detachedRepairs = repairTurns.filter(
+    (turn) => !turn.parentOpsTurnId || !rootIds.has(turn.parentOpsTurnId),
+  );
+  const systemEvents = snapshot.events
+    .filter(isMonitorSystemEvent)
+    .slice(-12)
+    .reverse();
+  const guardianHealthy = snapshot.server.guardian?.reachable !== false;
+  const monitorHealthy =
+    Boolean(snapshot.server.ops?.running) &&
+    Boolean(supervisor?.running) &&
+    guardianHealthy;
+  const activeRepair = repairTurns.some((turn) =>
+    ["queued", "running"].includes(turn.status),
+  );
+  const activeTaskCount = supervisor?.activeTaskCount ?? 0;
+
+  const renderRepairBranch = (turn: OpsTurn) => {
+    const thread = ops.threads.find((item) => item.id === turn.threadId);
+    const task = turn.targetTaskId
+      ? snapshot.tasks.find((item) => item.id === turn.targetTaskId)
+      : null;
+    const progress = snapshot.events
+      .filter(
+        (event) =>
+          event.opsTurnId === turn.id &&
+          ["ops.codex.message", "ops.recovery.spawned"].includes(event.type),
+      )
+      .slice(-2);
+    const summary =
+      turn.errorMessage ||
+      turn.final?.summary ||
+      progress.at(-1)?.message ||
+      (turn.status === "running" ? "正在修复并验证原任务恢复状态" : "等待执行");
+    return (
+      <article
+        className={cx(
+          "monitor-repair-branch",
+          ["queued", "running"].includes(turn.status) && "active",
+          turn.status === "failed" && "failed",
+        )}
+        key={turn.id}
+      >
+        <span className="monitor-branch-junction" aria-hidden="true" />
+        <div className="monitor-branch-head">
+          <span className="monitor-agent-icon sol">
+            <GitBranch size={15} />
+          </span>
+          <div>
+            <strong>Sol xhigh 修复分支</strong>
+            <small>{thread?.title ?? turn.id}</small>
+          </div>
+          <StatusBadge status={turn.status} />
+        </div>
+        <p title={summary}>{summary}</p>
+        <div className="monitor-branch-meta">
+          <code>
+            {thread?.codexThreadId?.slice(0, 12) ?? "等待 Codex thread"}
+          </code>
+          <time>{relativeTime(turn.startedAt ?? turn.createdAt)}</time>
+          {task && (
+            <button type="button" onClick={() => onTask(task.id)}>
+              {task.number}
+              <ArrowRight size={13} />
+            </button>
+          )}
+        </div>
+      </article>
+    );
+  };
+
+  return (
+    <section className="workspace-panel monitor-worktree-panel">
+      <div className="section-heading monitor-heading">
+        <div>
+          <span className="section-kicker">监督工作树</span>
+          <h2>Relay 自动监控</h2>
+        </div>
+        <span className={cx("monitor-health", monitorHealthy && "healthy")}>
+          <span />
+          {monitorHealthy ? "运行正常" : "需要关注"}
+        </span>
+      </div>
+
+      <div className="monitor-runtime-card">
+        <div className="monitor-runtime-main">
+          <span className="monitor-agent-icon luna">
+            <HeartPulse size={17} />
+          </span>
+          <div>
+            <strong>Luna Max 常驻监督</strong>
+            <small>
+              {supervisor?.intervalMs
+                ? `${Math.round(supervisor.intervalMs / 60_000)} 分钟一次`
+                : "等待监督器配置"}
+              {" · "}
+              {activeTaskCount} 个非终态任务
+            </small>
+          </div>
+          {snapshot.server.ops?.activeSessions ? (
+            <LoaderCircle className="spin" size={17} />
+          ) : (
+            <CheckCircle2 size={17} />
+          )}
+        </div>
+        <dl className="monitor-runtime-facts">
+          <div>
+            <dt>上次巡检</dt>
+            <dd>{relativeTime(supervisor?.lastCheckAt)}</dd>
+          </div>
+          <div>
+            <dt>下次巡检</dt>
+            <dd>{relativeTime(supervisor?.nextCheckAt)}</dd>
+          </div>
+          <div>
+            <dt>修复模型</dt>
+            <dd>{activeRepair ? "Sol xhigh 执行中" : "Sol xhigh 待命"}</dd>
+          </div>
+          <div>
+            <dt>Guardian</dt>
+            <dd>{guardianHealthy ? "可达" : "失联"}</dd>
+          </div>
+        </dl>
+      </div>
+
+      <div className="monitor-tree-scroll">
+        <div className="monitor-tree-root">
+          <span className="monitor-root-line" aria-hidden="true" />
+          <span className="monitor-root-node">
+            <Bot size={15} />
+          </span>
+          <div>
+            <strong>{codexModelLabel(systemThread.codexModel)}</strong>
+            <small>
+              {systemThread.codexReasoningEffort} · 持久线程{" "}
+              {systemThread.codexThreadId?.slice(0, 12) ?? "尚未建立"}
+            </small>
+          </div>
+        </div>
+
+        <div className="monitor-turn-timeline">
+          {rootTurns.map((turn) => {
+            const progress = snapshot.events
+              .filter(
+                (event) =>
+                  event.opsTurnId === turn.id &&
+                  event.type === "ops.codex.message",
+              )
+              .slice(-2);
+            const summary =
+              turn.errorMessage ||
+              turn.final?.summary ||
+              progress.at(-1)?.message ||
+              (turn.status === "running"
+                ? "正在读取任务、Worker、Unity 与 Git 证据"
+                : "巡检已进入队列");
+            const children = repairTurns.filter(
+              (repair) => repair.parentOpsTurnId === turn.id,
+            );
+            return (
+              <article className="monitor-turn" key={turn.id}>
+                <span className="monitor-turn-dot" aria-hidden="true" />
+                <div className="monitor-turn-head">
+                  <div>
+                    <strong>{monitorTurnLabel(turn)}</strong>
+                    <time>{relativeTime(turn.createdAt)}</time>
+                  </div>
+                  <StatusBadge status={turn.status} />
+                </div>
+                <p title={summary}>{summary}</p>
+                {children.length > 0 && (
+                  <div className="monitor-repair-branches">
+                    {children.map(renderRepairBranch)}
+                  </div>
+                )}
+              </article>
+            );
+          })}
+          {rootTurns.length === 0 && (
+            <div className="monitor-tree-empty">
+              <ShieldCheck size={18} />
+              <span>
+                <strong>监督器正在等待需要检查的任务</strong>
+                <small>有非终态任务时，每一轮 Luna 结果都会出现在这里。</small>
+              </span>
+            </div>
+          )}
+          {detachedRepairs.length > 0 && (
+            <div className="monitor-detached-branches">
+              <span>历史修复分支</span>
+              {detachedRepairs.map(renderRepairBranch)}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="monitor-system-events">
+        <div className="monitor-subhead">
+          <strong>系统事件</strong>
+          <span>任务与自动恢复状态</span>
+        </div>
+        <div className="monitor-event-list">
+          {systemEvents.map((event) => {
+            const kind = systemEventKind(event);
+            const EventIcon = kind.icon;
+            const task = event.taskId
+              ? snapshot.tasks.find((item) => item.id === event.taskId)
+              : null;
+            return (
+              <button
+                type="button"
+                className="monitor-event"
+                key={event.id}
+                disabled={!task}
+                onClick={() => task && onTask(task.id)}
+              >
+                <span className={cx("monitor-event-icon", kind.tone)}>
+                  <EventIcon size={13} />
+                </span>
+                <span>
+                  <strong>
+                    {kind.label}
+                    {task ? ` · ${task.number}` : ""}
+                  </strong>
+                  <small>{event.message}</small>
+                </span>
+                <time>{relativeTime(event.createdAt)}</time>
+              </button>
+            );
+          })}
+          {systemEvents.length === 0 && (
+            <p className="monitor-events-empty">暂无任务或恢复状态变化。</p>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1773,7 +2441,7 @@ function EventStream({
   );
 }
 
-function OpsPage({
+export function LegacyOpsPage({
   snapshot,
   busy,
   onTask,
@@ -1828,6 +2496,7 @@ function OpsPage({
   const threads = ops.threads.length ? ops.threads : [ops.thread];
   const selectedThread =
     threads.find((thread) => thread.id === selectedThreadId) ?? threads[0];
+  const supervisor = snapshot.server.ops?.supervisor;
   const snapshotTurnIds = new Set(ops.turns.map((turn) => turn.id));
   const visibleTurns = selectedThread
     ? [
@@ -1874,8 +2543,8 @@ function OpsPage({
       : threadActive
         ? "System Codex 正在思考和处理"
         : latestTurn
-          ? "本轮已结束，System Codex 当前已停止"
-          : "System Codex 当前已停止";
+          ? "本轮已结束，常驻监督仍在运行"
+          : "常驻监督已启动，当前空闲";
   const activityDetail = sending
     ? "正在确认消息送达，请不要重复发送。"
     : activeTurn?.status === "queued"
@@ -1886,8 +2555,8 @@ function OpsPage({
             : null) ||
           `第 ${activeTurn?.sequence ?? latestTurn?.sequence ?? 1} 轮仍在继续；收到最终结论前都会保持此状态。`
         : latestTurn
-          ? `第 ${latestTurn.sequence} 轮已在 ${relativeTime(latestTurn.finishedAt ?? latestTurn.createdAt)}停止。`
-          : "发送消息后，这里会立即显示接收、排队和思考状态。";
+          ? `第 ${latestTurn.sequence} 轮已在 ${relativeTime(latestTurn.finishedAt ?? latestTurn.createdAt)}结束；有非终态任务时每 5 分钟自动复查。`
+          : "有非终态任务时每 5 分钟自动检查；发现故障会新建 Sol xhigh 全权限修复对话。";
   const openIncidents = ops.incidents.filter((item) => !item.resolvedAt);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -1938,9 +2607,9 @@ function OpsPage({
           <span className="eyebrow">AUTONOMOUS OPERATIONS</span>
           <h1>系统助手</h1>
           <p>
-            持久化 Codex 会持续接收 Relay、任务和 Worker
-            异常，自动执行不删除数据的恢复动作，并在隔离 worktree
-            中完成代码自修复、验证、提交和部署。
+            GPT-5.6 Luna Max 常驻监督会复用同一对话，每 5 分钟检查非终态任务；
+            发现真实故障时会启动新的 GPT-5.6 Sol xhigh
+            全权限修复对话，保留原任务提示词并负责让原任务恢复运行。
           </p>
         </div>
         <div className="ops-status-cluster">
@@ -1964,6 +2633,9 @@ function OpsPage({
             {selectedThread
               ? `${codexModelLabel(selectedThread.codexModel)} · ${codexReasoningLabel(selectedThread.codexReasoningEffort)}${selectedThread.codexFastMode ? " · Fast" : ""}`
               : "未选择对话"}
+            {selectedThread?.isSystem && supervisor?.running
+              ? ` · 常驻 ${Math.round((supervisor.intervalMs ?? 300000) / 60000)} 分钟巡检`
+              : ""}
           </span>
         </div>
       </section>
@@ -2306,7 +2978,7 @@ function OpsPage({
                 )}
                 {threadActive
                   ? "System Codex 仍在继续处理；上方进度条停止后才表示本轮结束。"
-                  : "自动动作不可删除数据；代码修改必须经过 Git 与完整验证。"}
+                  : "修复对话不受旧动作目录和只读沙箱限制；原任务提示词由不可变归档保护。"}
               </span>
               <button
                 className="primary-action"
@@ -2441,22 +3113,31 @@ function OpsPage({
 
 function TasksPage({
   snapshot,
+  busy,
   onTask,
+  onComplete,
+  onCompleteMany,
   onCreate,
 }: {
   snapshot: Snapshot;
+  busy: boolean;
   onTask: (id: string) => void;
+  onComplete: (task: Task) => void;
+  onCompleteMany: (tasks: Task[]) => void;
   onCreate: () => void;
 }) {
   const [filter, setFilter] = useState("all");
   const [query, setQuery] = useState("");
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const filters = [
     ["all", "全部"],
     ["running", "执行中"],
     ["queued", "排队中"],
     ["waiting_user", "等待我确认"],
     ["needs_attention", "异常"],
-    ["closed", "已关闭"],
+    ["closed", "已完成"],
   ];
   const tasks = snapshot.tasks.filter((task) => {
     if (filter !== "all" && task.status !== filter) return false;
@@ -2465,6 +3146,25 @@ function TasksPage({
       `${task.number} ${task.title} ${task.createdBy} ${task.branchName} ${task.latestCommitSha ?? ""} ${project?.name ?? ""}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
   });
+  const batchMode = filter === "waiting_user";
+  const batchCandidates = tasks.filter(
+    (task) => task.status === "waiting_user",
+  );
+  const selectedTasks = batchCandidates.filter((task) =>
+    selectedTaskIds.has(task.id),
+  );
+  const allVisibleSelected =
+    batchCandidates.length > 0 &&
+    selectedTasks.length === batchCandidates.length;
+
+  const selectTask = (taskId: string, selected: boolean) => {
+    setSelectedTaskIds((current) => {
+      const next = new Set(current);
+      if (selected) next.add(taskId);
+      else next.delete(taskId);
+      return next;
+    });
+  };
   return (
     <div className="page tasks-page">
       <section className="page-title-row">
@@ -2508,6 +3208,49 @@ function TasksPage({
           />
         </label>
       </div>
+      {batchMode && (
+        <div className="task-batch-toolbar">
+          <label className="batch-select-all">
+            <span className="defect-checkbox">
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                disabled={!batchCandidates.length || busy}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setSelectedTaskIds((current) => {
+                    const next = new Set(current);
+                    for (const task of batchCandidates) {
+                      if (checked) next.add(task.id);
+                      else next.delete(task.id);
+                    }
+                    return next;
+                  });
+                }}
+              />
+              <span />
+            </span>
+            <span>全选当前列表</span>
+          </label>
+          <span className="batch-selection-summary">
+            已选 <strong>{selectedTasks.length}</strong> 个 · 当前共{" "}
+            {batchCandidates.length} 个
+          </span>
+          <button
+            type="button"
+            className="primary-action compact batch-complete-action"
+            disabled={!selectedTasks.length || busy}
+            onClick={() => onCompleteMany(selectedTasks)}
+          >
+            {busy ? (
+              <LoaderCircle size={16} className="spin" />
+            ) : (
+              <CheckCheck size={16} />
+            )}
+            一键完成 {selectedTasks.length || ""}
+          </button>
+        </div>
+      )}
       <div className="task-archive-list">
         {tasks.map((task) => {
           const turn = latestTurn(snapshot, task.id);
@@ -2518,14 +3261,47 @@ function TasksPage({
           const allTurns = snapshot.turns.filter(
             (item) => item.taskId === task.id,
           );
+          const buildDispatch = taskBuildDispatches(snapshot, task.id)[0];
           return (
-            <button
-              className="task-archive-row"
+            <div
+              className={cx(
+                "task-archive-row",
+                batchMode && selectedTaskIds.has(task.id) && "batch-selected",
+              )}
               key={task.id}
+              role="button"
+              tabIndex={0}
               onClick={() => onTask(task.id)}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) return;
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onTask(task.id);
+                }
+              }}
             >
               <div className="archive-signal">
-                <span className={cx("archive-dot", `status-${task.status}`)} />
+                {batchMode ? (
+                  <label
+                    className="defect-checkbox archive-select-checkbox"
+                    aria-label={`选择 ${task.number}`}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedTaskIds.has(task.id)}
+                      disabled={busy || task.completion?.status === "running"}
+                      onChange={(event) =>
+                        selectTask(task.id, event.target.checked)
+                      }
+                    />
+                    <span />
+                  </label>
+                ) : (
+                  <span
+                    className={cx("archive-dot", `status-${task.status}`)}
+                  />
+                )}
                 <span />
               </div>
               <div className="archive-main">
@@ -2542,7 +3318,23 @@ function TasksPage({
                   <code>{task.branchName}</code>
                   <i />
                   <span>{allTurns.length} 轮</span>
+                  {task.projectManagement?.defectId && (
+                    <>
+                      <i />
+                      <span>
+                        轻语 {task.projectManagement.defectId}
+                        {task.projectManagement.userName
+                          ? ` · ${task.projectManagement.userName}`
+                          : ""}
+                      </span>
+                    </>
+                  )}
                 </div>
+                {buildDispatch && (
+                  <div className="archive-build-status">
+                    <BuildStatusPill dispatch={buildDispatch} />
+                  </div>
+                )}
               </div>
               <div className="archive-current">
                 <strong>
@@ -2555,8 +3347,30 @@ function TasksPage({
                   {relativeTime(task.updatedAt)}
                 </span>
               </div>
-              <ChevronRight size={18} />
-            </button>
+              <div className="archive-actions">
+                {task.status === "waiting_user" && (
+                  <button
+                    type="button"
+                    className="archive-complete-action"
+                    disabled={busy || task.completion?.status === "running"}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onComplete(task);
+                    }}
+                  >
+                    {task.completion?.status === "running" ? (
+                      <LoaderCircle size={14} className="spin" />
+                    ) : (
+                      <Check size={14} />
+                    )}
+                    {task.completion?.status === "failed"
+                      ? "重试完成"
+                      : "确认完成"}
+                  </button>
+                )}
+                <ChevronRight size={18} />
+              </div>
+            </div>
           );
         })}
         {tasks.length === 0 && (
@@ -2590,11 +3404,11 @@ function TaskDetail({
   busy,
   onBack,
   onRefresh,
-  onAskOps,
   onMessage,
   onCancel,
   onRetry,
   onClose,
+  onCloseRelayOnly,
   onReopen,
 }: {
   snapshot: Snapshot;
@@ -2603,11 +3417,15 @@ function TaskDetail({
   busy: boolean;
   onBack: () => void;
   onRefresh: () => void;
-  onAskOps: () => void;
-  onMessage: (message: string) => Promise<boolean>;
+  onMessage: (
+    message: string,
+    executionProfile: ExecutionProfile,
+    files: File[],
+  ) => Promise<boolean>;
   onCancel: () => void;
   onRetry: () => void;
   onClose: () => void;
+  onCloseRelayOnly: () => void;
   onReopen: () => void;
 }) {
   const turns = snapshot.turns
@@ -2619,18 +3437,30 @@ function TaskDetail({
   const project = projectById(snapshot, task.projectId);
   const worker = snapshot.workers.find((item) => item.id === current?.workerId);
   const [message, setMessage] = useState("");
+  const [executionProfile, setExecutionProfile] =
+    useState<ExecutionProfile>("auto");
+  const [files, setFiles] = useState<File[]>([]);
   const [logsOpen, setLogsOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const active = turns.some((turn) => LIVE_TURN.has(turn.status));
   const closed = task.status === "closed";
+  const buildDispatches = taskBuildDispatches(snapshot, task.id);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!message.trim() || sending) return;
     setSending(true);
-    const ok = await onMessage(message.trim());
-    if (ok) setMessage("");
+    const ok = await onMessage(message.trim(), executionProfile, files);
+    if (ok) {
+      setMessage("");
+      setFiles([]);
+      setExecutionProfile("auto");
+    }
     setSending(false);
   };
+  const addFiles = (incoming: File[]) =>
+    setFiles((current) => mergeUniqueFiles(current, incoming));
+  const pasteImages = (event: ReactClipboardEvent<HTMLTextAreaElement>) =>
+    addFiles(clipboardImages(event));
   return (
     <div className="task-detail-page">
       <div className="task-detail-head">
@@ -2670,13 +3500,19 @@ function TaskDetail({
           </div>
         </div>
         <div className="task-head-actions">
-          <button className="secondary-action" onClick={onAskOps}>
-            <Bot size={15} />
-            交给系统 Codex
-          </button>
           <IconButton label="刷新" onClick={onRefresh}>
             <RefreshCw size={17} />
           </IconButton>
+          {!active && !closed && task.status === "waiting_user" && (
+            <button
+              className="secondary-action danger-text"
+              onClick={onCloseRelayOnly}
+              disabled={busy || task.completion?.status === "running"}
+            >
+              <CheckCircle2 size={15} />
+              仅完成 Relay
+            </button>
+          )}
           {active ? (
             <button className="secondary-action danger-text" onClick={onCancel}>
               <Square size={14} />
@@ -2693,9 +3529,21 @@ function TaskDetail({
               重新排队
             </button>
           ) : (
-            <button className="secondary-action" onClick={onClose}>
-              <Check size={15} />
-              确认完成
+            <button
+              className="secondary-action"
+              onClick={onClose}
+              disabled={busy || task.completion?.status === "running"}
+            >
+              {task.completion?.status === "running" ? (
+                <LoaderCircle size={15} className="spin" />
+              ) : (
+                <Check size={15} />
+              )}
+              {task.completion?.status === "failed"
+                ? "重试确认完成"
+                : task.completion?.status === "running"
+                  ? "正在完成"
+                  : "确认完成"}
             </button>
           )}
         </div>
@@ -2752,12 +3600,72 @@ function TaskDetail({
                     : `将创建第 ${(latest?.sequence ?? 0) + 1} 轮`}
               </span>
             </div>
+            <div className="composer-route">
+              <label>
+                <span>本轮辅助判断</span>
+                <select
+                  value={executionProfile}
+                  disabled={sending}
+                  onChange={(event) =>
+                    setExecutionProfile(event.target.value as ExecutionProfile)
+                  }
+                >
+                  {EXECUTION_PROFILE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <small>
+                {
+                  EXECUTION_PROFILE_OPTIONS.find(
+                    (option) => option.value === executionProfile,
+                  )?.detail
+                }
+              </small>
+            </div>
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
+              onPaste={pasteImages}
               disabled={sending}
-              placeholder="例如：继续处理当前现场，或补充新的微调要求…"
+              placeholder="例如：继续处理当前现场，或补充新的微调要求；可以直接 Ctrl+V 粘贴截图…"
             />
+            <div className="attachment-actions composer-attachment-actions">
+              <label className="attachment-button">
+                <Paperclip size={16} />
+                添加图片或文件
+                <input
+                  type="file"
+                  multiple
+                  disabled={sending}
+                  onChange={(event) => {
+                    addFiles(Array.from(event.target.files ?? []));
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </label>
+              <span>第二轮及后续提示词也支持直接粘贴截图</span>
+            </div>
+            {files.length > 0 && (
+              <div
+                className="attachment-list composer-attachment-list"
+                aria-label="本轮已添加的文件"
+              >
+                {files.map((file, index) => (
+                  <AttachmentChip
+                    key={`${file.name}:${file.size}:${file.lastModified}:${index}`}
+                    file={file}
+                    onRemove={() =>
+                      setFiles((current) =>
+                        current.filter((_, itemIndex) => itemIndex !== index),
+                      )
+                    }
+                  />
+                ))}
+              </div>
+            )}
             <div className="composer-foot">
               <span>
                 <GitBranch size={13} />
@@ -2855,6 +3763,51 @@ function TaskDetail({
                 <dd>{task.baseBranch}</dd>
               </div>
               <div>
+                <dt>任务来源</dt>
+                <dd>
+                  {task.projectManagement?.defectId ? (
+                    task.projectManagement.defectUrl ? (
+                      <a
+                        href={task.projectManagement.defectUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        轻语 {task.projectManagement.defectId}
+                        {task.projectManagement.userName
+                          ? ` · ${task.projectManagement.userName}`
+                          : ""}
+                      </a>
+                    ) : (
+                      `轻语 ${task.projectManagement.defectId}${
+                        task.projectManagement.userName
+                          ? ` · ${task.projectManagement.userName}`
+                          : ""
+                      }`
+                    )
+                  ) : (
+                    "Relay"
+                  )}
+                </dd>
+              </div>
+              {task.completion?.mergeRequestIid && (
+                <div>
+                  <dt>合并请求</dt>
+                  <dd>
+                    {task.completion.mergeRequestUrl ? (
+                      <a
+                        href={task.completion.mergeRequestUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        MR !{task.completion.mergeRequestIid}
+                      </a>
+                    ) : (
+                      `MR !${task.completion.mergeRequestIid}`
+                    )}
+                  </dd>
+                </div>
+              )}
+              <div>
                 <dt>Codex thread</dt>
                 <dd>
                   <code>
@@ -2877,6 +3830,22 @@ function TaskDetail({
                 <dd>{task.codexFastMode ? "已开启" : "普通速度"}</dd>
               </div>
             </dl>
+            {task.completion?.status === "failed" && (
+              <div className="preserved-error compact completion-error">
+                <AlertTriangle size={18} />
+                <div>
+                  <strong>
+                    {task.completion.step === "project_management"
+                      ? "MR 已合并，轻语更新失败"
+                      : task.completion.step === "relay"
+                        ? "Relay 最终状态写入失败"
+                        : "自动 MR 合并失败"}
+                  </strong>
+                  <p>{task.completion.errorMessage || "确认完成流程已停止"}</p>
+                  <code>{task.completion.errorCode}</code>
+                </div>
+              </div>
+            )}
             {current?.result && (
               <div className="change-summary">
                 <span>
@@ -2916,6 +3885,25 @@ function TaskDetail({
           </div>
         </aside>
       </div>
+      {buildDispatches.length > 0 && (
+        <section className="task-build-progress" aria-label="热更打包进度">
+          <div className="task-build-progress-title">
+            <div>
+              <span className="eyebrow">HOT UPDATE BUILD</span>
+              <h2>热更打包进度</h2>
+              <p>
+                代码交付并成功拉起打包后，本任务就已完成并释放队列；下面的打包进度独立更新，不会延迟下一条任务。
+              </p>
+            </div>
+            <BuildStatusPill dispatch={buildDispatches[0]} />
+          </div>
+          <div className="task-build-progress-list">
+            {buildDispatches.map((dispatch) => (
+              <BuildProgressCard key={dispatch.id} dispatch={dispatch} />
+            ))}
+          </div>
+        </section>
+      )}
       {busy && (
         <div className="mutation-overlay">
           <LoaderCircle className="spin" size={18} />
@@ -2972,10 +3960,19 @@ function TurnConversation({
         <div className="message-head">
           <span className="avatar small">{userInitial(turn.authorName)}</span>
           <strong>{turn.authorName}</strong>
+          <span className="message-kind user-message-kind">
+            {turn.sequence === 1 ? "初始提示词" : "补充要求"}
+          </span>
+          <span className="message-kind route-kind">
+            {executionProfileLabel(turn.executionProfile)}
+          </span>
           <time>{relativeTime(turn.createdAt)}</time>
           <StatusBadge status={turn.status} label={`第 ${turn.sequence} 轮`} />
         </div>
         <p>{turn.userMessage}</p>
+        {turn.attachments && turn.attachments.length > 0 && (
+          <TurnAttachments attachments={turn.attachments} />
+        )}
       </div>
       {progressMessages.map(({ event, text }) => (
         <div
@@ -3098,6 +4095,75 @@ function TurnConversation({
   );
 }
 
+function previewableImage(contentType?: string | null) {
+  return [
+    "image/avif",
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+  ].includes(String(contentType || "").toLowerCase());
+}
+
+function attachmentTypeLabel(attachment: Attachment) {
+  const extension = attachment.filename.split(".").at(-1);
+  if (extension && extension !== attachment.filename)
+    return extension.toUpperCase();
+  return attachment.contentType || "文件";
+}
+
+function TurnAttachmentThumbnail({ attachment }: { attachment: Attachment }) {
+  const url = `${getApiBase()}/api/attachments/${encodeURIComponent(attachment.id)}`;
+  if (!previewableImage(attachment.contentType))
+    return (
+      <span className="turn-attachment-file-icon">
+        <FileCode2 size={22} />
+      </span>
+    );
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img src={url} alt={attachment.filename} loading="lazy" />;
+}
+
+function TurnAttachments({ attachments }: { attachments: Attachment[] }) {
+  return (
+    <section
+      className="turn-attachments"
+      aria-label={`本轮附件，共 ${attachments.length} 个`}
+    >
+      <div className="turn-attachments-head">
+        <Paperclip size={14} />
+        <strong>附件</strong>
+        <span>{attachments.length} 个</span>
+      </div>
+      <div className="turn-attachment-grid">
+        {attachments.map((attachment) => {
+          const url = `${getApiBase()}/api/attachments/${encodeURIComponent(attachment.id)}`;
+          return (
+            <a
+              className="turn-attachment-card"
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              key={attachment.id}
+              title={`打开 ${attachment.filename}`}
+            >
+              <TurnAttachmentThumbnail attachment={attachment} />
+              <span>
+                <strong>{attachment.filename}</strong>
+                <small>
+                  {attachmentTypeLabel(attachment)} ·{" "}
+                  {formatFileSize(attachment.size)}
+                </small>
+              </span>
+            </a>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function PhaseProgress({ turn }: { turn: Turn }) {
   const currentIndex =
     turn.status === "success"
@@ -3146,6 +4212,433 @@ function PhaseProgress({ turn }: { turn: Turn }) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function SystemPage({
+  snapshot,
+  selectedWorker,
+  connected,
+  connectionChecked,
+  onSelectWorker,
+  onWorkerAction,
+  onCreateWorker,
+  onEditWorker,
+  onCreateProject,
+  onEditProject,
+  onDeleteProject,
+  onSaved,
+  notify,
+}: {
+  snapshot: Snapshot;
+  selectedWorker: Worker | null;
+  connected: boolean;
+  connectionChecked: boolean;
+  onSelectWorker: (id: string | null) => void;
+  onWorkerAction: (worker: Worker, action: string) => void;
+  onCreateWorker: () => void;
+  onEditWorker: (worker: Worker) => void;
+  onCreateProject: () => void;
+  onEditProject: (project: Project) => void;
+  onDeleteProject: (project: Project) => void;
+  onSaved: () => void;
+  notify: (message: string, kind?: Toast["kind"]) => void;
+}) {
+  const [hostMetrics, setHostMetrics] = useState<HostMetricsSnapshot | null>(
+    null,
+  );
+  const [hostMetricsError, setHostMetricsError] = useState<string | null>(null);
+  const enabledProjects = snapshot.projects.filter(
+    (project) => project.enabled,
+  ).length;
+  const healthyWorkers = snapshot.workers.filter((worker) =>
+    ["ready", "busy", "preparing"].includes(worker.status),
+  ).length;
+  const runtimeReady =
+    Boolean(snapshot.server.runtime?.ready) &&
+    Boolean(snapshot.server.runtime?.hyperv.canManage) &&
+    Boolean(snapshot.server.runtime?.codex.authenticated);
+
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    let controller: AbortController | null = null;
+    const refresh = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const metrics = await fetchHostMetrics(controller.signal);
+        if (!disposed) {
+          setHostMetrics(metrics);
+          setHostMetricsError(null);
+        }
+      } catch (error) {
+        if (
+          !disposed &&
+          !(error instanceof DOMException && error.name === "AbortError")
+        )
+          setHostMetricsError(
+            error instanceof Error ? error.message : "宿主机性能采样暂不可用",
+          );
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 3_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      controller?.abort();
+    };
+  }, []);
+
+  const metricCards = [
+    {
+      key: "cpu",
+      label: "CPU",
+      icon: <Cpu size={18} />,
+      available: Boolean(hostMetrics?.cpu.available),
+      value:
+        hostMetrics?.cpu.usagePercent != null
+          ? `${hostMetrics.cpu.usagePercent.toFixed(1)}%`
+          : null,
+      percent: hostMetrics?.cpu.usagePercent,
+      detail: hostMetrics
+        ? `${hostMetrics.cpu.logicalProcessors} 线程 · 处理器总负载`
+        : null,
+    },
+    {
+      key: "memory",
+      label: "内存",
+      icon: <MemoryStick size={18} />,
+      available: Boolean(hostMetrics?.memory.available),
+      value:
+        hostMetrics?.memory.usagePercent != null
+          ? `${hostMetrics.memory.usagePercent.toFixed(1)}%`
+          : null,
+      percent: hostMetrics?.memory.usagePercent,
+      detail:
+        hostMetrics?.memory.usedBytes != null &&
+        hostMetrics.memory.totalBytes != null
+          ? `${formatMetricBytes(hostMetrics.memory.usedBytes)} / ${formatMetricBytes(hostMetrics.memory.totalBytes)}`
+          : null,
+    },
+    {
+      key: "temperature",
+      label: "温度",
+      icon: <Thermometer size={18} />,
+      available: Boolean(hostMetrics?.temperature.available),
+      value:
+        hostMetrics?.temperature.celsius != null
+          ? `${hostMetrics.temperature.celsius.toFixed(1)}°C`
+          : null,
+      percent:
+        hostMetrics?.temperature.celsius != null
+          ? Math.min(100, hostMetrics.temperature.celsius)
+          : null,
+      detail: hostMetrics?.temperature.available
+        ? `${hostMetrics.temperature.sensor}${hostMetrics.temperature.kind === "gpu" ? " · GPU 温度回退" : ""}`
+        : null,
+    },
+    {
+      key: "gpu",
+      label: "显卡",
+      icon: <MonitorCog size={18} />,
+      available: Boolean(hostMetrics?.gpu.available),
+      value:
+        hostMetrics?.gpu.usagePercent != null
+          ? `${hostMetrics.gpu.usagePercent.toFixed(1)}%`
+          : null,
+      percent: hostMetrics?.gpu.usagePercent,
+      detail: hostMetrics?.gpu.name
+        ? `${hostMetrics.gpu.name}${hostMetrics.gpu.memoryUsagePercent != null ? ` · 显存 ${hostMetrics.gpu.memoryUsagePercent.toFixed(1)}%` : ""}`
+        : null,
+    },
+    {
+      key: "disk",
+      label: "硬盘",
+      icon: <HardDrive size={18} />,
+      available: Boolean(hostMetrics?.disk.available),
+      value:
+        hostMetrics?.disk.capacityUsagePercent != null
+          ? `${hostMetrics.disk.capacityUsagePercent.toFixed(1)}%`
+          : null,
+      percent: hostMetrics?.disk.capacityUsagePercent,
+      danger: Boolean(
+        hostMetrics?.disk.volumes.some(
+          (volume) => (volume.usagePercent ?? 0) > 80,
+        ),
+      ),
+      volumes: hostMetrics?.disk.volumes ?? [],
+      totalBytes: hostMetrics?.disk.totalBytes ?? null,
+      detail:
+        hostMetrics?.disk.usedBytes != null &&
+        hostMetrics.disk.totalBytes != null
+          ? `${formatMetricBytes(hostMetrics.disk.usedBytes)} / ${formatMetricBytes(hostMetrics.disk.totalBytes)} 已用`
+          : null,
+    },
+  ];
+
+  return (
+    <div className="page system-hub-page">
+      <section className="page-title-row system-hub-title">
+        <div>
+          <span className="eyebrow">SYSTEM & ENVIRONMENTS</span>
+          <h1>系统与环境</h1>
+          <p>在一个页面管理项目环境、Hyper-V 工位和 Relay 运行设置。</p>
+        </div>
+        <StatusBadge
+          status={connected && runtimeReady ? "ready" : "preparing"}
+          label={
+            connected && runtimeReady
+              ? "系统环境正常"
+              : connectionChecked
+                ? "部分能力待检查"
+                : "正在连接"
+          }
+        />
+      </section>
+
+      <div className="system-hub-stats">
+        <div>
+          <FolderGit2 size={17} />
+          <span>
+            <strong>{snapshot.projects.length}</strong>
+            <small>{enabledProjects} 个项目已启用</small>
+          </span>
+        </div>
+        <div>
+          <Server size={17} />
+          <span>
+            <strong>{snapshot.workers.length}</strong>
+            <small>{healthyWorkers} 个工位可调度</small>
+          </span>
+        </div>
+        <div>
+          <Cpu size={17} />
+          <span>
+            <strong>
+              {snapshot.server.runtime?.hyperv.vmCount ??
+                snapshot.workers.length}
+            </strong>
+            <small>Hyper-V 虚拟机</small>
+          </span>
+        </div>
+        <div>
+          <HeartPulse size={17} />
+          <span>
+            <strong>
+              {snapshot.server.schedulerRunning === false ? "暂停" : "运行中"}
+            </strong>
+            <small>Relay 调度循环</small>
+          </span>
+        </div>
+      </div>
+
+      <section
+        className="host-performance-panel"
+        id="system-performance"
+        aria-labelledby="host-performance-title"
+      >
+        <div className="host-performance-heading">
+          <div>
+            <span className="host-performance-icon">
+              <Activity size={17} />
+            </span>
+            <span>
+              <strong id="host-performance-title">当前宿主机性能</strong>
+              <small>
+                {hostMetrics
+                  ? `最后采样 ${new Date(hostMetrics.sampledAt).toLocaleTimeString("zh-CN", { hour12: false })}`
+                  : hostMetricsError
+                    ? "采样服务暂不可用"
+                    : "正在读取 Windows 性能数据"}
+              </small>
+            </span>
+          </div>
+          <span
+            className={cx(
+              "host-performance-live",
+              hostMetricsError && "unavailable",
+            )}
+            title={hostMetricsError ?? undefined}
+          >
+            <i aria-hidden="true" />
+            {hostMetricsError ? "等待恢复" : "每 3 秒刷新"}
+          </span>
+        </div>
+        <div className="host-performance-grid" aria-live="polite">
+          {metricCards.map((metric) => (
+            <article
+              className={cx(
+                "host-metric-card",
+                hostMetrics && !metric.available && "unavailable",
+                metric.danger && "danger",
+              )}
+              key={metric.key}
+            >
+              <div className="host-metric-label">
+                <span>{metric.icon}</span>
+                <small>{metric.label}</small>
+              </div>
+              <strong>
+                {metric.value ??
+                  (hostMetrics
+                    ? "不可用"
+                    : hostMetricsError
+                      ? "等待恢复"
+                      : "采样中")}
+              </strong>
+              {metric.key === "disk" && metric.volumes?.length ? (
+                <HostDiskCapacityBar
+                  totalBytes={metric.totalBytes}
+                  volumes={metric.volumes}
+                />
+              ) : (
+                <div className="host-metric-bar" aria-hidden="true">
+                  <span
+                    style={{
+                      width: `${Math.min(100, Math.max(0, metric.percent ?? 0))}%`,
+                    }}
+                  />
+                </div>
+              )}
+              <small className="host-metric-detail">
+                {metric.detail ??
+                  (hostMetrics
+                    ? "当前系统未提供此项传感器数据"
+                    : "正在建立采样基线")}
+              </small>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <nav className="system-hub-nav" aria-label="系统页面分区">
+        <a href="#system-performance">
+          <Activity size={15} />
+          宿主机性能
+          <span>5</span>
+        </a>
+        <a href="#system-projects">
+          <FolderGit2 size={15} />
+          项目环境
+          <span>{snapshot.projects.length}</span>
+        </a>
+        <a href="#system-workers">
+          <Server size={15} />
+          工位资源
+          <span>{snapshot.workers.length}</span>
+        </a>
+        <a href="#system-settings">
+          <Settings size={15} />
+          运行设置
+        </a>
+      </nav>
+
+      <section
+        className="system-hub-section system-projects-section"
+        id="system-projects"
+      >
+        <ProjectsPage
+          snapshot={snapshot}
+          onCreate={onCreateProject}
+          onEdit={onEditProject}
+          onDelete={onDeleteProject}
+        />
+      </section>
+
+      <section
+        className="system-hub-section system-workers-section"
+        id="system-workers"
+      >
+        <WorkersPage
+          snapshot={snapshot}
+          selected={selectedWorker}
+          onSelect={onSelectWorker}
+          onAction={onWorkerAction}
+          onCreate={onCreateWorker}
+          onEdit={onEditWorker}
+        />
+      </section>
+
+      <section
+        className="system-hub-section system-settings-section"
+        id="system-settings"
+      >
+        <SettingsPage
+          snapshot={snapshot}
+          connected={connected}
+          connectionChecked={connectionChecked}
+          onSaved={onSaved}
+          notify={notify}
+        />
+      </section>
+    </div>
+  );
+}
+
+function formatMetricBytes(bytes: number) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Math.max(0, bytes);
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(unitIndex >= 3 ? 1 : 0)} ${units[unitIndex]}`;
+}
+
+function HostDiskCapacityBar({
+  totalBytes,
+  volumes,
+}: {
+  totalBytes: number | null;
+  volumes: HostMetricsSnapshot["disk"]["volumes"];
+}) {
+  const effectiveTotal =
+    totalBytes ?? volumes.reduce((sum, volume) => sum + volume.totalBytes, 0);
+  const description = volumes
+    .map(
+      (volume) =>
+        `${volume.name} ${volume.usagePercent?.toFixed(1) ?? "未知"}% 已用`,
+    )
+    .join("，");
+
+  return (
+    <div
+      className="host-disk-capacity-bar"
+      role="img"
+      aria-label={`固定磁盘容量分段：${description}`}
+    >
+      {volumes.map((volume) => {
+        const usagePercent = Math.min(
+          100,
+          Math.max(0, volume.usagePercent ?? 0),
+        );
+        const capacityPercent =
+          effectiveTotal > 0
+            ? (volume.totalBytes / effectiveTotal) * 100
+            : 100 / volumes.length;
+        const danger = usagePercent > 80;
+        return (
+          <span
+            className={cx("host-disk-volume", danger && "danger")}
+            key={volume.name}
+            style={{ flexBasis: `${capacityPercent}%` }}
+            title={`${volume.name} ${formatMetricBytes(volume.usedBytes)} / ${formatMetricBytes(volume.totalBytes)}，已用 ${usagePercent.toFixed(1)}%`}
+          >
+            <i style={{ width: `${usagePercent}%` }} aria-hidden="true" />
+            <small>
+              <b>{volume.name}</b>
+              {usagePercent.toFixed(1)}%
+            </small>
+          </span>
+        );
+      })}
     </div>
   );
 }
@@ -3847,6 +5340,89 @@ function ImageAttachmentPreview({ file }: { file: File }) {
   return <img src={preview} alt="" />;
 }
 
+function mergeUniqueFiles(current: File[], incoming: File[]) {
+  const known = new Set(
+    current.map(
+      (file) => `${file.name}:${file.size}:${file.lastModified}:${file.type}`,
+    ),
+  );
+  return [
+    ...current,
+    ...incoming.filter((file) => {
+      const key = `${file.name}:${file.size}:${file.lastModified}:${file.type}`;
+      if (known.has(key)) return false;
+      known.add(key);
+      return true;
+    }),
+  ];
+}
+
+function clipboardImages(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+  const timestamp = Date.now();
+  return Array.from(event.clipboardData.items)
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file))
+    .map((file, index) => {
+      const extension =
+        file.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
+      return new File(
+        [file],
+        `粘贴图片-${timestamp}-${index + 1}.${extension}`,
+        { type: file.type, lastModified: timestamp + index },
+      );
+    });
+}
+
+function DefectThumbnail({ imageUrls }: { imageUrls: string[] }) {
+  const [failedUrls, setFailedUrls] = useState<Set<string>>(() => new Set());
+
+  const imageUrl = imageUrls.find((item) => !failedUrls.has(item));
+  return (
+    <span className="defect-thumbnails">
+      {imageUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={imageUrl}
+          alt=""
+          referrerPolicy="no-referrer"
+          onError={() =>
+            setFailedUrls((current) => new Set(current).add(imageUrl))
+          }
+        />
+      ) : (
+        <span className="defect-no-image">
+          <FileText size={18} />
+        </span>
+      )}
+    </span>
+  );
+}
+
+function DefectImageGallery({ imageUrls }: { imageUrls: string[] }) {
+  const [failedUrls, setFailedUrls] = useState<Set<string>>(() => new Set());
+
+  const visibleImages = imageUrls.filter((item) => !failedUrls.has(item));
+  if (!visibleImages.length) return null;
+  return (
+    <div className="defect-detail-images">
+      {visibleImages.map((imageUrl, index) => (
+        <a key={imageUrl} href={imageUrl} target="_blank" rel="noreferrer">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={imageUrl}
+            alt={`缺陷图片 ${index + 1}`}
+            referrerPolicy="no-referrer"
+            onError={() =>
+              setFailedUrls((current) => new Set(current).add(imageUrl))
+            }
+          />
+        </a>
+      ))}
+    </div>
+  );
+}
+
 function AttachmentChip({
   file,
   onRemove,
@@ -3881,6 +5457,7 @@ function CreateTaskModal({
   busy,
   onClose,
   onSubmit,
+  onBatchSubmit,
 }: {
   projects: Project[];
   workers: Worker[];
@@ -3888,8 +5465,13 @@ function CreateTaskModal({
   busy: boolean;
   onClose: () => void;
   onSubmit: (payload: Record<string, unknown>, files: File[]) => Promise<void>;
+  onBatchSubmit: (
+    payload: Record<string, unknown>,
+    items: ProjectManagementBatchItem[],
+  ) => Promise<ProjectManagementImportResult>;
 }) {
   const dialogRef = useDialogFocusTrap(onClose);
+  const [mode, setMode] = useState<"single" | "batch">("single");
   const [idempotencyKey] = useState(createIdempotencyKey);
   const [requirement, setRequirement] = useState("");
   const [priority, setPriority] = useState(0);
@@ -3897,7 +5479,34 @@ function CreateTaskModal({
   const [codexModel, setCodexModel] = useState("gpt-5.6-sol");
   const [codexReasoningEffort, setCodexReasoningEffort] = useState("xhigh");
   const [codexFastMode, setCodexFastMode] = useState(false);
+  const [executionProfile, setExecutionProfile] =
+    useState<ExecutionProfile>("auto");
   const [files, setFiles] = useState<File[]>([]);
+  const [projectManagementSession, setProjectManagementSession] =
+    useState<ProjectManagementSession | null>(null);
+  const [projectManagementProjects, setProjectManagementProjects] = useState<
+    ProjectManagementProject[]
+  >([]);
+  const [externalProjectId, setExternalProjectId] = useState("");
+  const [defects, setDefects] = useState<ProjectManagementDefect[]>([]);
+  const [defectTotal, setDefectTotal] = useState(0);
+  const [defectSearch, setDefectSearch] = useState("");
+  const [selectedDefects, setSelectedDefects] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [defectDrafts, setDefectDrafts] = useState<
+    Record<string, ProjectManagementDraft>
+  >({});
+  const [detailDefect, setDetailDefect] =
+    useState<ProjectManagementDefect | null>(null);
+  const [projectManagementLoading, setProjectManagementLoading] =
+    useState(false);
+  const [projectManagementLoginBusy, setProjectManagementLoginBusy] =
+    useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [projectManagementError, setProjectManagementError] = useState("");
+  const projectManagementInitialized = useRef(false);
+  const projectManagementPolling = useRef(false);
   const project = projects[0];
   const selectedCodexModel =
     CODEX_MODEL_OPTIONS.find((option) => option.value === codexModel) ??
@@ -3907,61 +5516,300 @@ function CreateTaskModal({
   );
 
   const addFiles = (incoming: File[]) => {
-    setFiles((current) => {
-      const known = new Set(
-        current.map(
-          (file) =>
-            `${file.name}:${file.size}:${file.lastModified}:${file.type}`,
-        ),
-      );
-      return [
-        ...current,
-        ...incoming.filter((file) => {
-          const key = `${file.name}:${file.size}:${file.lastModified}:${file.type}`;
-          if (known.has(key)) return false;
-          known.add(key);
-          return true;
-        }),
-      ];
-    });
+    setFiles((current) => mergeUniqueFiles(current, incoming));
   };
 
+  const updateDefectDraft = useCallback(
+    (
+      defectId: string,
+      update: (current: ProjectManagementDraft) => ProjectManagementDraft,
+    ) => {
+      setDefectDrafts((current) => ({
+        ...current,
+        [defectId]: update(current[defectId] ?? { extraPrompt: "", files: [] }),
+      }));
+    },
+    [],
+  );
+
   const pasteImages = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
-    const timestamp = Date.now();
-    const images = Array.from(event.clipboardData.items)
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => Boolean(file))
-      .map((file, index) => {
-        const extension =
-          file.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
-        return new File(
-          [file],
-          `粘贴图片-${timestamp}-${index + 1}.${extension}`,
-          { type: file.type, lastModified: timestamp + index },
-        );
-      });
+    const images = clipboardImages(event);
     if (images.length) addFiles(images);
   };
 
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    if (!project || !requirement.trim()) return;
-    void onSubmit(
-      {
-        projectId: project.id,
-        title: taskTitleFromContent(requirement),
-        requirement: requirement.trim(),
-        baseBranch: project.defaultBranch,
-        priority,
-        autoRelease,
-        codexModel,
-        codexReasoningEffort,
-        codexFastMode,
-        idempotencyKey,
-      },
-      files,
+  const startProjectManagementLogin = useCallback(async () => {
+    setProjectManagementLoginBusy(true);
+    setProjectManagementError("");
+    try {
+      const payload = await api<{ session: ProjectManagementSession }>(
+        "/api/project-management/login/start",
+        { method: "POST" },
+      );
+      setProjectManagementSession(payload.session);
+    } catch (error) {
+      setProjectManagementError(
+        error instanceof Error ? error.message : "二维码生成失败，请重试",
+      );
+    } finally {
+      setProjectManagementLoginBusy(false);
+    }
+  }, []);
+
+  const loadProjectManagementProjects = useCallback(async () => {
+    if (!project) return;
+    setProjectManagementLoading(true);
+    setProjectManagementError("");
+    try {
+      const payload = await api<{
+        projects: ProjectManagementProject[];
+        selectedProjectId?: string | null;
+      }>(
+        `/api/project-management/projects?relayProjectId=${encodeURIComponent(project.id)}`,
+      );
+      setProjectManagementProjects(payload.projects ?? []);
+      setExternalProjectId(
+        payload.selectedProjectId ||
+          (payload.projects?.length === 1 ? payload.projects[0].id : ""),
+      );
+      if (!payload.projects?.length) {
+        setProjectManagementError("当前账号没有可访问的项目");
+      }
+    } catch (error) {
+      const status = (error as { status?: number })?.status;
+      if (status === 401) {
+        setProjectManagementSession({ authenticated: false, login: null });
+        await startProjectManagementLogin();
+      } else {
+        setProjectManagementError(
+          error instanceof Error ? error.message : "读取项目列表失败",
+        );
+      }
+    } finally {
+      setProjectManagementLoading(false);
+    }
+  }, [project, startProjectManagementLogin]);
+
+  const initializeProjectManagement = useCallback(async () => {
+    setProjectManagementLoading(true);
+    setProjectManagementError("");
+    try {
+      const payload = await api<{ session: ProjectManagementSession }>(
+        "/api/project-management/session",
+      );
+      setProjectManagementSession(payload.session);
+      if (payload.session.authenticated) {
+        await loadProjectManagementProjects();
+      } else {
+        await startProjectManagementLogin();
+      }
+    } catch (error) {
+      setProjectManagementError(
+        error instanceof Error ? error.message : "连接项目管理系统失败",
+      );
+    } finally {
+      setProjectManagementLoading(false);
+    }
+  }, [loadProjectManagementProjects, startProjectManagementLogin]);
+
+  const loadDefects = useCallback(async () => {
+    if (!project || !externalProjectId) return;
+    setProjectManagementLoading(true);
+    setProjectManagementError("");
+    try {
+      const payload = await api<{
+        defects: ProjectManagementDefect[];
+        total: number;
+      }>(
+        `/api/project-management/defects?relayProjectId=${encodeURIComponent(project.id)}&externalProjectId=${encodeURIComponent(externalProjectId)}&pageSize=200`,
+      );
+      const nextDefects = payload.defects ?? [];
+      setDefects(nextDefects);
+      setDefectTotal(payload.total ?? nextDefects.length);
+      setSelectedDefects((current) => {
+        const selectable = new Set(
+          nextDefects
+            .filter((defect) => !defect.importedTask)
+            .map((defect) => defect.id),
+        );
+        return new Set([...current].filter((id) => selectable.has(id)));
+      });
+    } catch (error) {
+      const status = (error as { status?: number })?.status;
+      if (status === 401) {
+        setProjectManagementSession({ authenticated: false, login: null });
+        setDefects([]);
+        await startProjectManagementLogin();
+      } else {
+        setProjectManagementError(
+          error instanceof Error ? error.message : "读取缺陷列表失败",
+        );
+      }
+    } finally {
+      setProjectManagementLoading(false);
+    }
+  }, [externalProjectId, project, startProjectManagementLogin]);
+
+  useEffect(() => {
+    if (mode !== "batch" || projectManagementInitialized.current) return;
+    projectManagementInitialized.current = true;
+    void initializeProjectManagement();
+  }, [initializeProjectManagement, mode]);
+
+  useEffect(() => {
+    if (
+      mode !== "batch" ||
+      !projectManagementSession?.login ||
+      !["pending", "scanned"].includes(projectManagementSession.login.status)
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      if (projectManagementPolling.current) return;
+      projectManagementPolling.current = true;
+      void api<{ session: ProjectManagementSession }>(
+        "/api/project-management/login/status",
+      )
+        .then(async (payload) => {
+          setProjectManagementSession(payload.session);
+          if (payload.session.authenticated) {
+            await loadProjectManagementProjects();
+          }
+        })
+        .catch((error) => {
+          setProjectManagementError(
+            error instanceof Error ? error.message : "扫码状态读取失败",
+          );
+        })
+        .finally(() => {
+          projectManagementPolling.current = false;
+        });
+    }, 1_500);
+    return () => window.clearInterval(timer);
+  }, [loadProjectManagementProjects, mode, projectManagementSession?.login]);
+
+  useEffect(() => {
+    if (
+      mode === "batch" &&
+      projectManagementSession?.authenticated &&
+      externalProjectId
+    ) {
+      const timer = window.setTimeout(() => void loadDefects(), 0);
+      return () => window.clearTimeout(timer);
+    }
+  }, [
+    externalProjectId,
+    loadDefects,
+    mode,
+    projectManagementSession?.authenticated,
+  ]);
+
+  const visibleDefects = useMemo(() => {
+    const query = defectSearch.trim().toLowerCase();
+    if (!query) return defects;
+    return defects.filter((defect) =>
+      `${defect.code || ""} ${defect.title} ${defect.content} ${defect.status || ""}`
+        .toLowerCase()
+        .includes(query),
     );
+  }, [defectSearch, defects]);
+
+  const selectableVisibleDefects = visibleDefects.filter(
+    (defect) => !defect.importedTask,
+  );
+  const allVisibleSelected =
+    selectableVisibleDefects.length > 0 &&
+    selectableVisibleDefects.every((defect) => selectedDefects.has(defect.id));
+
+  const openDefectDetail = async (defect: ProjectManagementDefect) => {
+    if (!project || !externalProjectId) return;
+    setDetailDefect(defect);
+    setDetailLoading(true);
+    setProjectManagementError("");
+    try {
+      const payload = await api<{ defect: ProjectManagementDefect }>(
+        `/api/project-management/defects/${encodeURIComponent(defect.id)}?relayProjectId=${encodeURIComponent(project.id)}&externalProjectId=${encodeURIComponent(externalProjectId)}`,
+      );
+      setDetailDefect(payload.defect);
+    } catch (error) {
+      const status = (error as { status?: number })?.status;
+      if (status === 401) {
+        setDetailDefect(null);
+        setProjectManagementSession({ authenticated: false, login: null });
+        await startProjectManagementLogin();
+      } else {
+        setProjectManagementError(
+          error instanceof Error ? error.message : "读取缺陷详情失败",
+        );
+      }
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!project) return;
+    if (mode === "single") {
+      if (!requirement.trim()) return;
+      await onSubmit(
+        {
+          projectId: project.id,
+          title: taskTitleFromContent(requirement),
+          requirement: requirement.trim(),
+          baseBranch: project.defaultBranch,
+          priority,
+          autoRelease,
+          codexModel,
+          codexReasoningEffort,
+          codexFastMode,
+          executionProfile,
+          idempotencyKey,
+        },
+        files,
+      );
+      return;
+    }
+    if (!externalProjectId || selectedDefects.size === 0) return;
+    setProjectManagementError("");
+    try {
+      const result = await onBatchSubmit(
+        {
+          projectId: project.id,
+          externalProjectId,
+          baseBranch: project.defaultBranch,
+          priority,
+          autoRelease,
+          codexModel,
+          codexReasoningEffort,
+          codexFastMode,
+          executionProfile,
+        },
+        [...selectedDefects].map((defectId) => ({
+          defectId,
+          extraPrompt: defectDrafts[defectId]?.extraPrompt || "",
+          files: defectDrafts[defectId]?.files || [],
+        })),
+      );
+      if (result.failed > 0) {
+        const failedMessages = result.results
+          .filter((item) => item.status === "failed")
+          .map(
+            (item) => item.error?.message || `缺陷 ${item.defectId} 创建失败`,
+          );
+        setProjectManagementError(failedMessages.join("；"));
+        await loadDefects();
+      }
+    } catch (error) {
+      const status = (error as { status?: number })?.status;
+      if (status === 401) {
+        setProjectManagementSession({ authenticated: false, login: null });
+        await startProjectManagementLogin();
+      } else {
+        setProjectManagementError(
+          error instanceof Error ? error.message : "批量创建任务失败",
+        );
+      }
+    }
   };
   return (
     <div
@@ -3970,7 +5818,10 @@ function CreateTaskModal({
     >
       <form
         ref={dialogRef}
-        className="modal task-create-modal"
+        className={cx(
+          "modal task-create-modal",
+          mode === "batch" && "batch-mode",
+        )}
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-task-title"
@@ -3980,9 +5831,37 @@ function CreateTaskModal({
         <div className="modal-head">
           <div>
             <span className="eyebrow">NEW PERSISTENT TASK</span>
+            <div
+              className="task-create-tabs"
+              role="tablist"
+              aria-label="任务创建方式"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === "single"}
+                className={mode === "single" ? "active" : undefined}
+                onClick={() => setMode("single")}
+              >
+                <FileText size={15} />
+                单独创建
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === "batch"}
+                className={mode === "batch" ? "active" : undefined}
+                onClick={() => setMode("batch")}
+              >
+                <ListChecks size={15} />
+                列表创建
+              </button>
+            </div>
             <h2 id="new-task-title">发起新任务</h2>
             <p id="new-task-description">
-              系统会创建专属分支、Codex 对话和第一个执行轮次。
+              {mode === "single"
+                ? "系统会创建专属分支、Codex 对话和第一个执行轮次。"
+                : "勾选项目管理缺陷；每个缺陷都会创建独立分支和执行任务。"}
             </p>
           </div>
           <IconButton label="关闭" type="button" onClick={onClose}>
@@ -3991,49 +5870,313 @@ function CreateTaskModal({
         </div>
         {projects.length ? (
           <>
-            <label className="form-field requirement-field">
-              <span>
-                任务内容
-                <small>可以直接 Ctrl+V 粘贴截图</small>
-              </span>
-              <textarea
-                autoFocus
-                value={requirement}
-                onChange={(event) => setRequirement(event.target.value)}
-                onPaste={pasteImages}
-                placeholder="直接描述需要完成的内容、复现步骤和验收标准；截图可以直接粘贴到这里…"
-                rows={9}
-              />
-            </label>
-            <div className="attachment-actions">
-              <label className="attachment-button">
-                <Paperclip size={17} />
-                添加图片或文件
-                <input
-                  type="file"
-                  multiple
-                  onChange={(event) => {
-                    addFiles(Array.from(event.target.files ?? []));
-                    event.currentTarget.value = "";
-                  }}
-                />
-              </label>
-              <span>支持图片、文本和日志；也可以在上方直接粘贴截图</span>
-            </div>
-            {files.length > 0 && (
-              <div className="attachment-list" aria-label="已添加的文件">
-                {files.map((file, index) => (
-                  <AttachmentChip
-                    key={`${file.name}:${file.size}:${file.lastModified}:${index}`}
-                    file={file}
-                    onRemove={() =>
-                      setFiles((current) =>
-                        current.filter((_, itemIndex) => itemIndex !== index),
-                      )
-                    }
+            {mode === "single" ? (
+              <>
+                <label className="form-field requirement-field">
+                  <span>
+                    任务内容
+                    <small>可以直接 Ctrl+V 粘贴截图</small>
+                  </span>
+                  <textarea
+                    autoFocus
+                    value={requirement}
+                    onChange={(event) => setRequirement(event.target.value)}
+                    onPaste={pasteImages}
+                    placeholder="直接描述需要完成的内容、复现步骤和验收标准；截图可以直接粘贴到这里…"
+                    rows={9}
                   />
-                ))}
-              </div>
+                </label>
+                <div className="attachment-actions">
+                  <label className="attachment-button">
+                    <Paperclip size={17} />
+                    添加图片或文件
+                    <input
+                      type="file"
+                      multiple
+                      onChange={(event) => {
+                        addFiles(Array.from(event.target.files ?? []));
+                        event.currentTarget.value = "";
+                      }}
+                    />
+                  </label>
+                  <span>支持图片、文本和日志；也可以在上方直接粘贴截图</span>
+                </div>
+                {files.length > 0 && (
+                  <div className="attachment-list" aria-label="已添加的文件">
+                    {files.map((file, index) => (
+                      <AttachmentChip
+                        key={`${file.name}:${file.size}:${file.lastModified}:${index}`}
+                        file={file}
+                        onRemove={() =>
+                          setFiles((current) =>
+                            current.filter(
+                              (_, itemIndex) => itemIndex !== index,
+                            ),
+                          )
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <section className="defect-picker" aria-label="项目管理缺陷列表">
+                {!projectManagementSession?.authenticated ? (
+                  <div className="project-management-login">
+                    <div className="project-management-login-icon">
+                      <ScanLine size={24} />
+                    </div>
+                    <div>
+                      <h3>扫码读取分配给我的缺陷</h3>
+                      <p>
+                        当前 Relay 用户：
+                        <strong>
+                          {projectManagementSession?.relayUserName ||
+                            "未记录用户"}
+                        </strong>
+                        。使用轻羽 APP 扫码后只绑定到该用户，不会修改原单状态。
+                      </p>
+                    </div>
+                    {projectManagementSession?.login?.qrContent ? (
+                      <div className="project-management-qr">
+                        <QRCodeSVG
+                          value={projectManagementSession.login.qrContent}
+                          size={184}
+                          level="M"
+                          marginSize={2}
+                        />
+                        <strong>
+                          {projectManagementSession.login.status === "scanned"
+                            ? "已扫码，请在手机确认"
+                            : ["expired", "cancelled"].includes(
+                                  projectManagementSession.login.status,
+                                )
+                              ? "二维码已失效"
+                              : "二维码有效期 5 分钟"}
+                        </strong>
+                        {["expired", "cancelled", "error"].includes(
+                          projectManagementSession.login.status,
+                        ) && (
+                          <button
+                            type="button"
+                            className="secondary-action"
+                            onClick={() => void startProjectManagementLogin()}
+                            disabled={projectManagementLoginBusy}
+                          >
+                            <RefreshCw size={15} />
+                            重新生成
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="primary-action"
+                        onClick={() => void startProjectManagementLogin()}
+                        disabled={projectManagementLoginBusy}
+                      >
+                        {projectManagementLoginBusy ? (
+                          <LoaderCircle className="spin" size={16} />
+                        ) : (
+                          <ScanLine size={16} />
+                        )}
+                        生成登录二维码
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    <div className="defect-picker-toolbar">
+                      <div className="defect-picker-account">
+                        <span className="status-dot healthy" />
+                        <div>
+                          <strong>
+                            {projectManagementSession.user?.name || "已登录"}
+                          </strong>
+                          <small>
+                            绑定 Relay：
+                            {projectManagementSession.relayUserName ||
+                              "未记录用户"}
+                            · 只显示分配给我的未结束缺陷
+                          </small>
+                        </div>
+                      </div>
+                      {projectManagementProjects.length > 1 && (
+                        <label className="defect-project-select">
+                          <span>项目</span>
+                          <select
+                            value={externalProjectId}
+                            onChange={(event) => {
+                              setExternalProjectId(event.target.value);
+                              setSelectedDefects(new Set());
+                            }}
+                          >
+                            <option value="">请选择项目</option>
+                            {projectManagementProjects.map((item) => (
+                              <option key={item.id} value={item.id}>
+                                {item.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      <label className="defect-search">
+                        <Search size={15} />
+                        <input
+                          value={defectSearch}
+                          onChange={(event) =>
+                            setDefectSearch(event.target.value)
+                          }
+                          placeholder="搜索编号、标题或内容"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label="刷新缺陷列表"
+                        onClick={() => void loadDefects()}
+                        disabled={
+                          projectManagementLoading || !externalProjectId
+                        }
+                      >
+                        <RefreshCw
+                          className={
+                            projectManagementLoading ? "spin" : undefined
+                          }
+                          size={16}
+                        />
+                      </button>
+                    </div>
+                    <div className="defect-picker-summary">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={allVisibleSelected}
+                          onChange={(event) => {
+                            const next = new Set(selectedDefects);
+                            for (const defect of selectableVisibleDefects) {
+                              if (event.target.checked) next.add(defect.id);
+                              else next.delete(defect.id);
+                            }
+                            setSelectedDefects(next);
+                          }}
+                          disabled={!selectableVisibleDefects.length}
+                        />
+                        选择当前列表
+                      </label>
+                      <span>
+                        已选 <strong>{selectedDefects.size}</strong> 个 · 共读取{" "}
+                        {defectTotal} 个
+                      </span>
+                    </div>
+                    <div
+                      className="defect-list"
+                      aria-busy={projectManagementLoading}
+                    >
+                      {projectManagementLoading && defects.length === 0 ? (
+                        <div className="defect-list-state">
+                          <LoaderCircle className="spin" size={22} />
+                          正在读取缺陷列表…
+                        </div>
+                      ) : visibleDefects.length === 0 ? (
+                        <div className="defect-list-state">
+                          <Inbox size={24} />
+                          {externalProjectId
+                            ? "没有找到分配给你的缺陷"
+                            : "请先选择项目"}
+                        </div>
+                      ) : (
+                        visibleDefects.map((defect) => {
+                          const draft = defectDrafts[defect.id];
+                          const selected = selectedDefects.has(defect.id);
+                          return (
+                            <article
+                              key={defect.id}
+                              className={cx(
+                                "defect-card",
+                                selected && "selected",
+                                defect.importedTask && "imported",
+                              )}
+                            >
+                              <label className="defect-checkbox">
+                                <input
+                                  type="checkbox"
+                                  checked={selected}
+                                  disabled={Boolean(defect.importedTask)}
+                                  onChange={(event) => {
+                                    const next = new Set(selectedDefects);
+                                    if (event.target.checked)
+                                      next.add(defect.id);
+                                    else next.delete(defect.id);
+                                    setSelectedDefects(next);
+                                  }}
+                                />
+                                <span />
+                              </label>
+                              <button
+                                type="button"
+                                className="defect-card-main"
+                                onClick={() => void openDefectDetail(defect)}
+                              >
+                                <span className="defect-card-copy">
+                                  <span className="defect-card-title-row">
+                                    {defect.code && <code>{defect.code}</code>}
+                                    <strong>{defect.title}</strong>
+                                  </span>
+                                  <span className="defect-card-content">
+                                    {defect.content}
+                                  </span>
+                                  <span className="defect-card-meta">
+                                    {defect.status && (
+                                      <span>{defect.status}</span>
+                                    )}
+                                    {defect.priority && (
+                                      <span>{defect.priority}</span>
+                                    )}
+                                    {defect.severity && (
+                                      <span>{defect.severity}</span>
+                                    )}
+                                    {(draft?.extraPrompt ||
+                                      draft?.files.length) && (
+                                      <span className="supplemented">
+                                        已补充提示词/图片
+                                      </span>
+                                    )}
+                                    {defect.importedTask && (
+                                      <span className="already-imported">
+                                        已创建 TK-
+                                        {String(
+                                          defect.importedTask.number,
+                                        ).padStart(4, "0")}
+                                      </span>
+                                    )}
+                                  </span>
+                                </span>
+                                <DefectThumbnail
+                                  key={defect.images.join("\u001f")}
+                                  imageUrls={defect.images}
+                                />
+                                <ChevronRight size={17} />
+                              </button>
+                            </article>
+                          );
+                        })
+                      )}
+                    </div>
+                  </>
+                )}
+                {projectManagementError && (
+                  <div className="defect-picker-error" role="alert">
+                    <AlertTriangle size={16} />
+                    <span>{projectManagementError}</span>
+                    {projectManagementSession?.authenticated && (
+                      <button type="button" onClick={() => void loadDefects()}>
+                        重试
+                      </button>
+                    )}
+                  </div>
+                )}
+              </section>
             )}
             <section
               className="codex-task-settings"
@@ -4045,10 +6188,23 @@ function CreateTaskModal({
                 </span>
                 <div>
                   <h3 id="codex-task-settings-title">Codex 配置</h3>
-                  <p>该任务后续追加轮次会继续使用这里的选择。</p>
+                  <p>模型设置沿用到后续轮次；执行路线可在每一轮单独调整。</p>
                 </div>
               </div>
               <div className="codex-task-settings-grid">
+                <StyledSelect
+                  label="首轮执行路线"
+                  value={executionProfile}
+                  options={EXECUTION_PROFILE_OPTIONS}
+                  description={
+                    EXECUTION_PROFILE_OPTIONS.find(
+                      (option) => option.value === executionProfile,
+                    )?.detail
+                  }
+                  onChange={(value) =>
+                    setExecutionProfile(value as ExecutionProfile)
+                  }
+                />
                 <StyledSelect
                   label="模型"
                   value={codexModel}
@@ -4155,7 +6311,9 @@ function CreateTaskModal({
             <div className="modal-actions">
               <span>
                 <ShieldCheck size={14} />
-                需求文本不会进入 PowerShell 命令
+                {mode === "single"
+                  ? "需求文本不会进入 PowerShell 命令"
+                  : `每个缺陷独立创建任务 · 已选 ${selectedDefects.size} 个`}
               </span>
               <button
                 type="button"
@@ -4166,14 +6324,21 @@ function CreateTaskModal({
               </button>
               <button
                 className="primary-action"
-                disabled={busy || !requirement.trim()}
+                disabled={
+                  busy ||
+                  (mode === "single"
+                    ? !requirement.trim()
+                    : !externalProjectId || selectedDefects.size === 0)
+                }
               >
                 {busy ? (
                   <LoaderCircle className="spin" size={17} />
                 ) : (
                   <ArrowRight size={17} />
                 )}
-                加入执行队列
+                {mode === "single"
+                  ? "加入执行队列"
+                  : `一键批量开始${selectedDefects.size ? `（${selectedDefects.size}）` : ""}`}
               </button>
             </div>
           </>
@@ -4183,6 +6348,171 @@ function CreateTaskModal({
             title="请先添加项目环境"
             description="至少需要一个已启用项目，才能创建任务。"
           />
+        )}
+        {detailDefect && (
+          <div
+            className="defect-detail-backdrop"
+            onMouseDown={(event) =>
+              event.target === event.currentTarget && setDetailDefect(null)
+            }
+          >
+            <section
+              className="defect-detail-panel"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="defect-detail-title"
+            >
+              <div className="defect-detail-head">
+                <div>
+                  <span>{detailDefect.code || `缺陷 ${detailDefect.id}`}</span>
+                  <h3 id="defect-detail-title">{detailDefect.title}</h3>
+                </div>
+                <IconButton
+                  type="button"
+                  label="关闭缺陷详情"
+                  onClick={() => setDetailDefect(null)}
+                >
+                  <X size={18} />
+                </IconButton>
+              </div>
+              <div className="defect-detail-scroll">
+                {detailLoading && (
+                  <div className="defect-detail-loading">
+                    <LoaderCircle className="spin" size={18} />
+                    正在读取完整信息…
+                  </div>
+                )}
+                <dl className="defect-detail-facts">
+                  <div>
+                    <dt>状态</dt>
+                    <dd>{detailDefect.status || "未填写"}</dd>
+                  </div>
+                  <div>
+                    <dt>优先级</dt>
+                    <dd>{detailDefect.priority || "未填写"}</dd>
+                  </div>
+                  <div>
+                    <dt>严重程度</dt>
+                    <dd>{detailDefect.severity || "未填写"}</dd>
+                  </div>
+                  <div>
+                    <dt>负责人</dt>
+                    <dd>{detailDefect.assignee || "未填写"}</dd>
+                  </div>
+                </dl>
+                <div className="defect-detail-content">
+                  <div>
+                    <h4>完整缺陷内容</h4>
+                    <a href={detailDefect.url} target="_blank" rel="noreferrer">
+                      打开原始缺陷
+                      <ExternalLink size={13} />
+                    </a>
+                  </div>
+                  <p>{detailDefect.content}</p>
+                </div>
+                <DefectImageGallery
+                  key={detailDefect.images.join("\u001f")}
+                  imageUrls={detailDefect.images}
+                />
+                {!detailDefect.importedTask && (
+                  <div className="defect-supplement">
+                    <div>
+                      <h4>补充给 Codex 的信息</h4>
+                      <p>只会附加到这一个缺陷任务，可继续粘贴截图。</p>
+                    </div>
+                    <textarea
+                      value={defectDrafts[detailDefect.id]?.extraPrompt || ""}
+                      onChange={(event) =>
+                        updateDefectDraft(detailDefect.id, (current) => ({
+                          ...current,
+                          extraPrompt: event.target.value,
+                        }))
+                      }
+                      onPaste={(event) => {
+                        const images = clipboardImages(event);
+                        if (!images.length) return;
+                        updateDefectDraft(detailDefect.id, (current) => ({
+                          ...current,
+                          files: mergeUniqueFiles(current.files, images),
+                        }));
+                      }}
+                      rows={5}
+                      placeholder="补充复现条件、期望效果、技术方向或验收标准…"
+                    />
+                    <div className="attachment-actions">
+                      <label className="attachment-button">
+                        <ImagePlus size={17} />
+                        补充图片或文件
+                        <input
+                          type="file"
+                          multiple
+                          onChange={(event) => {
+                            const incoming = Array.from(
+                              event.target.files ?? [],
+                            );
+                            updateDefectDraft(detailDefect.id, (current) => ({
+                              ...current,
+                              files: mergeUniqueFiles(current.files, incoming),
+                            }));
+                            event.currentTarget.value = "";
+                          }}
+                        />
+                      </label>
+                      <span>也可以在上面的输入框直接粘贴截图</span>
+                    </div>
+                    {(defectDrafts[detailDefect.id]?.files.length ?? 0) > 0 && (
+                      <div className="attachment-list">
+                        {defectDrafts[detailDefect.id].files.map(
+                          (file, index) => (
+                            <AttachmentChip
+                              key={`${file.name}:${file.size}:${file.lastModified}:${index}`}
+                              file={file}
+                              onRemove={() =>
+                                updateDefectDraft(
+                                  detailDefect.id,
+                                  (current) => ({
+                                    ...current,
+                                    files: current.files.filter(
+                                      (_, itemIndex) => itemIndex !== index,
+                                    ),
+                                  }),
+                                )
+                              }
+                            />
+                          ),
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div className="defect-detail-actions">
+                {!detailDefect.importedTask && (
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={selectedDefects.has(detailDefect.id)}
+                      onChange={(event) => {
+                        const next = new Set(selectedDefects);
+                        if (event.target.checked) next.add(detailDefect.id);
+                        else next.delete(detailDefect.id);
+                        setSelectedDefects(next);
+                      }}
+                    />
+                    加入本次批量任务
+                  </label>
+                )}
+                <button
+                  type="button"
+                  className="primary-action"
+                  onClick={() => setDetailDefect(null)}
+                >
+                  <Check size={16} />
+                  完成
+                </button>
+              </div>
+            </section>
+          </div>
         )}
       </form>
     </div>

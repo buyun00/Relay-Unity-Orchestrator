@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$TaskBranch,
     [string]$ExpectedHead,
     [AllowNull()][string]$AuditedFilesJson,
+    [ValidateNotNullOrEmpty()][string]$ApprovedOverlayPathsJson = '[]',
     [ValidateRange(10, 300)][int]$TimeoutSeconds = 90
 )
 
@@ -74,13 +75,14 @@ $normalizedAuditedFilesJson = ConvertTo-Json `
 # A nested array inside an array expression is enumerated by Windows
 # PowerShell. Populate fixed slots so the normalized JSON remains exactly one
 # PowerShell Direct argument for empty, single-file, and multi-file audits.
-$argumentList = New-Object object[] 6
+$argumentList = New-Object object[] 7
 $argumentList[0] = $GuestProjectPath
 $argumentList[1] = $TaskBranch
 $argumentList[2] = $ExpectedHead
 $argumentList[3] = $normalizedAuditedFilesJson
-$argumentList[4] = $helperSource
-$argumentList[5] = $guestSource
+$argumentList[4] = $ApprovedOverlayPathsJson
+$argumentList[5] = $helperSource
+$argumentList[6] = $guestSource
 $remoteOutput = @(
     Invoke-RelayPowerShellDirect -VMName $VMName -Credential $credential -Stage 'powershell-direct-workspace-verification' -TimeoutSeconds $TimeoutSeconds `
         -ArgumentList $argumentList `
@@ -90,11 +92,13 @@ $remoteOutput = @(
                 $ExpectedBranch,
                 $ExpectedHead,
                 $AuditedFilesJson,
+                $ApprovedOverlaysJson,
                 $HelperSource,
                 $GuestSource
             )
             $ErrorActionPreference = 'Stop'
             Set-StrictMode -Version Latest
+            $env:RELAY_APPROVED_OVERLAY_PATHS_JSON = $ApprovedOverlaysJson
             . ([scriptblock]::Create($HelperSource))
             & ([scriptblock]::Create($GuestSource)) `
                 -ProjectPath $ProjectPath `

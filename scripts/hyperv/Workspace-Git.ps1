@@ -34,12 +34,55 @@ function ConvertTo-RelayNativeArgument {
     return $quoted.ToString()
 }
 
+function Stop-RelayOwnedChildProcesses {
+    param([Parameter(Mandatory = $true)][int]$RootProcessId)
+
+    # Process.Kill() in Windows PowerShell/.NET Framework terminates only the
+    # direct Git process. Helpers such as git-remote-http can otherwise keep
+    # redirected pipe handles open long after the timeout. Snapshot descendants
+    # from this exact root and terminate them deepest-first; never sweep by name.
+    $processSnapshot = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Select-Object ProcessId, ParentProcessId
+    )
+    $ownedIds = New-Object System.Collections.Generic.List[int]
+    $pending = New-Object System.Collections.Generic.Queue[int]
+    $pending.Enqueue($RootProcessId)
+    while ($pending.Count -gt 0) {
+        $parentId = $pending.Dequeue()
+        foreach ($child in @($processSnapshot | Where-Object {
+            [int]$_.ParentProcessId -eq $parentId
+        })) {
+            $childId = [int]$child.ProcessId
+            $ownedIds.Add($childId)
+            $pending.Enqueue($childId)
+        }
+    }
+    $orderedIds = @($ownedIds.ToArray())
+    [Array]::Reverse($orderedIds)
+    foreach ($ownedId in $orderedIds) {
+        try {
+            $ownedProcess = [System.Diagnostics.Process]::GetProcessById($ownedId)
+            try {
+                if (-not $ownedProcess.HasExited) {
+                    $ownedProcess.Kill()
+                    [void]$ownedProcess.WaitForExit(5000)
+                }
+            } finally {
+                $ownedProcess.Dispose()
+            }
+        } catch {
+            # A descendant may exit between the snapshot and termination.
+        }
+    }
+}
+
 function Invoke-RelayGitProcess {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [hashtable]$Environment = @{},
-        [ValidateRange(1, 300)][int]$TimeoutSeconds = 60,
+        [ValidateRange(1, 1200)][int]$TimeoutSeconds = 60,
         [string]$Stage = ''
     )
 
@@ -90,6 +133,7 @@ function Invoke-RelayGitProcess {
         $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderr)
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $timedOut = $true
+            Stop-RelayOwnedChildProcesses -RootProcessId $process.Id
             try {
                 # This Process instance owns exactly this Git child. Do not use
                 # a name-based process sweep or unrelated process tree.
@@ -97,11 +141,20 @@ function Invoke-RelayGitProcess {
             } catch {
                 # Preserve the original timeout as the primary diagnostic.
             }
-            $process.WaitForExit()
+            [void]$process.WaitForExit(5000)
         }
-        [System.Threading.Tasks.Task]::WaitAll(
-            [System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
-        )
+        $streamTasks = [System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+        $streamsDrained = [System.Threading.Tasks.Task]::WaitAll($streamTasks, 5000)
+        if (-not $streamsDrained) {
+            # Do not let inherited pipe handles defeat the process timeout.
+            try { $process.StandardOutput.Close() } catch {}
+            try { $process.StandardError.Close() } catch {}
+            try {
+                [void][System.Threading.Tasks.Task]::WaitAll($streamTasks, 1000)
+            } catch {
+                # Partial output already captured remains useful diagnostics.
+            }
+        }
         if ($process.HasExited) {
             $exitCode = $process.ExitCode
         }
@@ -166,7 +219,7 @@ function Test-RelayTransientGitFailure {
 
     if ([bool]$Result.timedOut) { return $true }
     $diagnostic = ([string]$Result.stderr + [Environment]::NewLine + [string]$Result.stdout)
-    return $diagnostic -match '(?im)(?:curl\s+18|transfer closed with outstanding read data|early EOF|unexpected disconnect|invalid index-pack output|connection (?:was )?reset|connection reset by peer|operation timed out|low speed|less than \d+ bytes/sec transferred)'
+    return $diagnostic -match '(?im)(?:curl\s+18|transfer closed with outstanding read data|early EOF|unexpected disconnect|invalid index-pack output|connection (?:was )?reset|connection reset by peer|could not resolve host|temporary failure in name resolution|operation timed out|low speed|less than \d+ bytes/sec transferred)'
 }
 
 function Invoke-RelayGitWithRetry {
@@ -175,7 +228,7 @@ function Invoke-RelayGitWithRetry {
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$Stage,
         [hashtable]$Environment = @{},
-        [ValidateRange(1, 300)][int]$TimeoutSeconds = 60,
+        [ValidateRange(1, 1200)][int]$TimeoutSeconds = 60,
         [ValidateRange(1, 3)][int]$MaximumAttempts = 3,
         [ValidateRange(0, 10000)][int]$InitialBackoffMilliseconds = 1000,
         [scriptblock]$ProcessInvoker,
@@ -230,7 +283,7 @@ function Invoke-RelayGit {
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [hashtable]$Environment = @{},
-        [ValidateRange(1, 300)][int]$TimeoutSeconds = 60,
+        [ValidateRange(1, 1200)][int]$TimeoutSeconds = 60,
         [string]$Stage = ''
     )
 
@@ -372,6 +425,12 @@ function Get-RelayWorkspaceStatus {
     foreach ($entry in $entries) {
         [void]$knownPaths.Add((ConvertTo-RelayGitPath ([string]$entry.path)))
     }
+    $approvedOverlayPaths = New-Object `
+        'System.Collections.Generic.HashSet[string]' `
+        ([System.StringComparer]::Ordinal)
+    foreach ($approvedPath in @(Get-RelayApprovedOverlayPaths $RepositoryPath)) {
+        [void]$approvedOverlayPaths.Add($approvedPath)
+    }
     $head = Get-RelayGitValue $RepositoryPath @('rev-parse', '--verify', 'HEAD')
     $literalPathEnvironment = @{ GIT_LITERAL_PATHSPECS = '1' }
     foreach ($skipPath in @(Get-RelaySkipWorktreePaths $RepositoryPath)) {
@@ -389,6 +448,11 @@ function Get-RelayWorkspaceStatus {
         }
         $worktreeBlob = Get-RelayPathBlob $RepositoryPath $skipPath
         if ($worktreeBlob -eq $headBlobs[0]) { continue }
+        # A local infrastructure overlay is excluded only when an administrator
+        # explicitly records its exact repository-relative path and the index
+        # still marks it skip-worktree. Ordinary skip-worktree drift remains
+        # visible and fail-closed.
+        if ($approvedOverlayPaths.Contains($skipPath)) { continue }
         $entries.Add([pscustomobject]@{
             code = ' M'
             path = $skipPath
@@ -396,6 +460,50 @@ function Get-RelayWorkspaceStatus {
         })
     }
     return $entries.ToArray()
+}
+
+function Get-RelayApprovedOverlayPaths {
+    param([Parameter(Mandatory = $true)][string]$RepositoryPath)
+
+    $paths = New-Object `
+        'System.Collections.Generic.HashSet[string]' `
+        ([System.StringComparer]::Ordinal)
+    $result = Invoke-RelayGitProcess $RepositoryPath @(
+        'config', '--local', '--get-all', 'relay.approvedOverlayPath'
+    )
+    if ($result.exitCode -notin @(0, 1) -or $result.timedOut) {
+        throw (New-RelayGitFailure $result @(
+            'config', '--local', '--get-all', 'relay.approvedOverlayPath'
+        ))
+    }
+    if ($result.exitCode -eq 0) {
+        foreach ($line in @($result.stdout -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            [void]$paths.Add((ConvertTo-RelayGitPath $line))
+        }
+    }
+
+    $configuredJson = [Environment]::GetEnvironmentVariable(
+        'RELAY_APPROVED_OVERLAY_PATHS_JSON',
+        [EnvironmentVariableTarget]::Process
+    )
+    if (-not [string]::IsNullOrWhiteSpace($configuredJson)) {
+        try {
+            $configured = $configuredJson | ConvertFrom-Json
+        } catch {
+            throw "RELAY_APPROVED_OVERLAY_PATHS_JSON was not valid JSON: $($_.Exception.Message)"
+        }
+        if ($null -ne $configured -and $configured -is [string]) {
+            throw 'RELAY_APPROVED_OVERLAY_PATHS_JSON must contain a JSON array of repository-relative paths.'
+        }
+        foreach ($configuredPath in @($configured)) {
+            if ($configuredPath -isnot [string] -or [string]::IsNullOrWhiteSpace($configuredPath)) {
+                throw 'RELAY_APPROVED_OVERLAY_PATHS_JSON must contain only non-empty string paths.'
+            }
+            [void]$paths.Add((ConvertTo-RelayGitPath $configuredPath))
+        }
+    }
+    return @($paths | Sort-Object)
 }
 
 function Get-RelaySkipWorktreePaths {

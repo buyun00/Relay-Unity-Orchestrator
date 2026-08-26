@@ -26,6 +26,22 @@ function integerList(value, fallback) {
   return parsed.length ? parsed : fallback;
 }
 
+function hourList(value, fallback) {
+  const parsed = String(value || "")
+    .split(",")
+    .map((item) => Number.parseInt(item.trim(), 10))
+    .filter((item) => Number.isInteger(item) && item >= 0 && item <= 23);
+  return parsed.length ? [...new Set(parsed)].sort((a, b) => a - b) : fallback;
+}
+
+function stringList(value, fallback = []) {
+  const parsed = String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return parsed.length ? parsed : fallback;
+}
+
 const requestedAdapter = (
   process.env.PIPELINE_ADAPTER || "hyperv"
 ).toLowerCase();
@@ -39,6 +55,10 @@ const adapter = "hyperv";
 const dataDirectory = path.resolve(
   process.env.PIPELINE_DATA_DIR || path.join(projectRoot, ".pipeline-data"),
 );
+const logDirectory = path.join(dataDirectory, "logs");
+const auditLogDirectory = path.resolve(
+  process.env.PIPELINE_AUDIT_LOG_DIR || path.join(logDirectory, "daily-audit"),
+);
 
 export const config = Object.freeze({
   version: "0.3.2",
@@ -47,7 +67,11 @@ export const config = Object.freeze({
   dataDirectory,
   databasePath: path.join(dataDirectory, "pipeline.sqlite"),
   uploadDirectory: path.join(dataDirectory, "uploads"),
-  logDirectory: path.join(dataDirectory, "logs"),
+  logDirectory,
+  auditLogEnabled: boolean(process.env.PIPELINE_AUDIT_LOG_ENABLED, true),
+  auditLogDirectory,
+  auditLogTimeZone:
+    process.env.PIPELINE_AUDIT_LOG_TIME_ZONE?.trim() || "Asia/Shanghai",
   // Listen on every interface by default so devices on the local network can
   // reach the control API through the host machine's LAN address.
   host: process.env.PIPELINE_HOST || "0.0.0.0",
@@ -61,12 +85,64 @@ export const config = Object.freeze({
     integer(process.env.PIPELINE_BODY_LIMIT_MB, 2) * 1024 * 1024,
   uploadLimitBytes:
     integer(process.env.PIPELINE_UPLOAD_LIMIT_MB, 25) * 1024 * 1024,
+  projectManagementEnabled: boolean(
+    process.env.PIPELINE_PROJECT_MANAGEMENT_ENABLED,
+    true,
+  ),
+  projectManagementBaseUrl:
+    process.env.PIPELINE_PROJECT_MANAGEMENT_BASE_URL?.trim() ||
+    "https://50qweb.jiaxianghudong.com",
+  projectManagementTimeoutMs: integer(
+    process.env.PIPELINE_PROJECT_MANAGEMENT_TIMEOUT_MS,
+    10_000,
+  ),
+  projectManagementSessionTtlMs:
+    integer(process.env.PIPELINE_PROJECT_MANAGEMENT_SESSION_HOURS, 12) *
+    60 *
+    60 *
+    1000,
+  projectManagementSessionStatePath: path.resolve(
+    process.env.PIPELINE_PROJECT_MANAGEMENT_SESSION_STATE_PATH?.trim() ||
+      path.join(dataDirectory, "project-management-sessions.dpapi.json"),
+  ),
+  projectManagementSessionProtectionScript: path.join(
+    projectRoot,
+    "scripts",
+    "Protect-ProjectManagementSessions.ps1",
+  ),
+  gitlabBaseUrl:
+    process.env.PIPELINE_GITLAB_BASE_URL?.trim() || "http://git.dominogm.com",
+  gitlabTokenFile: process.env.PIPELINE_GITLAB_TOKEN_FILE?.trim() || null,
+  gitlabTimeoutMs: integer(process.env.PIPELINE_GITLAB_TIMEOUT_MS, 15_000),
   schedulerIntervalMs: integer(
     process.env.PIPELINE_SCHEDULER_INTERVAL_MS,
     1_500,
   ),
   healthIntervalMs: integer(process.env.PIPELINE_HEALTH_INTERVAL_MS, 30_000),
   checkpointsEnabled: boolean(process.env.PIPELINE_CHECKPOINTS_ENABLED, false),
+  checkpointMaintenanceEnabled: boolean(
+    process.env.PIPELINE_CHECKPOINT_MAINTENANCE_ENABLED,
+    false,
+  ),
+  checkpointMaintenanceHours: hourList(
+    process.env.PIPELINE_CHECKPOINT_MAINTENANCE_HOURS,
+    [5, 6, 7],
+  ),
+  checkpointMaintenanceTimeZone:
+    process.env.PIPELINE_CHECKPOINT_MAINTENANCE_TIME_ZONE?.trim() ||
+    "Asia/Shanghai",
+  checkpointMaintenanceScanIntervalMs: integer(
+    process.env.PIPELINE_CHECKPOINT_MAINTENANCE_SCAN_INTERVAL_MS,
+    30_000,
+  ),
+  checkpointMaintenanceStatePath: path.join(
+    dataDirectory,
+    "checkpoint-maintenance.json",
+  ),
+  checkpointRetentionCount: Math.max(
+    2,
+    integer(process.env.PIPELINE_CHECKPOINT_RETENTION_COUNT, 2),
+  ),
   allowUnitySaveSkip: boolean(
     process.env.PIPELINE_ALLOW_UNITY_SAVE_SKIP,
     false,
@@ -87,6 +163,7 @@ export const config = Object.freeze({
   gitAuthorEmail:
     process.env.PIPELINE_GIT_AUTHOR_EMAIL?.trim() ||
     "relay-unity-orchestrator@localhost",
+  approvedOverlayPaths: stringList(process.env.PIPELINE_APPROVED_OVERLAY_PATHS),
   ozdqpBuildEnabled: boolean(process.env.OZDQP_BUILD_ENABLED, true),
   ozdqpBuildApiUrl:
     process.env.OZDQP_BUILD_API_URL?.trim() ||
@@ -99,6 +176,14 @@ export const config = Object.freeze({
   ozdqpBuildPollIntervalMs: integer(
     process.env.OZDQP_BUILD_POLL_INTERVAL_MS,
     1_000,
+  ),
+  ozdqpBuildStatusPollIntervalMs: integer(
+    process.env.OZDQP_BUILD_STATUS_POLL_INTERVAL_MS,
+    5_000,
+  ),
+  ozdqpBuildFailedStatusPollIntervalMs: integer(
+    process.env.OZDQP_BUILD_FAILED_STATUS_POLL_INTERVAL_MS,
+    30_000,
   ),
   ozdqpBuildRetryScheduleMs: integerList(
     process.env.OZDQP_BUILD_RETRY_SCHEDULE_MS,
@@ -118,15 +203,30 @@ export const config = Object.freeze({
     process.env.PIPELINE_OPS_MAX_CONCURRENT_SESSIONS,
     4,
   ),
-  opsCodexModel:
-    process.env.PIPELINE_OPS_CODEX_MODEL?.trim() ||
-    process.env.PIPELINE_CODEX_MODEL?.trim() ||
-    DEFAULT_CODEX_MODEL,
+  opsSupervisorIntervalMs: integer(
+    process.env.PIPELINE_OPS_SUPERVISOR_INTERVAL_MS,
+    5 * 60 * 1000,
+  ),
+  opsCodexModel: process.env.PIPELINE_OPS_CODEX_MODEL?.trim() || "gpt-5.6-luna",
   opsCodexReasoningEffort:
-    process.env.PIPELINE_OPS_CODEX_REASONING_EFFORT?.trim() ||
-    process.env.PIPELINE_CODEX_REASONING_EFFORT?.trim() ||
-    DEFAULT_CODEX_REASONING_EFFORT,
+    process.env.PIPELINE_OPS_CODEX_REASONING_EFFORT?.trim() || "max",
   opsCodexFastMode: boolean(process.env.PIPELINE_OPS_CODEX_FAST_MODE, false),
+  opsRepairCodexModel:
+    process.env.PIPELINE_OPS_REPAIR_CODEX_MODEL?.trim() || "gpt-5.6-sol",
+  opsRepairCodexReasoningEffort:
+    process.env.PIPELINE_OPS_REPAIR_CODEX_REASONING_EFFORT?.trim() || "xhigh",
+  opsRepairCodexFastMode: boolean(
+    process.env.PIPELINE_OPS_REPAIR_CODEX_FAST_MODE,
+    false,
+  ),
+  opsRepairCodexTimeoutMs:
+    integer(process.env.PIPELINE_OPS_REPAIR_CODEX_TIMEOUT_MINUTES, 0) *
+    60 *
+    1000,
+  opsRepairTaskStartWaitMs: integer(
+    process.env.PIPELINE_OPS_REPAIR_TASK_START_WAIT_MS,
+    120_000,
+  ),
   repairDirectory: path.join(dataDirectory, "repairs"),
   deploymentStatePath: path.join(dataDirectory, "deployment-state.json"),
   guardianEnabled: boolean(process.env.PIPELINE_GUARDIAN_ENABLED, true),

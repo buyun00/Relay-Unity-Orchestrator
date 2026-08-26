@@ -535,21 +535,33 @@ export class HyperVAdapter {
           cause: error,
         });
       }
-      const parsedError = String(error?.stdout || "").trim()
-        ? parseJsonRecord(String(error.stdout).trim()).error
-        : null;
+      const parsedFailure = String(error?.stdout || "").trim()
+        ? parseJsonRecord(String(error.stdout).trim())
+        : { value: null, error: null };
+      const parsedError = parsedFailure.error;
       const transport = transportRecord(error, { parseError: parsedError });
       error.operation = scriptName;
-      error.code =
-        error.code === "PROCESS_START_FAILED"
+      const checkpointFailure =
+        scriptName === "Update-ProjectReadyCheckpoint.ps1" &&
+        parsedFailure.value?.code === "CHECKPOINT_WORKSPACE_DIRTY" &&
+        parsedFailure.value?.checkpointDirty
+          ? parsedFailure.value
+          : null;
+      error.code = checkpointFailure
+        ? checkpointFailure.code
+        : error.code === "PROCESS_START_FAILED"
           ? "POWERSHELL_NOT_AVAILABLE"
           : responseContract === "recovery-proof"
             ? "RECOVERY_COMMAND_FAILED"
             : "HYPERV_COMMAND_FAILED";
+      if (checkpointFailure) {
+        error.message = checkpointFailure.message;
+      }
       Object.assign(error, transport);
       error.details = {
         ...(error.details || {}),
         transport,
+        ...(checkpointFailure ? { checkpointFailure } : {}),
       };
       throw error;
     }
@@ -574,6 +586,14 @@ export class HyperVAdapter {
       result.CredentialPath = worker.credentialPath;
     }
     return result;
+  }
+
+  workspaceAuditArguments() {
+    return {
+      ApprovedOverlayPathsJson: JSON.stringify(
+        this.config.approvedOverlayPaths || [],
+      ),
+    };
   }
 
   async initialize() {
@@ -686,6 +706,7 @@ export class HyperVAdapter {
       "Prepare-Workspace.ps1",
       {
         ...this.workerArguments(context.worker),
+        ...this.workspaceAuditArguments(),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
@@ -724,6 +745,7 @@ export class HyperVAdapter {
         "Inspect-PreservedWorkspace.ps1",
         {
           ...this.workerArguments(context.worker),
+          ...this.workspaceAuditArguments(),
           GuestProjectPath: required(
             context.project.guestProjectPath,
             "project.guestProjectPath",
@@ -817,6 +839,7 @@ export class HyperVAdapter {
       "Prepare-Workspace.ps1",
       {
         ...this.workerArguments(context.worker),
+        ...this.workspaceAuditArguments(),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
@@ -861,6 +884,7 @@ export class HyperVAdapter {
       "Verify-PreservedWorkspace.ps1",
       {
         ...this.workerArguments(context.worker),
+        ...this.workspaceAuditArguments(),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
@@ -957,6 +981,7 @@ export class HyperVAdapter {
       "Recover-Workspace.ps1",
       {
         ...this.workerArguments(context.worker),
+        ...this.workspaceAuditArguments(),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
@@ -1083,6 +1108,7 @@ export class HyperVAdapter {
       "Get-DeliveryWorkspaceAudit.ps1",
       {
         ...this.workerArguments(context.worker),
+        ...this.workspaceAuditArguments(),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
@@ -1128,6 +1154,7 @@ export class HyperVAdapter {
       "Get-DeliveryWorkspaceAudit.ps1",
       {
         ...this.workerArguments(context.worker),
+        ...this.workspaceAuditArguments(),
         GuestProjectPath: required(
           context.project.guestProjectPath,
           "project.guestProjectPath",
@@ -1237,10 +1264,10 @@ export class HyperVAdapter {
         ),
         TaskBranch: required(context.task.branchName, "task.branchName"),
         CommitMessage: `task #${context.task.number} turn ${context.turn.sequence}: ${context.task.title}`,
-        ExpectedAuditJson: JSON.stringify(deliveryAudit),
         GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
         GitAuthorEmail:
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
+        ExpectedAuditJson: JSON.stringify(deliveryAudit),
       },
       { signal },
     );
@@ -1271,6 +1298,45 @@ export class HyperVAdapter {
           "PROJECT_READY",
       },
       { signal },
+    );
+  }
+
+  async refreshWorkerCheckpoint(
+    worker,
+    project,
+    {
+      retentionCount = 2,
+      mode = "Refresh",
+      useCurrentRestoredState = false,
+      signal,
+    } = {},
+  ) {
+    return this.powershell(
+      "Update-ProjectReadyCheckpoint.ps1",
+      {
+        ...this.workerArguments(worker),
+        GuestProjectPath: required(
+          project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+        RepoUrl: required(project.repoUrl, "project.repoUrl"),
+        BaseBranch: required(project.defaultBranch, "project.defaultBranch"),
+        CheckpointName:
+          worker.checkpointName || project.checkpointName || "PROJECT_READY",
+        UnitySaveUrl: required(
+          resolveWorkerTemplate(project.unitySaveUrl, worker),
+          "project.unitySaveUrl",
+        ),
+        GuestUnitySkillsEndpoint:
+          this.config.unityGuestLocalEndpoint || "http://127.0.0.1:8090",
+        ApprovedOverlayPathsJson: JSON.stringify(
+          this.config.approvedOverlayPaths || [],
+        ),
+        RetentionCount: retentionCount,
+        UseCurrentRestoredState: useCurrentRestoredState ? 1 : null,
+        Mode: mode,
+      },
+      { signal, timeoutMs: 45 * 60_000 },
     );
   }
 
