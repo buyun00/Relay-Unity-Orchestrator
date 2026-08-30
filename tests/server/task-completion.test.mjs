@@ -526,7 +526,7 @@ test("GitLab client merges the current branch head without enforcing a recorded 
   assert.equal(merged.iid, 12);
   assert.equal(merged.mergedCommitSha, MERGE_SHA);
   assert.equal(merged.alreadyMerged, false);
-  assert.equal(merged.sourceBranchDeleted, true);
+  assert.equal(merged.sourceBranchDeleted, false);
   assert.ok(calls.every((call) => call.token === "glpat-test-token-value"));
   assert.deepEqual(
     calls.find(
@@ -535,30 +535,26 @@ test("GitLab client merges the current branch head without enforcing a recorded 
         call.method === "PUT",
     ).body,
     {
-      should_remove_source_branch: true,
+      should_remove_source_branch: false,
       merge_when_pipeline_succeeds: false,
       squash: false,
     },
   );
   assert.equal(
-    calls.find(
-      (call) =>
-        call.pathname.includes("/repository/branches/") &&
-        call.method === "DELETE",
-    ).method,
-    "DELETE",
+    calls.some((call) => call.method === "DELETE"),
+    false,
   );
   assert.equal(
     calls.find(
       (call) =>
         call.pathname.endsWith("/merge_requests") && call.method === "POST",
     ).body.remove_source_branch,
-    true,
+    false,
   );
   assert.equal(referenceCalls, 2);
 });
 
-test("GitLab client deletes a matching residual source branch for an already merged MR", async (t) => {
+test("GitLab client preserves a matching source branch for an already merged commit", async (t) => {
   const root = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-gitlab-cleanup-test-"),
   );
@@ -616,9 +612,9 @@ test("GitLab client deletes a matching residual source branch for an already mer
     description: "Automated merge",
   });
   assert.equal(merged.alreadyMerged, true);
-  assert.equal(merged.sourceBranchDeleted, true);
-  assert.equal(sourceBranchExists, false);
-  assert.equal(calls.filter((call) => call.method === "DELETE").length, 1);
+  assert.equal(merged.sourceBranchDeleted, false);
+  assert.equal(sourceBranchExists, true);
+  assert.equal(calls.filter((call) => call.method === "DELETE").length, 0);
 });
 
 test("GitLab client accepts a manually merged MR after its source branch was deleted", async (t) => {

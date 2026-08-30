@@ -260,60 +260,6 @@ export class GitLabClient {
     }
   }
 
-  async ensureSourceBranchDeleted(
-    origin,
-    projectId,
-    sourceBranch,
-    targetBranch,
-    expectedSha,
-  ) {
-    if (!sourceBranch || sourceBranch === targetBranch) {
-      throw new HttpError(
-        409,
-        "GITLAB_SOURCE_BRANCH_DELETE_UNSAFE",
-        "任务源分支与目标分支相同，已拒绝自动删除",
-      );
-    }
-    const source = await this.branchOrNull(origin, projectId, sourceBranch);
-    if (!source) return true;
-    const sourceSha = String(source?.commit?.id || "").toLowerCase();
-    if (sourceSha !== expectedSha) {
-      return false;
-    }
-    try {
-      await this.request(
-        origin,
-        `/projects/${encodeURIComponent(projectId)}/repository/branches/${encodeURIComponent(sourceBranch)}`,
-        { method: "DELETE", accepted: [204, 404] },
-      );
-    } catch (error) {
-      throw new HttpError(
-        error?.status || 502,
-        "GITLAB_SOURCE_BRANCH_DELETE_FAILED",
-        `MR 已合并，但源分支 ${sourceBranch} 未能删除：${error?.message || "GitLab request failed"}`,
-        { causeCode: error?.code || null },
-      );
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const remaining = await this.branchOrNull(
-        origin,
-        projectId,
-        sourceBranch,
-      );
-      if (!remaining) return true;
-      const remainingSha = String(remaining?.commit?.id || "").toLowerCase();
-      if (remainingSha !== expectedSha) {
-        return false;
-      }
-      await sleep(250);
-    }
-    throw new HttpError(
-      409,
-      "GITLAB_SOURCE_BRANCH_NOT_DELETED",
-      `MR 已合并，但 GitLab 尚未确认源分支 ${sourceBranch} 已删除`,
-    );
-  }
-
   async commitReferences(origin, projectId, commitSha) {
     return this.request(
       origin,
@@ -479,13 +425,6 @@ export class GitLabClient {
       Array.isArray(refs) &&
       refs.some((ref) => ref?.type === "branch" && ref?.name === targetBranch)
     ) {
-      const sourceBranchDeleted = await this.ensureSourceBranchDeleted(
-        repository.origin,
-        projectId,
-        sourceBranch,
-        targetBranch,
-        sourceSha,
-      );
       const mergedRequest = existing.find(
         (candidate) =>
           candidate?.state === "merged" &&
@@ -501,7 +440,7 @@ export class GitLabClient {
           mergedRequest?.squash_commit_sha ||
           sourceSha,
         alreadyMerged: true,
-        sourceBranchDeleted,
+        sourceBranchDeleted: false,
       };
     }
     if (mergeRequest) {
@@ -523,7 +462,7 @@ export class GitLabClient {
             target_branch: targetBranch,
             title,
             description,
-            remove_source_branch: true,
+            remove_source_branch: false,
             squash: false,
           },
         },
@@ -540,7 +479,7 @@ export class GitLabClient {
       {
         method: "PUT",
         body: {
-          should_remove_source_branch: true,
+          should_remove_source_branch: false,
           merge_when_pipeline_succeeds: false,
           squash: false,
         },
@@ -569,13 +508,6 @@ export class GitLabClient {
       targetBranch,
       mergedSourceSha,
     );
-    const sourceBranchDeleted = await this.ensureSourceBranchDeleted(
-      repository.origin,
-      projectId,
-      sourceBranch,
-      targetBranch,
-      mergedSourceSha,
-    );
     return {
       iid: merged.iid,
       webUrl: merged.web_url,
@@ -584,7 +516,7 @@ export class GitLabClient {
       mergedCommitSha:
         merged.merge_commit_sha || merged.squash_commit_sha || mergedSourceSha,
       alreadyMerged: false,
-      sourceBranchDeleted,
+      sourceBranchDeleted: false,
     };
   }
 }
