@@ -110,7 +110,7 @@ function workerIsReady(worker) {
   );
 }
 
-function unresolvedCheckpointIncident(store, worker) {
+function unresolvedCheckpointIncident(store, worker, recoveryIncidentId = null) {
   if (typeof store?.listIncidents !== "function" || !worker?.id) return null;
   return (
     store
@@ -119,6 +119,7 @@ function unresolvedCheckpointIncident(store, worker) {
         (incident) =>
           incident.workerId === worker.id &&
           !incident.resolvedAt &&
+          incident.id !== recoveryIncidentId &&
           incident.context?.eventType === "checkpoint.maintenance.failed",
       ) || null
   );
@@ -240,6 +241,7 @@ export class CheckpointMaintenance {
     slot = null,
     reason = "operator request",
     useCurrentRestoredState = false,
+    recoveryIncidentId = null,
   } = {}) {
     if (this.runPromise) return this.runPromise;
     const startedAt = this.now();
@@ -257,6 +259,7 @@ export class CheckpointMaintenance {
       attemptSlot,
       reason,
       useCurrentRestoredState,
+      recoveryIncidentId,
     }).finally(() => {
       this.runPromise = null;
     });
@@ -269,6 +272,7 @@ export class CheckpointMaintenance {
     attemptSlot,
     reason,
     useCurrentRestoredState,
+    recoveryIncidentId,
   }) {
     const workers = this.store
       .listWorkers()
@@ -290,7 +294,11 @@ export class CheckpointMaintenance {
         ? this.store.getProject(worker.projectId)
         : null;
       if (!project?.enabled) continue;
-      const blockingIncident = unresolvedCheckpointIncident(this.store, worker);
+      const blockingIncident = unresolvedCheckpointIncident(
+        this.store,
+        worker,
+        recoveryIncidentId,
+      );
       if (blockingIncident) {
         results.push({
           workerId: worker.id,

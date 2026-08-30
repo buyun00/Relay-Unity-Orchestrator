@@ -431,6 +431,34 @@ test("an unresolved checkpoint incident keeps maintenance closed without touchin
   );
 });
 
+test("a guarded retry can bypass only the checkpoint incident it is recovering", async (t) => {
+  const incident = {
+    id: "incident-checkpoint-dirty",
+    workerId: "worker-maintenance",
+    resolvedAt: null,
+    context: { eventType: "checkpoint.maintenance.failed" },
+  };
+  const state = harness(t, { incidents: [incident] });
+  const maintenance = new CheckpointMaintenance(
+    {
+      config: state.config,
+      store: state.store,
+      scheduler: { notifyQueueChanged() {} },
+      adapter: state.adapter,
+    },
+    { now: () => new Date("2026-08-03T22:05:00.000Z") },
+  );
+
+  const result = await maintenance.runNow({
+    workerId: "worker-maintenance",
+    recoveryIncidentId: incident.id,
+    reason: "verify the repair before resolving the incident",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(state.adapter.refreshCalls.length, 1);
+  assert.equal(state.worker().status, "ready");
+});
+
 test("structured checkpoint attention survives the PowerShell transport and maintenance event", async (t) => {
   const checkpointFailure = {
     code: "CHECKPOINT_WORKSPACE_DIRTY",
@@ -749,4 +777,56 @@ test("Luna's checkpoint.refresh action delegates to the guarded maintenance runn
       "checkpoint.refresh",
     ),
   );
+});
+
+test("Luna's checkpoint.refresh action identifies its own recovery incident", async () => {
+  const calls = [];
+  const incident = {
+    id: "incident-checkpoint-dirty",
+    workerId: "worker-maintenance",
+    resolvedAt: null,
+    context: { eventType: "checkpoint.maintenance.failed" },
+  };
+  const ops = new OpsEngine(
+    {
+      config: {},
+      store: {
+        getIncident: (id) => (id === incident.id ? incident : null),
+        getTask: () => null,
+      },
+      scheduler: {},
+      repairManager: {},
+      checkpointMaintenance: {
+        async runNow(options) {
+          calls.push(options);
+          return {
+            ok: true,
+            results: [{ workerId: options.workerId, ok: true }],
+          };
+        },
+      },
+    },
+    {
+      sessionRunner: { run: async () => null },
+      recoverySessionRunner: { run: async () => null },
+    },
+  );
+
+  const result = await ops.performAction(
+    { incidentId: incident.id },
+    {
+      type: "checkpoint.refresh",
+      targetId: "worker-maintenance",
+      reason: "Retry after the preserved workspace was repaired",
+    },
+    { diagnosis: "The maintenance gate is ready" },
+  );
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [
+    {
+      workerId: "worker-maintenance",
+      reason: "Retry after the preserved workspace was repaired",
+      recoveryIncidentId: incident.id,
+    },
+  ]);
 });

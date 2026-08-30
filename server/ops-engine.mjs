@@ -1277,9 +1277,17 @@ export class OpsEngine {
             "Checkpoint maintenance is not running",
           );
         }
+        const recoveryIncidentId =
+          incident?.id &&
+          incident.workerId === targetId &&
+          !incident.resolvedAt &&
+          incident.context?.eventType === "checkpoint.maintenance.failed"
+            ? incident.id
+            : null;
         const result = await this.checkpointMaintenance.runNow({
           workerId: targetId,
           reason: action.reason || diagnosis.diagnosis,
+          ...(recoveryIncidentId ? { recoveryIncidentId } : {}),
         });
         if (!result?.ok) {
           throw Object.assign(
