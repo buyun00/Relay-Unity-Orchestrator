@@ -549,6 +549,31 @@ test("the Hyper-V refresh script is fast-forward-only and prunes after canary", 
     source,
     /\$postRefreshGitResult\s*=\s*Invoke-GuestGitState\s+\$false/u,
   );
+  const initialSaveIndex = source.indexOf(
+    "$saveResult = Invoke-UnitySaveValidation",
+  );
+  const postSaveGitIndex = source.indexOf(
+    "$postSaveGitResult = Invoke-GuestGitState $false",
+  );
+  const checkpointIndex = source.indexOf("Checkpoint-VM");
+  assert.ok(initialSaveIndex >= 0, "initial Unity save gate must remain present");
+  assert.ok(
+    initialSaveIndex < postSaveGitIndex && postSaveGitIndex < checkpointIndex,
+    "Git must be rechecked after the initial Unity save and before checkpoint creation",
+  );
+  const canarySaveIndex = source.indexOf(
+    "$canarySave = Invoke-UnitySaveValidation",
+  );
+  const canaryPostSaveGitIndex = source.indexOf(
+    "$canaryPostSaveGitResult = Invoke-GuestGitState $false",
+  );
+  const canaryPassedIndex = source.indexOf("$canaryPassed = $true");
+  assert.ok(canarySaveIndex >= 0, "canary Unity save gate must remain present");
+  assert.ok(
+    canarySaveIndex < canaryPostSaveGitIndex &&
+      canaryPostSaveGitIndex < canaryPassedIndex,
+    "Git must be rechecked after the canary Unity save before the canary passes",
+  );
   assert.match(
     source,
     /\$configuredOverlays\s*=\s*\$ApprovedOverlaysJson\s*\|\s*ConvertFrom-Json/u,

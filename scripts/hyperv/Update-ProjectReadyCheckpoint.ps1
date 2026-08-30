@@ -1363,6 +1363,8 @@ $assetRefreshResult = $null
 $postRefreshStableFailure = $null
 $unityEditorRecovery = $null
 $postRefreshGitResult = $null
+$postSaveGitResult = $null
+$canaryPostSaveGitResult = $null
 $dialogResult = $null
 $initialRestoreSkipped = $false
 try {
@@ -1406,6 +1408,10 @@ try {
         $postRefreshGitResult = Invoke-GuestGitState $false
     }
     $saveResult = Invoke-UnitySaveValidation
+    # File/Save is itself a mutation boundary. Re-run the same fail-closed Git
+    # gate after it so serialized scene/settings corruption cannot be captured
+    # by PROJECT_READY merely because the pre-save refresh check was clean.
+    $postSaveGitResult = Invoke-GuestGitState $false
     $dialogResult = Wait-DialogGuard
 
     $activeCheckpoint = Get-ActiveCheckpoint
@@ -1434,6 +1440,9 @@ try {
     }
     $canaryUnity = Wait-GuestUnitySkills
     $canarySave = Invoke-UnitySaveValidation
+    # The restored canary must remain clean after its own Unity save before the
+    # checkpoint is accepted or any older managed checkpoint is pruned.
+    $canaryPostSaveGitResult = Invoke-GuestGitState $false
     $canaryDialog = Wait-DialogGuard
     $canaryPassed = $true
 
@@ -1469,6 +1478,8 @@ try {
         newHead = $gitResult.newHead
         git = $gitResult
         postRefreshGit = $postRefreshGitResult
+        postSaveGit = $postSaveGitResult
+        canaryPostSaveGit = $canaryPostSaveGitResult
         assetRefresh = $assetRefreshResult
         postRefreshStableFailure = $postRefreshStableFailure
         unityEditorRecovery = $unityEditorRecovery
