@@ -1114,6 +1114,10 @@ export class HyperVAdapter {
           "project.guestProjectPath",
         ),
         TaskBranch: required(context.task.branchName, "task.branchName"),
+        BaseRef: `refs/remotes/origin/${required(
+          context.task.baseBranch,
+          "task.baseBranch",
+        )}`,
         ChangedFilesJson: JSON.stringify(
           codexStringArray(codexFinal?.changedFiles),
         ),
@@ -1160,6 +1164,10 @@ export class HyperVAdapter {
           "project.guestProjectPath",
         ),
         TaskBranch: required(context.task.branchName, "task.branchName"),
+        BaseRef: `refs/remotes/origin/${required(
+          context.task.baseBranch,
+          "task.baseBranch",
+        )}`,
         ExpectedHead: required(expectedAudit?.head, "deliveryAudit.head"),
         ChangedFilesJson: JSON.stringify(
           codexStringArray(expectedAudit?.changedFiles),

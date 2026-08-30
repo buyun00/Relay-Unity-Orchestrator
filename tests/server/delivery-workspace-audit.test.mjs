@@ -57,6 +57,7 @@ async function invokeAudit({
   validation = ["PowerShell syntax passed", "targeted tests passed"],
   expectedAudit = null,
   approvedOverlayPaths = [],
+  baseRef = null,
 }) {
   const args = [
     "-NoLogo",
@@ -76,6 +77,7 @@ async function invokeAudit({
     JSON.stringify(validation),
     "-OutputJson",
   ];
+  if (baseRef) args.push("-BaseRef", baseRef);
   if (expectedHead) args.push("-ExpectedHead", expectedHead);
   if (expectedAudit)
     args.push("-ExpectedAuditJson", JSON.stringify(expectedAudit));
@@ -270,6 +272,80 @@ test("delivery audit reconstructs committed additions from a clean HEAD", async 
       { code: "A ", filePath: addedPaths[0], unsafeReason: null },
       { code: "A ", filePath: addedPaths[1], unsafeReason: null },
     ],
+  );
+  assert.deepEqual(recorded.blockedPaths, []);
+});
+
+test("delivery audit reconstructs a clean multi-commit result from its configured remote base ref", async (t) => {
+  const { repository } = await createRepository(t);
+  fs.writeFileSync(path.join(repository, "Assets", "Only.cs"), "baseline\n");
+  const taskPaths = [
+    "Assets/Only.cs",
+    "Assets/Second.cs",
+    "Assets/Third.cs",
+    "Assets/Fourth.cs",
+  ];
+  for (const filePath of taskPaths.slice(1)) {
+    fs.writeFileSync(path.join(repository, filePath), "baseline\n");
+  }
+  await run(git, ["-C", repository, "add", "--", ...taskPaths]);
+  await run(git, ["-C", repository, "commit", "-m", "task base"]);
+  await run(git, [
+    "-C",
+    repository,
+    "update-ref",
+    "refs/remotes/origin/main",
+    "HEAD",
+  ]);
+
+  for (const filePath of taskPaths) {
+    fs.writeFileSync(path.join(repository, filePath), "first task commit\n");
+  }
+  const transientPaths = ["Assets/Transient.cs", "Assets/Transient.cs.meta"];
+  for (const filePath of transientPaths) {
+    fs.writeFileSync(path.join(repository, filePath), "transient\n");
+  }
+  await run(git, [
+    "-C",
+    repository,
+    "add",
+    "--",
+    ...taskPaths,
+    ...transientPaths,
+  ]);
+  await run(git, ["-C", repository, "commit", "-m", "first task commit"]);
+
+  for (const filePath of taskPaths) {
+    fs.writeFileSync(path.join(repository, filePath), "final task result\n");
+  }
+  for (const filePath of transientPaths) {
+    fs.rmSync(path.join(repository, filePath));
+  }
+  await run(git, ["-C", repository, "add", "-A", "--", "Assets"]);
+  await run(git, ["-C", repository, "commit", "-m", "final task commit"]);
+
+  const latestCommitOnly = await invokeAudit({
+    repository,
+    changedFiles: taskPaths,
+  });
+  assert.equal(latestCommitOnly.completeFileSet, false);
+  assert.equal(latestCommitOnly.safeForDeliveryRetry, false);
+
+  const recorded = await invokeAudit({
+    repository,
+    changedFiles: taskPaths,
+    baseRef: "refs/remotes/origin/main",
+  });
+  assert.equal(recorded.ready, true);
+  assert.equal(recorded.exact, true);
+  assert.equal(recorded.completeFileSet, true);
+  assert.equal(recorded.safeForDeliveryRetry, true);
+  assert.equal(recorded.source, "head-commit");
+  assert.deepEqual(
+    recorded.files.map(({ code, path: filePath }) => ({ code, filePath })),
+    [...taskPaths]
+      .sort((left, right) => left.localeCompare(right))
+      .map((filePath) => ({ code: " M", filePath })),
   );
   assert.deepEqual(recorded.blockedPaths, []);
 });

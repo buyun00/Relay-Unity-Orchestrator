@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ProjectPath,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ExpectedBranch,
     [AllowNull()][string]$ExpectedHead,
+    [AllowNull()][string]$BaseRef,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ChangedFilesJson,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ValidationJson,
     [AllowNull()][string]$ExpectedAuditJson,
@@ -113,38 +114,51 @@ function Get-CommittedHeadStatus {
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
-        [string[]]$ExpectedPaths
+        [string[]]$ExpectedPaths,
+        [AllowNull()][string]$BaseRef
     )
 
     if ($ExpectedPaths.Count -eq 0) {
         return @()
     }
 
-    # This fallback is deliberately narrow: only a normal single-parent HEAD
-    # whose complete delta is the declared set of added or modified tracked
-    # files can represent a Codex result that was committed before Relay
-    # recorded it. Deletes and rename/copy pairs remain ineligible.
-    $parentRecord = Get-RelayGitValue $RepositoryPath @(
-        'rev-list', '--parents', '-n', '1', 'HEAD'
+    # A clean workspace may contain a result that Codex committed before Relay
+    # recorded its audit. Prefer the configured remote base ref so multi-commit
+    # task results are reconstructed from the same complete delta used for
+    # delivery. Retain the single-parent fallback for direct script callers
+    # that do not supply a base ref. Deletes and rename/copy pairs remain
+    # ineligible.
+    $headCommit = Get-RelayGitValue $RepositoryPath @(
+        'rev-parse', '--verify', 'HEAD^{commit}'
     )
-    $commitIds = @($parentRecord -split '\s+' | Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_)
-    })
-    if ($commitIds.Count -ne 2) {
-        return @()
+    if ([string]::IsNullOrWhiteSpace($BaseRef)) {
+        $parentRecord = Get-RelayGitValue $RepositoryPath @(
+            'rev-list', '--parents', '-n', '1', 'HEAD'
+        )
+        $commitIds = @($parentRecord -split '\s+' | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        })
+        if ($commitIds.Count -ne 2) {
+            return @()
+        }
+        $baseCommit = $commitIds[1]
+    } else {
+        $baseCommit = Get-RelayGitValue $RepositoryPath @(
+            'rev-parse', '--verify', "${BaseRef}^{commit}"
+        )
     }
 
     $allDelta = Invoke-RelayGit $RepositoryPath @(
         'diff-tree', '--no-commit-id', '--name-only', '--no-renames',
-        '-r', '-z', $commitIds[1], $commitIds[0]
+        '-r', '-z', $baseCommit, $headCommit
     )
     $modifiedDelta = Invoke-RelayGit $RepositoryPath @(
         'diff-tree', '--no-commit-id', '--name-only', '--no-renames',
-        '--diff-filter=M', '-r', '-z', $commitIds[1], $commitIds[0]
+        '--diff-filter=M', '-r', '-z', $baseCommit, $headCommit
     )
     $addedDelta = Invoke-RelayGit $RepositoryPath @(
         'diff-tree', '--no-commit-id', '--name-only', '--no-renames',
-        '--diff-filter=A', '-r', '-z', $commitIds[1], $commitIds[0]
+        '--diff-filter=A', '-r', '-z', $baseCommit, $headCommit
     )
     $allPaths = [string[]]@(
         ConvertFrom-RelayNulFields $allDelta.stdoutBytes |
@@ -356,7 +370,8 @@ if ($status.Count -eq 0 -and $script:changedFiles.Count -gt 0) {
     $committedHeadStatus = @(
         Get-CommittedHeadStatus `
             -RepositoryPath $ProjectPath `
-            -ExpectedPaths $script:changedFiles
+            -ExpectedPaths $script:changedFiles `
+            -BaseRef $BaseRef
     )
     if ($committedHeadStatus.Count -gt 0) {
         $status = $committedHeadStatus

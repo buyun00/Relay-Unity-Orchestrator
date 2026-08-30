@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$GuestProjectPath,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$TaskBranch,
     [AllowNull()][string]$ExpectedHead,
+    [AllowNull()][string]$BaseRef,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ChangedFilesJson,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ValidationJson,
     [AllowNull()][string]$ExpectedAuditJson,
@@ -34,16 +35,17 @@ $guestSource = [System.IO.File]::ReadAllText(
     [System.Text.Encoding]::UTF8
 )
 
-$argumentList = New-Object object[] 9
+$argumentList = New-Object object[] 10
 $argumentList[0] = $GuestProjectPath
 $argumentList[1] = $TaskBranch
 $argumentList[2] = $ExpectedHead
-$argumentList[3] = $ChangedFilesJson
-$argumentList[4] = $ValidationJson
-$argumentList[5] = $ExpectedAuditJson
-$argumentList[6] = $ApprovedOverlayPathsJson
-$argumentList[7] = $helperSource
-$argumentList[8] = $guestSource
+$argumentList[3] = $BaseRef
+$argumentList[4] = $ChangedFilesJson
+$argumentList[5] = $ValidationJson
+$argumentList[6] = $ExpectedAuditJson
+$argumentList[7] = $ApprovedOverlayPathsJson
+$argumentList[8] = $helperSource
+$argumentList[9] = $guestSource
 
 $remoteOutput = @(
     Invoke-Command -VMName $VMName -Credential $credential `
@@ -53,6 +55,7 @@ $remoteOutput = @(
                 $ProjectPath,
                 $ExpectedBranch,
                 $ExpectedHead,
+                $BaseRef,
                 $ChangedFilesJson,
                 $ValidationJson,
                 $ExpectedAuditJson,
@@ -68,6 +71,7 @@ $remoteOutput = @(
                 -ProjectPath $ProjectPath `
                 -ExpectedBranch $ExpectedBranch `
                 -ExpectedHead $ExpectedHead `
+                -BaseRef $BaseRef `
                 -ChangedFilesJson $ChangedFilesJson `
                 -ValidationJson $ValidationJson `
                 -ExpectedAuditJson $ExpectedAuditJson `
