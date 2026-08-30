@@ -349,3 +349,63 @@ test("delivery audit reconstructs a clean multi-commit result from its configure
   );
   assert.deepEqual(recorded.blockedPaths, []);
 });
+
+test("delivery audit replays a durable exact audit independently of older branch history", async (t) => {
+  const { repository } = await createRepository(t);
+  await run(git, ["-C", repository, "add", "--", "Assets/Only.cs"]);
+  await run(git, ["-C", repository, "commit", "-m", "task base"]);
+  await run(git, [
+    "-C",
+    repository,
+    "update-ref",
+    "refs/remotes/origin/main",
+    "HEAD",
+  ]);
+
+  const priorPath = "Assets/PriorBranchWork.cs";
+  fs.writeFileSync(path.join(repository, priorPath), "prior branch work\n");
+  await run(git, ["-C", repository, "add", "--", priorPath]);
+  await run(git, ["-C", repository, "commit", "-m", "prior branch work"]);
+
+  fs.writeFileSync(path.join(repository, "Assets", "Only.cs"), "task result\n");
+  await run(git, ["-C", repository, "add", "--", "Assets/Only.cs"]);
+  await run(git, ["-C", repository, "commit", "-m", "task result"]);
+  const head = (
+    await run(git, ["-C", repository, "rev-parse", "HEAD"])
+  ).stdout
+    .trim()
+    .toLowerCase();
+
+  const recorded = await invokeAudit({ repository });
+  assert.equal(recorded.ready, true);
+  assert.equal(recorded.exact, true);
+  assert.equal(recorded.safeForDeliveryRetry, true);
+  assert.equal(recorded.completeFileSet, true);
+  assert.equal(recorded.source, "head-commit");
+  assert.deepEqual(recorded.changedFiles, ["Assets/Only.cs"]);
+
+  const replayed = await invokeAudit({
+    repository,
+    expectedHead: head,
+    expectedAudit: recorded,
+    baseRef: "refs/remotes/origin/main",
+  });
+  assert.equal(replayed.ready, true);
+  assert.equal(replayed.exact, true);
+  assert.equal(replayed.safeForDeliveryRetry, true);
+  assert.equal(replayed.completeFileSet, true);
+  assert.equal(replayed.fingerprint, recorded.fingerprint);
+  assert.deepEqual(replayed.blockedPaths, []);
+
+  const unexpectedPath = "Assets/Unexpected.cs";
+  fs.writeFileSync(path.join(repository, unexpectedPath), "unexpected drift\n");
+  const drifted = await invokeAudit({
+    repository,
+    expectedHead: head,
+    expectedAudit: recorded,
+    baseRef: "refs/remotes/origin/main",
+  });
+  assert.equal(drifted.ready, false);
+  assert.equal(drifted.code, "DELIVERY_RETRY_AUDIT_MISMATCH");
+  assert.ok(drifted.blockedPaths.includes(unexpectedPath));
+});

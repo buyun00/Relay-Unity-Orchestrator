@@ -207,6 +207,58 @@ function Get-CommittedHeadStatus {
     return [object[]]$entries.ToArray()
 }
 
+function Get-RecordedAuditStatus {
+    param(
+        [Parameter(Mandatory = $true)][object]$ExpectedAudit,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$ExpectedPaths
+    )
+
+    try {
+        if (
+            $ExpectedAudit.version -ne 1 -or
+            -not [bool]$ExpectedAudit.safeForDeliveryRetry -or
+            [string]::IsNullOrWhiteSpace([string]$ExpectedAudit.fingerprint)
+        ) {
+            return @()
+        }
+
+        $recordedFiles = @($ExpectedAudit.files)
+        if ($recordedFiles.Count -ne $ExpectedPaths.Count) {
+            return @()
+        }
+
+        $entries = New-Object System.Collections.Generic.List[object]
+        $recordedPaths = New-Object System.Collections.Generic.List[string]
+        foreach ($file in $recordedFiles) {
+            $statusPath = ConvertTo-RelayGitPath ([string]$file.path)
+            $recordedPaths.Add($statusPath)
+            $entries.Add([pscustomobject]@{
+                code = [string]$file.code
+                path = $statusPath
+                originalPath = if (
+                    $null -eq $file.originalPath -or
+                    [string]::IsNullOrWhiteSpace([string]$file.originalPath)
+                ) {
+                    $null
+                } else {
+                    ConvertTo-RelayGitPath ([string]$file.originalPath)
+                }
+            })
+        }
+
+        $sortedExpected = Get-OrdinalSortedStrings -Values $ExpectedPaths
+        $sortedRecorded = Get-OrdinalSortedStrings -Values $recordedPaths.ToArray()
+        if (-not (Test-ExactStringArray -Left $sortedExpected -Right $sortedRecorded)) {
+            return @()
+        }
+        return [object[]]$entries.ToArray()
+    } catch {
+        return @()
+    }
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -367,15 +419,45 @@ if (
 $status = @(Get-RelayWorkspaceStatus $ProjectPath)
 $auditSource = 'workspace'
 if ($status.Count -eq 0 -and $script:changedFiles.Count -gt 0) {
-    $committedHeadStatus = @(
-        Get-CommittedHeadStatus `
-            -RepositoryPath $ProjectPath `
-            -ExpectedPaths $script:changedFiles `
-            -BaseRef $BaseRef
-    )
-    if ($committedHeadStatus.Count -gt 0) {
-        $status = $committedHeadStatus
-        $auditSource = 'head-commit'
+    # Exact retry verification replays the already-recorded status set. The
+    # audit fingerprint pins branch, HEAD, paths, statuses, blobs, file hashes,
+    # and validation, while the clean-workspace check above still rejects any
+    # unapproved drift. Re-deriving this set from BaseRef would make a durable
+    # audit depend on a remote ref that can move or on older branch history.
+    if ($null -ne $expectedAudit) {
+        $recordedAuditStatus = @(
+            Get-RecordedAuditStatus `
+                -ExpectedAudit $expectedAudit `
+                -ExpectedPaths $script:changedFiles
+        )
+        if ($recordedAuditStatus.Count -gt 0) {
+            $status = $recordedAuditStatus
+            $sourceProperty = $expectedAudit.PSObject.Properties['source']
+            $recordedSource = if ($null -eq $sourceProperty) {
+                ''
+            } else {
+                [string]$sourceProperty.Value
+            }
+            $auditSource = if (
+                $recordedSource -in @('workspace', 'head-commit')
+            ) {
+                $recordedSource
+            } else {
+                'recorded-audit'
+            }
+        }
+    }
+    if ($status.Count -eq 0) {
+        $committedHeadStatus = @(
+            Get-CommittedHeadStatus `
+                -RepositoryPath $ProjectPath `
+                -ExpectedPaths $script:changedFiles `
+                -BaseRef $BaseRef
+        )
+        if ($committedHeadStatus.Count -gt 0) {
+            $status = $committedHeadStatus
+            $auditSource = 'head-commit'
+        }
     }
 }
 $files = New-Object System.Collections.Generic.List[object]
