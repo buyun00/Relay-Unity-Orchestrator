@@ -486,6 +486,27 @@ export class HyperVAdapter {
     this.runtime = null;
     this.runtimeCheckedAt = 0;
     this.runtimePromise = null;
+    this.vmPowerShellTails = new Map();
+  }
+
+  async serializeVmPowerShell(vmName, operation) {
+    const key = String(vmName).trim().toLowerCase();
+    const previous = this.vmPowerShellTails.get(key) || Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.vmPowerShellTails.set(key, tail);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.vmPowerShellTails.get(key) === tail) {
+        this.vmPowerShellTails.delete(key);
+      }
+    }
   }
 
   async powershell(
@@ -506,12 +527,16 @@ export class HyperVAdapter {
       if (value == null || value === "") continue;
       args.push(`-${name}`, String(value));
     }
-    let result;
-    try {
-      result = await this.processRunner(this.config.powershellCommand, args, {
+    const run = () =>
+      this.processRunner(this.config.powershellCommand, args, {
         signal,
         timeoutMs,
       });
+    let result;
+    try {
+      result = namedArguments.VMName
+        ? await this.serializeVmPowerShell(namedArguments.VMName, run)
+        : await run();
     } catch (error) {
       const refusal = parseWorkspaceRefusal(error);
       if (refusal) {

@@ -15,6 +15,7 @@ Set-StrictMode -Version Latest
 $OutputEncoding = [Console]::OutputEncoding
 Import-Module Hyper-V -ErrorAction Stop
 . (Join-Path $PSScriptRoot 'Credential.ps1')
+. (Join-Path $PSScriptRoot 'PowerShell-Direct.ps1')
 
 function Get-RelaySmbShareRoot {
     [CmdletBinding()]
@@ -222,11 +223,28 @@ if ($vmRunning) {
     do {
         if ($credential -is [System.Management.Automation.PSCredential]) {
             try {
-                $unity = [bool](Invoke-Command -VMName $VMName -Credential $credential -ScriptBlock {
-                    @(
-                        Get-CimInstance Win32_Process -Filter "Name='Unity.exe'" -ErrorAction SilentlyContinue
-                    ).Count -gt 0
-                } -ErrorAction Stop)
+                $remainingSeconds = [Math]::Max(
+                    1,
+                    [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
+                )
+                $directTimeoutSeconds = [Math]::Min(15, $remainingSeconds)
+                $unityResult = @(
+                    Invoke-RelayPowerShellDirect `
+                        -VMName $VMName `
+                        -Credential $credential `
+                        -ArgumentList @('Unity.exe') `
+                        -ScriptBlock {
+                            param($ProcessName)
+                            @(
+                                Get-CimInstance Win32_Process `
+                                    -Filter "Name='$ProcessName'" `
+                                    -ErrorAction SilentlyContinue
+                            ).Count -gt 0
+                        } `
+                        -Stage 'worker-health-unity-process' `
+                        -TimeoutSeconds $directTimeoutSeconds
+                )
+                $unity = [bool]$unityResult[-1]
                 # A successful PowerShell Direct round trip proves that the
                 # guest is responsive even when Hyper-V Heartbeat is stale.
                 $heartbeat = $true

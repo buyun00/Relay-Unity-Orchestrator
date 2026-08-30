@@ -38,7 +38,9 @@ function global:Invoke-Command {
     param(
         [string]$VMName,
         [pscredential]$Credential,
-        [scriptblock]$ScriptBlock
+        [object[]]$ArgumentList,
+        [scriptblock]$ScriptBlock,
+        [switch]$AsJob
     )
 
     return $true
@@ -68,6 +70,12 @@ function global:Get-SmbMapping {
     return @()
 }
 
+function global:Get-SmbGlobalMapping {
+    [CmdletBinding()]
+    param([string]$RemotePath)
+    return @()
+}
+
 function global:New-SmbMapping {
     [CmdletBinding()]
     param(
@@ -89,6 +97,30 @@ function global:New-SmbMapping {
         throw 'SMB recovery received unexpected mapping parameters.'
     }
     $global:relayTestShareConnected = $true
+}
+
+function global:New-SmbGlobalMapping {
+    [CmdletBinding()]
+    param(
+        [string]$RemotePath,
+        [pscredential]$Credential,
+        [bool]$Persistent,
+        [string[]]$FullAccess
+    )
+
+    $global:relayTestMappingCalls += 1
+    if ($global:relayTestMappingFails) {
+        throw 'simulated SMB authentication failure'
+    }
+    $global:relayTestShareConnected = $true
+}
+
+function global:Remove-SmbGlobalMapping {
+    [CmdletBinding()]
+    param(
+        [string]$RemotePath,
+        [switch]$Force
+    )
 }
 
 function Assert-Equal {

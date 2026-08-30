@@ -104,6 +104,60 @@ function exactDeliveryAudit() {
   };
 }
 
+test("PowerShell commands are serialized per VM without blocking other workers", async () => {
+  const starts = [];
+  let releaseFirst;
+  let markFirstStarted;
+  let markOtherStarted;
+  const firstStarted = new Promise((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const otherStarted = new Promise((resolve) => {
+    markOtherStarted = resolve;
+  });
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  let workerACalls = 0;
+  const processRunner = async (_command, args) => {
+    const vmName = args[args.indexOf("-VMName") + 1];
+    starts.push(vmName);
+    if (vmName === "worker-a") {
+      workerACalls += 1;
+      if (workerACalls === 1) {
+        markFirstStarted();
+        await firstGate;
+      }
+    } else {
+      markOtherStarted();
+    }
+    return { exitCode: 0, stdout: '{"ready":true}', stderr: "" };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  const first = adapter.powershell("Get-WorkerHealth.ps1", {
+    VMName: "worker-a",
+  });
+  await firstStarted;
+  const second = adapter.powershell("Inspect-PreservedWorkspace.ps1", {
+    VMName: "worker-a",
+  });
+  const other = adapter.powershell("Get-WorkerHealth.ps1", {
+    VMName: "worker-b",
+  });
+  await otherStarted;
+
+  assert.equal(workerACalls, 1);
+  assert.deepEqual(starts, ["worker-a", "worker-b"]);
+  releaseFirst();
+  await Promise.all([first, second, other]);
+  assert.equal(workerACalls, 2);
+  assert.deepEqual(starts, ["worker-a", "worker-b", "worker-a"]);
+});
+
 function recoveryProof({
   taskBranch,
   auditedHead,
