@@ -94,6 +94,7 @@ function buildPrompt(context) {
     unity_asset: [
       "Relay executionProfile=unity_asset for this turn.",
       "Use the configured Unity Skill to inspect or edit the requested real scenes, prefabs, components, hierarchy, serialized bindings, or other Editor state.",
+      "Unity MCP availability is not a task-startup prerequisite. If that transport cannot initialize, use the assigned Worker's UnitySkills REST interface; preserve all requested runtime and visual verification, and report any evidence that remains unavailable.",
       ...workerUnityRoute,
       `If Unity or its Skill times out, inspect pending guest dialogs before treating the timeout as terminal. Read them with ${dialogStateScript} using VMName ${context.worker.vmName} and CredentialPath ${context.worker.credentialPath}.`,
       `For an unknown dialog, reason from its title, text, screenshot, and enumerated buttons, then use ${dialogActionScript} only with the exact dialogId/buttonId returned by the state interface. Never authorize a high-risk action without explicit user authority.`,
@@ -243,7 +244,7 @@ export class CodexRunner {
         "-c",
         `mcp_servers.unity.url=${JSON.stringify(unitySkillUrl)}`,
         "-c",
-        "mcp_servers.unity.required=true",
+        "mcp_servers.unity.required=false",
       );
     }
     args.push(

@@ -1689,13 +1689,16 @@ test("Codex turns pin the Relay model, reasoning effort, and standard speed", as
   assert.ok(args.indexOf('model_reasoning_effort="xhigh"') < execIndex);
   assert.ok(args.indexOf('service_tier="default"') < execIndex);
   assert.ok(args.indexOf("features.fast_mode=false") < execIndex);
-  assert.ok(args.includes("mcp_servers.unity.required=true"));
+  assert.ok(args.includes("mcp_servers.unity.required=false"));
+  assert.ok(!args.includes("mcp_servers.unity.required=true"));
   assert.equal(args.at(-1), "-");
   const prompt = options.input;
   assert.match(prompt, /Get-UnityDialogGuardState\.ps1/);
   assert.match(prompt, /Invoke-UnityDialogGuardAction\.ps1/);
   assert.match(prompt, /VMName unity-worker-01/);
   assert.match(prompt, /Never authorize a high-risk action/);
+  assert.match(prompt, /Unity MCP availability is not a task-startup prerequisite/);
+  assert.match(prompt, /preserve all requested runtime and visual verification/);
 });
 
 test("Relay execution profiles keep code turns away from Unity and gate auto escalation", async (t) => {
