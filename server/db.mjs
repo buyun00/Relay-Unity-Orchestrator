@@ -592,7 +592,6 @@ export class Store {
       "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
     );
     this.migrate();
-    this.reconcileInterruptedWork();
   }
 
   close() {

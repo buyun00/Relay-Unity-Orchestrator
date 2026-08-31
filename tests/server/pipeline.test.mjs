@@ -1647,6 +1647,41 @@ test("pausing the scheduler preserves queued work and resuming dispatches it", a
   );
 });
 
+test("opening a second Store cannot mark live work interrupted", (t) => {
+  const config = createConfig();
+  const owner = new Store(config);
+  const { project, worker } = seedProjectAndWorker(owner);
+  const created = createTask(owner, project.id, {
+    title: "Live turn",
+    message: "Keep executing",
+  });
+  owner.claimNextTurn();
+  owner.setTurnPhase(created.turn.id, "running");
+  const auxiliary = new Store(config);
+  t.after(() => {
+    auxiliary.close();
+    owner.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+  assert.equal(auxiliary.getTurn(created.turn.id).status, "running");
+  assert.equal(owner.getTask(created.task.id).status, "running");
+  assert.equal(owner.getWorker(worker.id).currentTurnId, created.turn.id);
+  assert.equal(owner.getWorker(worker.id).status, "busy");
+  // A real server startup still recovers abandoned work, explicitly.
+  auxiliary.reconcileInterruptedWork();
+  assert.equal(owner.getTurn(created.turn.id).status, "interrupted");
+  assert.equal(owner.getTurn(created.turn.id).errorCode, "SERVER_RESTARTED");
+  const source = fs.readFileSync(path.resolve("server/index.mjs"), "utf8");
+  assert.ok(
+    source.indexOf("await api.listen();") <
+      source.indexOf("store.reconcileInterruptedWork();"),
+  );
+  assert.ok(
+    source.indexOf("store.reconcileInterruptedWork();") <
+      source.indexOf("await scheduler.start("),
+  );
+});
+
 test("SQLite restart preserves project URLs, task conversation, branch, and history", async (t) => {
   const config = createConfig();
   let store = new Store(config);

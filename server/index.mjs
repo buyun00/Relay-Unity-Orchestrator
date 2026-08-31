@@ -38,7 +38,8 @@ function qaHubProjectMap(raw) {
     if (separator <= 0 || separator === entry.length - 1) continue;
     const qaProjectKey = entry.slice(0, separator).trim();
     const relayProjectId = entry.slice(separator + 1).trim();
-    if (qaProjectKey && relayProjectId) result.set(qaProjectKey, relayProjectId);
+    if (qaProjectKey && relayProjectId)
+      result.set(qaProjectKey, relayProjectId);
   }
   if (result.size === 0) {
     throw new Error("QA Hub project allowlist is empty or invalid");
@@ -54,7 +55,9 @@ function qaHubWebhookEndpoint(value) {
     endpoint.username ||
     endpoint.password
   ) {
-    throw new Error("QA Hub webhook endpoint must be credential-free loopback HTTP");
+    throw new Error(
+      "QA Hub webhook endpoint must be credential-free loopback HTTP",
+    );
   }
   return endpoint.toString();
 }
@@ -106,10 +109,7 @@ let qaHubM2mService = null;
 let qaHubWebhookOutbox = null;
 let stopQaHubDurableEventSink = null;
 if (config.qaHubM2mEnabled) {
-  const m2mToken = readSecretFile(
-    config.qaHubM2mTokenFile,
-    "QA Hub M2M token",
-  );
+  const m2mToken = readSecretFile(config.qaHubM2mTokenFile, "QA Hub M2M token");
   const webhookSecret = readSecretFile(
     config.qaHubWebhookSecretFile,
     "QA Hub webhook secret",
@@ -256,6 +256,9 @@ const api = new PipelineHttpServer({
 });
 
 await api.listen();
+// Only the backend that successfully owns the API port may recover abandoned
+// work. Opening another Store for diagnostics must never interrupt live turns.
+store.reconcileInterruptedWork();
 qaHubWebhookOutbox?.start();
 if (config.ozdqpBuildEnabled) {
   buildDispatcher.start();
