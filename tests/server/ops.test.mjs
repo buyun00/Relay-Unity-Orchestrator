@@ -1153,6 +1153,75 @@ test("task prompts are archived immutably before unrestricted recovery can run",
   );
 });
 
+test("supervisor ignores 100 normally waiting tasks and fresh Codex progress", (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-quiet-supervisor-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const ops = new OpsEngine({
+    config,
+    store,
+    scheduler,
+    repairManager: { run: async () => null },
+  });
+  t.after(() => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  for (let index = 0; index < 101; index += 1) {
+    store.createTask({
+      projectId: project.id,
+      title: `Task ${index}`,
+      message: "Original work",
+      userName: "Tester",
+    });
+  }
+  const active = store.claimNextTurn();
+  store.setTurnPhase(active.turn.id, "running");
+  store.db
+    .prepare("UPDATE tasks SET updated_at=?")
+    .run("2020-01-01T00:00:00.000Z");
+  store.db
+    .prepare("UPDATE events SET created_at=?")
+    .run("2020-01-01T00:00:00.000Z");
+  store.emit({
+    taskId: active.task.id,
+    turnId: active.turn.id,
+    type: "codex.item.completed",
+    phase: "codex",
+    message: "New execution progress",
+  });
+  assert.deepEqual(ops.supervisorCandidates(), []);
+  store.db
+    .prepare("UPDATE events SET created_at=? WHERE task_id=?")
+    .run("2020-01-01T00:00:00.000Z", active.task.id);
+  assert.deepEqual(
+    ops.supervisorCandidates().map((task) => task.id),
+    [active.task.id],
+  );
+  store.failTurn(
+    active.turn.id,
+    Object.assign(new Error("Runtime unavailable"), {
+      code: "CODEX_NOT_AVAILABLE",
+    }),
+    { preserveWorker: true },
+  );
+  const candidates = ops.supervisorCandidates();
+  assert.equal(candidates.filter((task) => task.status === "queued").length, 1);
+  assert.equal(candidates.filter((task) => task.status === "failed").length, 1);
+  scheduler.setPaused(true);
+  assert.deepEqual(ops.supervisorCandidates(), []);
+});
+
 test("the persistent supervisor stays quiet without tasks and checks after the configured interval", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-supervisor-interval-test-"),
@@ -1189,12 +1258,24 @@ test("the persistent supervisor stays quiet without tasks and checks after the c
   await ops.start();
   await new Promise((resolve) => setTimeout(resolve, 80));
   assert.equal(supervisor.calls.length, 0);
-  store.createTask({
+  const { task } = store.createTask({
     projectId: project.id,
     title: "Periodic check",
     message: "Watch this task every configured interval.",
     userName: "Tester",
   });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(
+    supervisor.calls.length,
+    0,
+    "fresh queue entries do not need AI audits",
+  );
+  store.db
+    .prepare("UPDATE tasks SET updated_at=? WHERE id=?")
+    .run("2020-01-01T00:00:00.000Z", task.id);
+  store.db
+    .prepare("UPDATE events SET created_at=? WHERE task_id=?")
+    .run("2020-01-01T00:00:00.000Z", task.id);
   await waitUntil(
     () => supervisor.calls.length >= 1,
     "scheduled persistent supervisor check",

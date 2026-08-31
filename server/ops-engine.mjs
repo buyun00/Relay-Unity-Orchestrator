@@ -238,6 +238,39 @@ export class OpsEngine {
       .filter((task) => SUPERVISED_TASK_STATUSES.has(task.status));
   }
 
+  supervisorCandidates() {
+    if (this.scheduler.status().paused) return [];
+    const cutoff =
+      Date.now() -
+      Math.max(1000, Number(this.config.opsTaskStallMs || 15 * 60_000));
+    const workers = this.store.listWorkers();
+    const queuedProjects = new Set();
+    return this.supervisedTasks().filter((task) => {
+      if (this.store.findActiveRecoveryTurn(task.id)) return false;
+      const latest = this.store.listTaskTurns(task.id).at(-1);
+      if (latest?.codexFinal?.status === "needs_input") return false;
+      if (task.status === "failed") return true;
+      const progressAt =
+        this.store.latestTaskProgressAt(task.id) || task.updatedAt;
+      if (Date.parse(progressAt) > cutoff) return false;
+      if (task.status === "queued") {
+        const compatible = workers.filter(
+          (worker) => worker.enabled && worker.projectId === task.projectId,
+        );
+        // Waiting behind a busy worker is normal backpressure, not a new
+        // incident for every task in the queue. Diagnose one queue per project.
+        if (
+          !compatible.some((worker) => worker.status === "ready") &&
+          compatible.some((worker) => worker.currentTurnId)
+        )
+          return false;
+        if (queuedProjects.has(task.projectId)) return false;
+        queuedProjects.add(task.projectId);
+      }
+      return true;
+    });
+  }
+
   async start() {
     if (this.running || !this.config.opsEnabled) return;
     this.running = true;
@@ -299,7 +332,7 @@ export class OpsEngine {
     if (!this.running) return null;
     this.lastSupervisorCheckAt = new Date().toISOString();
     this.scheduleNextSupervisorCheck();
-    const tasks = this.supervisedTasks();
+    const tasks = force ? this.supervisedTasks() : this.supervisorCandidates();
     if (!tasks.length) return null;
     const activeSystemTurn = this.store
       .listOpsTurns({ threadId: "ops-system", includeCleared: true })

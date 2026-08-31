@@ -1481,6 +1481,17 @@ export class Store {
       .map(eventFromRow);
   }
 
+  latestTaskProgressAt(taskId) {
+    return (
+      this.db
+        .prepare(
+          `SELECT MAX(created_at) AS at FROM events
+         WHERE task_id=? AND (type LIKE 'codex.%' OR type LIKE 'turn.%')`,
+        )
+        .get(taskId)?.at || null
+    );
+  }
+
   listProjects() {
     return this.db
       .prepare("SELECT * FROM projects ORDER BY name")
