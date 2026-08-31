@@ -958,10 +958,60 @@ export class HyperVAdapter {
       });
     }
 
+    if (!context.task.latestCommitSha && workspaceEstablished) {
+      return this.resumeLocalDraft(context, inspection, { signal, onProgress });
+    }
     return this.recoverPreserved(context, inspection, {
       signal,
       onProgress,
     });
+  }
+
+  async resumeLocalDraft(context, inspection, { signal, onProgress }) {
+    onProgress?.(
+      "workspace-local-draft",
+      `Resuming the existing local ${context.task.branchName}; unpublished work does not require a delivery SHA`,
+    );
+    const result = await this.powershell(
+      "Resume-LocalTaskBranch.ps1",
+      {
+        ...this.workerArguments(context.worker),
+        GuestProjectPath: required(
+          context.project.guestProjectPath,
+          "project.guestProjectPath",
+        ),
+        TaskBranch: context.task.branchName,
+        ExpectedCurrentBranch: required(inspection.branch, "inspection.branch"),
+        ExpectedCurrentHead: required(inspection.head, "inspection.head"),
+      },
+      { signal, timeoutMs: 240_000 },
+    );
+    if (
+      !result.ready ||
+      !result.localDraft ||
+      result.branch !== context.task.branchName ||
+      !/^[0-9a-f]{40}$/u.test(String(result.head || "")) ||
+      result.originalBranch !== inspection.branch ||
+      result.originalHead !== inspection.head
+    ) {
+      throw Object.assign(
+        new Error("Local task branch identity was not verified"),
+        {
+          code: "LOCAL_DRAFT_IDENTITY_UNPROVEN",
+          details: result,
+        },
+      );
+    }
+    onProgress?.(
+      "workspace-local-draft-resumed",
+      `Resumed unpublished local commit ${result.head}`,
+      result,
+    );
+    return this.finishPreservedResume(
+      context,
+      { ...result, inspection },
+      { onProgress },
+    );
   }
 
   async retryInitialPreparation(context, inspection, { signal, onProgress }) {
