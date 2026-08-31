@@ -1587,7 +1587,7 @@ export class PipelineHttpServer {
         return;
       }
       const taskMutation = pathname.match(
-        /^\/api\/tasks\/([^/]+)\/(messages|cancel|retry|close|complete-relay-only|reopen)$/,
+        /^\/api\/tasks\/([^/]+)\/(messages|cancel|retry|resume-preserved|close|complete-relay-only|reopen)$/,
       );
       if (taskMutation && request.method === "POST") {
         const taskId = decodeURIComponent(taskMutation[1]);
@@ -1631,6 +1631,15 @@ export class PipelineHttpServer {
             { ok: true, turn: this.scheduler.retryTask(taskId, actorName) },
             cors,
           );
+          return;
+        }
+        if (action === "resume-preserved") {
+          const turn = this.store.rebindQueuedTurnToPreservedWorker(
+            taskId,
+            actorName,
+          );
+          this.scheduler.notifyQueueChanged();
+          json(response, 200, { ok: true, turn }, cors);
           return;
         }
         if (action === "close") {

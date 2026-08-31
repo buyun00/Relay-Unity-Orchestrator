@@ -1467,6 +1467,51 @@ test("claiming preserved work atomically marks its attention worker busy", (t) =
   assert.equal(store.getWorker(worker.id).currentTurnId, continued.id);
 });
 
+test("an existing queued turn can rebind to its prior attention worker without replacing the prompt", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Queued recovery rebind",
+    message: "Preserve this original prompt",
+  });
+  const first = store.claimNextTurn();
+  store.setTaskThread(created.task.id, "thread-preserved-rebind");
+  store.completeTurn(first.turn.id, {
+    codexFinal: {
+      status: "completed",
+      summary: "Committed before validation follow-up",
+      changedFiles: [],
+      validation: [],
+      risks: [],
+    },
+    commitSha: "a".repeat(40),
+  });
+  store.setWorkerState(worker.id, "ready", {
+    currentTurnId: null,
+    error: null,
+  });
+  const continued = store.appendTurn(created.task.id, {
+    message: "Run the queued validation on the same thread",
+  });
+  assert.equal(continued.workerId, null);
+  const fingerprintBefore = store.taskPromptFingerprint(created.task.id);
+
+  store.setWorkerState(worker.id, "attention", {
+    currentTurnId: null,
+    error: "Infrastructure restarted while another turn was active",
+  });
+  const rebound = store.rebindQueuedTurnToPreservedWorker(
+    created.task.id,
+    "Recovery operator",
+  );
+
+  assert.equal(rebound.id, continued.id);
+  assert.equal(rebound.workerId, worker.id);
+  assert.equal(store.taskPromptFingerprint(created.task.id), fingerprintBefore);
+  const resumed = store.claimNextTurn();
+  assert.equal(resumed.turn.id, continued.id);
+  assert.equal(resumed.resumePreservedWorkspace, true);
+});
+
 test("autoRelease=false leaves a successful worker reserved", async (t) => {
   const config = createConfig();
   const adapter = new TrackingFakeAdapter(config);

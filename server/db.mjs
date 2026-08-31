@@ -2228,6 +2228,91 @@ export class Store {
     });
   }
 
+  rebindQueuedTurnToPreservedWorker(taskId, actorName = null) {
+    const task = this.getTask(taskId);
+    if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
+    if (!task.codexThreadId || !task.latestCommitSha) {
+      throw new HttpError(
+        409,
+        "PRESERVED_RESUME_IDENTITY_MISSING",
+        "A preserved resume requires both the existing Codex thread and the durable task commit",
+      );
+    }
+
+    const queuedTurns = this.db
+      .prepare(
+        "SELECT * FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence",
+      )
+      .all(taskId);
+    if (queuedTurns.length !== 1) {
+      throw new HttpError(
+        409,
+        "PRESERVED_RESUME_TURN_AMBIGUOUS",
+        "Exactly one queued turn is required for preserved recovery",
+      );
+    }
+    const queued = queuedTurns[0];
+    if (queued.worker_id) return this.getTurn(queued.id);
+
+    const preserved = this.db
+      .prepare(
+        `
+        SELECT workers.id AS worker_id
+        FROM turns
+        JOIN workers ON workers.id=turns.worker_id
+        WHERE turns.task_id=? AND turns.id<>?
+          AND turns.status IN ('success','failed','cancelled','interrupted')
+          AND workers.enabled=1 AND workers.status='attention'
+          AND workers.current_turn_id IS NULL
+          AND (workers.project_id=? OR workers.project_id IS NULL)
+        ORDER BY turns.sequence DESC
+        LIMIT 1
+      `,
+      )
+      .get(taskId, queued.id, task.projectId);
+    if (!preserved?.worker_id) {
+      throw new HttpError(
+        409,
+        "PRESERVED_RESUME_WORKER_UNAVAILABLE",
+        "No idle attention worker from this task history is available for preserved recovery",
+      );
+    }
+
+    let event;
+    this.transaction(() => {
+      const updated = this.db
+        .prepare(
+          `UPDATE turns SET worker_id=?
+           WHERE id=? AND task_id=? AND status='queued' AND worker_id IS NULL`,
+        )
+        .run(preserved.worker_id, queued.id, taskId);
+      if (!updated.changes) {
+        throw new HttpError(
+          409,
+          "PRESERVED_RESUME_STATE_CHANGED",
+          "The queued turn changed while preserved recovery was being assigned",
+        );
+      }
+      event = this.insertEvent({
+        taskId,
+        turnId: queued.id,
+        workerId: preserved.worker_id,
+        actorName,
+        type: "turn.preserved-worker.rebound",
+        phase: "queued",
+        message:
+          "Rebound the existing queued turn to its prior attention worker without changing the prompt or workspace",
+        data: {
+          workerId: preserved.worker_id,
+          branchName: task.branchName,
+          expectedHead: task.latestCommitSha,
+        },
+      });
+    });
+    this.notifyEvent(event);
+    return this.getTurn(queued.id);
+  }
+
   attachUploads(attachmentIds, taskId, turnId) {
     if (!Array.isArray(attachmentIds) || attachmentIds.length === 0) return;
     const statement = this.db.prepare(`
