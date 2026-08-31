@@ -4370,13 +4370,15 @@ export class Store {
     });
   }
 
-  claimNextOpsTurn() {
+  claimNextOpsTurn({ excludeThreadIds = [] } = {}) {
+    const excluded = [...new Set(excludeThreadIds)];
     return this.transaction(() => {
       const row = this.db
         .prepare(
           `
           SELECT queued.* FROM ops_turns AS queued
           WHERE queued.status='queued'
+            ${excluded.length ? `AND queued.thread_id NOT IN (${excluded.map(() => "?").join(",")})` : ""}
             AND NOT EXISTS (
               SELECT 1 FROM ops_turns AS active
               WHERE active.thread_id=queued.thread_id
@@ -4385,7 +4387,7 @@ export class Store {
           ORDER BY queued.created_at ASC LIMIT 1
         `,
         )
-        .get();
+        .get(...excluded);
       if (!row) return null;
       const timestamp = now();
       const claimed = this.db

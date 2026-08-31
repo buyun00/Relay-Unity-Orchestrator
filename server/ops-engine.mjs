@@ -619,7 +619,10 @@ export class OpsEngine {
         Number(this.config.opsMaxConcurrentSessions || 4),
       );
       while (this.running && this.activeTurns.size < maxConcurrentSessions) {
-        const turn = this.store.claimNextOpsTurn();
+        // Live execution ownership survives an accidental database requeue.
+        const turn = this.store.claimNextOpsTurn({
+          excludeThreadIds: [...this.activeTurns.keys()],
+        });
         if (!turn) break;
         const controller = new AbortController();
         this.activeTurns.set(turn.threadId, turn.id);
@@ -637,8 +640,12 @@ export class OpsEngine {
     try {
       await this.execute(turn, controller.signal);
     } finally {
-      this.activeTurns.delete(turn.threadId);
-      this.activeControllers.delete(turn.id);
+      if (this.activeControllers.get(turn.id) === controller) {
+        if (this.activeTurns.get(turn.threadId) === turn.id) {
+          this.activeTurns.delete(turn.threadId);
+        }
+        this.activeControllers.delete(turn.id);
+      }
       queueMicrotask(() => this.pump());
     }
   }

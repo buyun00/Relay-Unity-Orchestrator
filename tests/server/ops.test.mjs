@@ -384,6 +384,51 @@ test("manual System Codex messages resume the same durable Ops thread", async (t
   );
 });
 
+test("live Ops ownership prevents duplicate execution after an accidental database requeue", async (t) => {
+  const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "relay-ops-live-owner-"));
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const ops = new OpsEngine({ config, store, scheduler: {}, repairManager: {} });
+  const releases = new Map();
+  const calls = [];
+  ops.execute = async (turn) => {
+    calls.push(turn.id);
+    await new Promise((resolve) => releases.set(turn.id, resolve));
+    store.completeOpsTurn(turn.id, { status: "resolved" });
+  };
+  t.after(async () => {
+    ops.running = false;
+    for (const release of releases.values()) release();
+    await Promise.all([...ops.executions]);
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  ops.running = true;
+  const first = ops.sendMessage("Original recovery");
+  const originalController = ops.activeControllers.get(first.id);
+  store.requeueOpsTurn(first.id, "Simulated erroneous recovery by another process");
+  ops.pump();
+  assert.deepEqual(calls, [first.id]);
+  assert.equal(ops.activeControllers.get(first.id), originalController);
+  assert.equal(store.getOpsTurn(first.id).status, "queued");
+
+  const unrelatedThread = store.createOpsThread({
+    title: "Unrelated recovery",
+    codexModel: "test-model",
+    codexReasoningEffort: "high",
+    codexFastMode: false,
+  });
+  const unrelated = ops.sendMessage("Independent request", "Tester", unrelatedThread.id);
+  assert.deepEqual(calls, [first.id, unrelated.id]);
+  assert.equal(ops.activeTurns.size, 2);
+  const followup = ops.sendMessage("Follow-up on original thread");
+  assert.equal(calls.length, 2);
+  releases.get(first.id)();
+  await waitUntil(() => calls.includes(followup.id), "same-thread follow-up after original exits");
+  assert.equal(calls.filter((id) => id === first.id).length, 1);
+  assert.equal(store.getOpsTurn(first.id).status, "completed");
+});
+
 test("manual diagnosis stays read-only until the operator explicitly authorizes action", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-ops-manual-policy-test-"),
