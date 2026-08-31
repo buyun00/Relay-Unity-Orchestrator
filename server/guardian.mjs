@@ -12,6 +12,7 @@ import {
 } from "./ops-policy.mjs";
 import { RepairManager } from "./repair-manager.mjs";
 import { runProcess } from "./process.mjs";
+import { acquireRelayIdleWindow } from "./relay-restart-safety.mjs";
 import { id, now, parseJson } from "./util.mjs";
 
 const opsSchemaPath = fileURLToPath(
@@ -179,18 +180,42 @@ const guardianState = {
 let relayRestarting = false;
 let webRestarting = false;
 
+async function relayIdleWindow({ allowUnavailable = false } = {}) {
+  return acquireRelayIdleWindow({
+    allowUnavailable,
+    probe: () => probe(`http://127.0.0.1:${config.port}/api/health`),
+    setPaused: async (paused) => {
+      const response = await fetch(
+        `http://127.0.0.1:${config.port}/api/scheduler/${paused ? "pause" : "resume"}`,
+        { method: "POST", signal: AbortSignal.timeout(5_000) },
+      );
+      if (!response.ok)
+        throw new Error(`Relay scheduler control failed: ${response.status}`);
+      return response.json();
+    },
+  });
+}
+
 async function restartRelay(reason = "Guardian health recovery") {
   if (relayRestarting) return { accepted: true, alreadyRunning: true };
   relayRestarting = true;
+  let release;
+  let restarted = false;
   try {
+    release = await relayIdleWindow({
+      allowUnavailable:
+        guardianState.relayFailures >= config.guardianFailureThreshold,
+    });
     await stopRecognizedPort(config.port, "server[\\\\/]index\\.mjs");
     await waitForPortToClose(config.port);
     const pid = spawnService(config.relayEntry, "backend-guardian");
+    restarted = true;
     guardianState.relayRestarts += 1;
     guardianState.lastError = null;
     return { accepted: true, pid, reason };
   } finally {
     relayRestarting = false;
+    await release?.({ restarted });
   }
 }
 
@@ -283,7 +308,11 @@ async function activatePendingDeployment() {
   const deployment = readJsonFile(config.deploymentStatePath, null);
   if (!deployment || deployment.status !== "pending") return;
   guardianState.activationRunning = true;
+  let release;
+  let restarted = false;
   try {
+    // Deferral is not a failed deployment: do not stop web, build, or roll back.
+    release = await relayIdleWindow();
     deployment.attempts = Number(deployment.attempts || 0) + 1;
     deployment.status = "activating";
     deployment.activationStartedAt = now();
@@ -292,37 +321,53 @@ async function activatePendingDeployment() {
     await stopRecognizedPort(config.internalWebPort, "vinext.+\\bstart\\b");
     await buildMain();
     await restartRelay(`Deploying repair ${deployment.repairId}`);
+    restarted = true;
     await restartWeb(`Deploying repair ${deployment.repairId}`);
     await waitForServices();
     deployment.status = "healthy";
     deployment.healthyAt = now();
     writeJsonFile(config.deploymentStatePath, deployment);
   } catch (error) {
+    if (!release) {
+      deployment.deferredReason = error.message;
+      writeJsonFile(config.deploymentStatePath, deployment);
+      return;
+    }
     guardianState.lastError = error.message;
     deployment.activationError = error.message;
     try {
-      const head = (await git(["rev-parse", "HEAD"])).stdout.trim();
-      const dirty = (await git(["status", "--porcelain"])).stdout.trim();
-      if (head !== deployment.commitSha || dirty) {
-        throw new Error(
-          "Cannot automatically roll back because Relay source moved or is dirty",
-        );
+      // A new backend may already be executing work after activation. Never
+      // revert its source or restart it while those turns are in flight.
+      const releaseRollback = await relayIdleWindow();
+      let rollbackRestarted = false;
+      try {
+        const head = (await git(["rev-parse", "HEAD"])).stdout.trim();
+        const dirty = (await git(["status", "--porcelain"])).stdout.trim();
+        if (head !== deployment.commitSha || dirty) {
+          throw new Error(
+            "Cannot automatically roll back because Relay source moved or is dirty",
+          );
+        }
+        await git([
+          "-c",
+          `user.name=${config.gitAuthorName}`,
+          "-c",
+          `user.email=${config.gitAuthorEmail}`,
+          "revert",
+          "--no-edit",
+          deployment.commitSha,
+        ]);
+        await buildMain();
+        await restartRelay(`Rolling back repair ${deployment.repairId}`);
+        rollbackRestarted = true;
+        restarted = true;
+        await restartWeb(`Rolling back repair ${deployment.repairId}`);
+        await waitForServices();
+        deployment.status = "rolled_back";
+        deployment.rolledBackAt = now();
+      } finally {
+        await releaseRollback({ restarted: rollbackRestarted });
       }
-      await git([
-        "-c",
-        `user.name=${config.gitAuthorName}`,
-        "-c",
-        `user.email=${config.gitAuthorEmail}`,
-        "revert",
-        "--no-edit",
-        deployment.commitSha,
-      ]);
-      await buildMain();
-      await restartRelay(`Rolling back repair ${deployment.repairId}`);
-      await restartWeb(`Rolling back repair ${deployment.repairId}`);
-      await waitForServices();
-      deployment.status = "rolled_back";
-      deployment.rolledBackAt = now();
     } catch (rollbackError) {
       deployment.status = "rollback_failed";
       deployment.rollbackError = rollbackError.message;
@@ -331,6 +376,7 @@ async function activatePendingDeployment() {
     writeJsonFile(config.deploymentStatePath, deployment);
   } finally {
     guardianState.activationRunning = false;
+    await release?.({ restarted });
   }
 }
 
@@ -800,7 +846,8 @@ async function monitor() {
     const deployment = readJsonFile(config.deploymentStatePath, null);
     if (deployment?.status === "pending") {
       await activatePendingDeployment();
-      return;
+      if (readJsonFile(config.deploymentStatePath, null)?.status !== "pending")
+        return;
     }
     const [relay, web] = await Promise.all([
       probe(`http://127.0.0.1:${config.port}/api/health`),
