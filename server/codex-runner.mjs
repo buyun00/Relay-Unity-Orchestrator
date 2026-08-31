@@ -94,6 +94,7 @@ function buildPrompt(context) {
     auto: [
       "Relay executionProfile=auto for this turn: begin on the code-only route.",
       "Unity, UI, layout, Panel, View, and Prefab keywords do not by themselves justify Unity automation. Escalate to UnitySkills only after code-level investigation identifies the exact serialized asset or Editor operation required and explains why code alone cannot complete the request. Do not repair Unity merely to obtain optional validation evidence.",
+      "Explicitly requested Unity compilation, runtime interaction, object readback, or Game View evidence is required work, not optional validation. Those explicit requirements authorize escalation to the assigned Worker's UnitySkills REST endpoint even when the implementation is code-only; auto never waives them. Do not infer Unity is unavailable from the absence of an Editor on the Relay host. Preserve these requirements across automatic correction turns.",
       ...workerUnityRoute,
       `Only after that explicit escalation, if Unity or UnitySkills times out, inspect pending guest dialogs with ${dialogStateScript} using VMName ${context.worker.vmName} and CredentialPath ${context.worker.credentialPath}. For an unknown dialog, use ${dialogActionScript} only with the exact dialogId/buttonId returned by the state interface, and never authorize a high-risk action without explicit user authority.`,
     ],

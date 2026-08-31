@@ -1748,6 +1748,11 @@ test("Relay execution profiles keep code turns away from Unity and gate auto esc
     /exact serialized asset or Editor operation/,
   );
   assert.match(autoCall.options.input, /Only after that explicit escalation/);
+  assert.match(autoCall.options.input, /auto never waives them/);
+  assert.match(
+    autoCall.options.input,
+    /absence of an Editor on the Relay host/,
+  );
   assert.match(
     autoCall.options.input,
     /authoritative Unity endpoint for this assigned Worker unity-worker-01 is http:\/\/172\.30\.240\.11:8090/,
