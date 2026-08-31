@@ -238,14 +238,19 @@ class WorkspaceRefusingFakeAdapter extends FakeAdapter {
 }
 
 class BlockedResultFakeAdapter extends TrackingFakeAdapter {
+  shouldBlock = true;
+
   async runCodex(...args) {
     const result = await super.runCodex(...args);
-    result.final = {
-      ...result.final,
-      status: "blocked",
-      summary: "Unity requires operator attention",
-      risks: ["Workspace must remain preserved"],
-    };
+    if (this.shouldBlock) {
+      this.shouldBlock = false;
+      result.final = {
+        ...result.final,
+        status: "blocked",
+        summary: "Unity requires operator attention",
+        risks: ["Workspace must remain preserved"],
+      };
+    }
     return result;
   }
 }
@@ -407,7 +412,7 @@ test("verified delivery writes the OZDQP outbox from task.branchName", async (t)
   );
 });
 
-test("push failure does not write the OZDQP outbox", async (t) => {
+test("push failure is corrected in the task conversation and never dispatches the failed turn", async (t) => {
   const { store, scheduler, project, worker } = createHarness(t, {
     repoUrl: "http://git.dominogm.com/diaoyu/ozdqp.git",
     autoBuildEnabled: true,
@@ -422,22 +427,31 @@ test("push failure does not write the OZDQP outbox", async (t) => {
   scheduler.notifyQueueChanged();
   await waitUntil(
     () =>
-      store.getTurn(created.turn.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention" &&
+      store.getTask(created.task.id).status === "waiting_user" &&
+      store.getWorker(worker.id).status === "ready" &&
       scheduler.status().activeTurns === 0,
-    "the failed remote push",
+    "the task conversation to correct the failed remote push",
   );
 
   assert.equal(store.getBuildDispatchForTurn(created.turn.id), null);
+  const turns = store.listTaskTurns(created.task.id);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].errorCode, "GIT_PUSH_FAILED");
+  assert.equal(turns[1].authorName, "Relay Task Feedback");
+  assert.equal(turns[1].status, "success");
   assert.equal(
     store
       .listTaskEvents(created.task.id)
-      .some((event) => event.type === "build.dispatch.queued"),
+      .some(
+        (event) =>
+          event.turnId === created.turn.id &&
+          event.type === "build.dispatch.queued",
+      ),
     false,
   );
 });
 
-test("structured blocked result preserves attention and suppresses every delivery step", async (t) => {
+test("structured blocked result is sent back to the same task Codex conversation", async (t) => {
   const config = createConfig();
   const adapter = new BlockedResultFakeAdapter(config);
   const { store, scheduler, project, worker } = createHarness(t, { adapter });
@@ -451,31 +465,35 @@ test("structured blocked result preserves attention and suppresses every deliver
   await waitUntil(
     () =>
       store.getTurn(created.turn.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention" &&
+      store.listTaskTurns(created.task.id).at(-1)?.status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
       scheduler.status().activeTurns === 0,
-    "the blocked result to preserve attention",
+    "the blocked result to be corrected in the task conversation",
   );
 
   const turn = store.getTurn(created.turn.id);
+  const feedbackTurn = store.listTaskTurns(created.task.id).at(-1);
   assert.equal(turn.errorCode, "CODEX_BLOCKED");
   assert.equal(turn.codexFinal.status, "blocked");
-  assert.equal(adapter.auditCalls, 0);
-  assert.equal(adapter.finalizeCalls, 0);
-  assert.equal(adapter.releaseCalls, 0);
+  assert.equal(feedbackTurn.authorName, "Relay Task Feedback");
+  assert.equal(feedbackTurn.status, "success");
+  assert.equal(adapter.codexContexts.length, 2);
+  assert.equal(adapter.auditCalls, 1);
+  assert.equal(adapter.finalizeCalls, 1);
+  assert.equal(adapter.releaseCalls, 1);
   assert.equal(store.getBuildDispatchForTurn(created.turn.id), null);
-  assert.equal(
+  assert.ok(
     store
       .listTaskEvents(created.task.id)
-      .some((event) =>
-        ["turn.delivery", "turn.unity-save", "turn.delivered"].includes(
-          event.type,
-        ),
+      .some(
+        (event) =>
+          event.turnId === created.turn.id &&
+          event.type === "turn.task-feedback",
       ),
-    false,
   );
 });
 
-test("task.retry reuses the original completed turn for exact-audit delivery only", async (t) => {
+test("delivery failure automatically resumes the original task Codex once", async (t) => {
   const config = createConfig();
   const adapter = new FailFirstDeliveryFakeAdapter(config);
   const { store, scheduler, project, worker } = createHarness(t, { adapter });
@@ -489,37 +507,21 @@ test("task.retry reuses the original completed turn for exact-audit delivery onl
   await waitUntil(
     () =>
       store.getTurn(created.turn.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention" &&
+      store.listTaskTurns(created.task.id).at(-1)?.status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
       scheduler.status().activeTurns === 0,
-    "the initial delivery failure",
+    "the original task conversation to recover the delivery failure",
   );
 
   const failed = store.getTurn(created.turn.id);
+  const feedback = store.listTaskTurns(created.task.id).at(-1);
   assert.equal(failed.codexFinal.status, "completed");
   assert.equal(failed.deliveryAudit.safeForDeliveryRetry, true);
-  assert.equal(adapter.codexContexts.length, 1);
-  assert.equal(adapter.finalizeCalls, 1);
-
-  const retried = scheduler.retryTask(created.task.id, "Operator");
-  assert.equal(retried.id, created.turn.id);
-  assert.equal(retried.executionMode, "delivery_only");
-  assert.deepEqual(
-    store.listTaskTurns(created.task.id).map((turn) => turn.id),
-    [created.turn.id],
-    "delivery retry must not create a continuation turn",
-  );
-
-  await waitUntil(
-    () =>
-      store.getTurn(created.turn.id).status === "success" &&
-      store.getWorker(worker.id).status === "ready" &&
-      scheduler.status().activeTurns === 0,
-    "the delivery-only retry",
-  );
-
-  assert.equal(adapter.codexContexts.length, 1, "Codex must not relaunch");
-  assert.equal(adapter.auditCalls, 1, "the original audit must be reused");
-  assert.equal(adapter.deliveryRetryVerifyCalls, 1);
+  assert.equal(feedback.authorName, "Relay Task Feedback");
+  assert.equal(feedback.status, "success");
+  assert.equal(adapter.codexContexts.length, 2);
+  assert.equal(adapter.auditCalls, 2);
+  assert.equal(adapter.deliveryRetryVerifyCalls, 0);
   assert.equal(adapter.finalizeCalls, 2);
   assert.ok(
     store
@@ -527,7 +529,7 @@ test("task.retry reuses the original completed turn for exact-audit delivery onl
       .some(
         (event) =>
           event.turnId === created.turn.id &&
-          event.type === "turn.delivery-retry.queued",
+          event.type === "turn.task-feedback",
       ),
   );
 });
@@ -809,33 +811,49 @@ test("delivery-only retry rejects valid-looking HEAD and content-hash drift befo
   for (const field of ["head", "hash"]) {
     await t.test(field, async (subtest) => {
       const config = createConfig();
-      const adapter = new FailFirstDeliveryFakeAdapter(config);
+      const adapter = new TrackingFakeAdapter(config);
       const { store, scheduler, project, worker } = createHarness(subtest, {
         adapter,
       });
       const created = createTask(store, project.id, {
         title: `Reject ${field} drift`,
       });
-      scheduler.start();
-      scheduler.notifyQueueChanged();
-      await waitUntil(
-        () =>
-          store.getTurn(created.turn.id).status === "failed" &&
-          scheduler.status().activeTurns === 0,
-        "the initial delivery failure",
+      const claimed = store.claimNextTurn();
+      store.setTurnPhase(created.turn.id, "running");
+      const codexFinal = {
+        status: "completed",
+        summary: "Completed before delivery retry",
+        changedFiles: ["Assets/Only.cs"],
+        validation: ["Validated"],
+        risks: [],
+      };
+      store.recordCodexCompletion(created.turn.id, codexFinal);
+      const audit = await adapter.auditDeliveryWorkspace(claimed, codexFinal);
+      store.recordDeliveryAudit(created.turn.id, audit);
+      store.failTurn(
+        created.turn.id,
+        Object.assign(new Error("Transient delivery failure"), {
+          code: "UNITY_SAVE_FAILED",
+        }),
+        { preserveWorker: true },
       );
-      const audit = store.getTurn(created.turn.id).deliveryAudit;
       if (field === "head") audit.head = "9".repeat(40);
       else audit.files[0].sha256 = "9".repeat(64);
       store.db
         .prepare("UPDATE turns SET delivery_audit_json=? WHERE id=?")
         .run(JSON.stringify(audit), created.turn.id);
 
+      await scheduler.start({ paused: true });
+      store.onEvent((event) => {
+        if (event.type === "turn.task-feedback") scheduler.setPaused(true);
+      });
       const retried = scheduler.retryTask(created.task.id, "Operator");
       assert.equal(retried.id, created.turn.id);
+      scheduler.setPaused(false);
       await waitUntil(
         () =>
           store.getTurn(created.turn.id).status === "failed" &&
+          store.listTaskTurns(created.task.id).length === 2 &&
           scheduler.status().activeTurns === 0,
         `the ${field} mismatch refusal`,
       );
@@ -845,9 +863,12 @@ test("delivery-only retry rejects valid-looking HEAD and content-hash drift befo
         "DELIVERY_RETRY_AUDIT_MISMATCH",
       );
       assert.equal(store.getWorker(worker.id).status, "attention");
-      assert.equal(adapter.codexContexts.length, 1);
-      assert.equal(adapter.finalizeCalls, 1);
-      assert.equal(store.listTaskTurns(created.task.id).length, 1);
+      assert.equal(adapter.codexContexts.length, 0);
+      assert.equal(adapter.finalizeCalls, 0);
+      assert.equal(
+        store.listTaskTurns(created.task.id).at(-1).authorName,
+        "Relay Task Feedback",
+      );
     });
   }
 });
@@ -1098,7 +1119,7 @@ test("Codex progress messages are stored as durable conversation events", async 
   );
 });
 
-test("a message after delivery failure resumes the preserved worker without preparing again", async (t) => {
+test("automatic task feedback resumes the preserved worker without preparing again", async (t) => {
   const config = createConfig();
   const adapter = new TrackingFakeAdapter(config);
   const store = new Store(config);
@@ -1124,17 +1145,18 @@ test("a message after delivery failure resumes the preserved worker without prep
   await waitUntil(
     () =>
       store.getTurn(created.turn.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention" &&
+      store.listTaskTurns(created.task.id).at(-1)?.status === "success" &&
+      store.getWorker(worker.id).status === "ready" &&
       scheduler.status().activeTurns === 0,
-    "the simulated push failure",
+    "the automatic preserved-workspace continuation",
   );
 
   const failedTurn = store.getTurn(created.turn.id);
   assert.equal(failedTurn.errorCode, "GIT_PUSH_FAILED");
-  assert.equal(store.getTask(created.task.id).status, "failed");
-  assert.equal(store.getWorker(worker.id).status, "attention");
+  assert.equal(store.getTask(created.task.id).status, "waiting_user");
+  assert.equal(store.getWorker(worker.id).status, "ready");
   assert.equal(store.getWorker(worker.id).currentTurnId, null);
-  assert.equal(adapter.releaseCalls, 0);
+  assert.equal(adapter.releaseCalls, 1);
   assert.equal(adapter.prepareCalls, 1);
   assert.equal(
     store
@@ -1147,18 +1169,10 @@ test("a message after delivery failure resumes the preserved worker without prep
     false,
   );
 
-  const continued = store.appendTurn(created.task.id, {
-    message: "Continue after the Unity dialog was dismissed",
-  });
+  const continued = store.listTaskTurns(created.task.id).at(-1);
   assert.equal(continued.workerId, worker.id);
-  scheduler.notifyQueueChanged();
-  await waitUntil(
-    () =>
-      store.getTurn(continued.id).status === "success" &&
-      store.getWorker(worker.id).status === "ready" &&
-      scheduler.status().activeTurns === 0,
-    "the preserved workspace follow-up to complete",
-  );
+  assert.equal(continued.authorName, "Relay Task Feedback");
+  assert.equal(continued.status, "success");
   assert.equal(adapter.prepareCalls, 1);
   assert.equal(adapter.resumeCalls, 1);
   assert.equal(adapter.verifyCalls, 1);

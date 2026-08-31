@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexRunner } from "../codex-runner.mjs";
 import { runProcess } from "../process.mjs";
-import { resolveWorkerTemplate } from "../util.mjs";
+import { deliveryAuditFingerprint, resolveWorkerTemplate } from "../util.mjs";
 
 const scriptsDirectory = fileURLToPath(
   new URL("../../scripts/hyperv/", import.meta.url),
@@ -64,6 +64,90 @@ function parseJsonRecord(text) {
 function codexStringArray(value) {
   if (!Array.isArray(value)) return [];
   return value.map((item) => String(item));
+}
+
+function deliveryAuditForFinalization(context, deliveryAudit) {
+  const taskBranch = required(context.task.branchName, "task.branchName");
+  const files = Array.isArray(deliveryAudit?.files)
+    ? deliveryAudit.files
+    : null;
+  if (
+    deliveryAudit?.version !== 1 ||
+    deliveryAudit?.ready !== true ||
+    deliveryAudit?.exact !== true ||
+    deliveryAudit?.branch !== taskBranch ||
+    !deliveryAudit?.head ||
+    !files
+  ) {
+    throw Object.assign(
+      new Error(
+        "Delivery workspace ownership, branch, HEAD, or actual file state could not be established",
+      ),
+      {
+        code: "DELIVERY_AUDIT_TASK_CORRECTION_REQUIRED",
+        blockedPaths: Array.isArray(deliveryAudit?.blockedPaths)
+          ? deliveryAudit.blockedPaths.map(String)
+          : [],
+        details: deliveryAudit,
+      },
+    );
+  }
+
+  const unsafeFiles = files.filter(
+    (file) =>
+      file?.unsafeReason ||
+      typeof file?.path !== "string" ||
+      !/^[ MA]{2}$/u.test(String(file?.code || "")) ||
+      !/[MA]/u.test(String(file?.code || "")),
+  );
+  if (unsafeFiles.length) {
+    throw Object.assign(
+      new Error(
+        "The actual Git workspace contains deleted, missing, untracked, renamed, or unsupported files that the task Codex must correct",
+      ),
+      {
+        code: "DELIVERY_AUDIT_TASK_CORRECTION_REQUIRED",
+        blockedPaths: unsafeFiles.map((file) => String(file?.path || "")),
+        details: deliveryAudit,
+      },
+    );
+  }
+
+  if (
+    deliveryAudit.safeForDeliveryRetry === true &&
+    deliveryAudit.completeFileSet === true
+  ) {
+    return { audit: deliveryAudit, advisory: false };
+  }
+
+  const reportedPaths = new Set(codexStringArray(deliveryAudit.changedFiles));
+  const unownedFiles = files.filter((file) => !reportedPaths.has(file.path));
+  if (unownedFiles.length) {
+    throw Object.assign(
+      new Error(
+        "The actual workspace includes files outside this task's reported change set; the task Codex must distinguish its own changes from unrelated drift",
+      ),
+      {
+        code: "DELIVERY_AUDIT_TASK_CORRECTION_REQUIRED",
+        blockedPaths: unownedFiles.map((file) => String(file.path)),
+        details: deliveryAudit,
+      },
+    );
+  }
+
+  const audit = {
+    ...deliveryAudit,
+    safeForDeliveryRetry: true,
+    completeFileSet: true,
+    changedFiles: files.map((file) => String(file.path)),
+    validation: codexStringArray(deliveryAudit.validation),
+    blockedPaths: [],
+    source: deliveryAudit.source || "workspace",
+    message:
+      "Relay used the actual tracked Git workspace within the task's reported change set; already-committed reported paths were advisory.",
+  };
+  audit.fingerprint = deliveryAuditFingerprint(audit);
+  return { advisory: true, audit };
 }
 
 function repositoryRelativeCodexPaths(context, value) {
@@ -1254,18 +1338,18 @@ export class HyperVAdapter {
   }
 
   async finalize(context, { signal, onProgress, deliveryAudit }) {
-    if (
-      deliveryAudit?.ready !== true ||
-      deliveryAudit?.exact !== true ||
-      deliveryAudit?.safeForDeliveryRetry !== true ||
-      deliveryAudit?.completeFileSet !== true ||
-      !Array.isArray(deliveryAudit?.files)
-    ) {
-      throw Object.assign(
-        new Error(
-          "An exact safe delivery audit is required before Unity save and Git finalization",
-        ),
-        { code: "DELIVERY_AUDIT_REQUIRED" },
+    const normalized = deliveryAuditForFinalization(context, deliveryAudit);
+    const finalizationAudit = normalized.audit;
+    if (normalized.advisory) {
+      onProgress?.(
+        "delivery-audit-advisory",
+        "Codex changedFiles did not match Git; using the actual tracked workspace file set and continuing delivery",
+        {
+          reportedFiles: Array.isArray(deliveryAudit?.changedFiles)
+            ? deliveryAudit.changedFiles.length
+            : 0,
+          actualFiles: finalizationAudit.files.length,
+        },
       );
     }
     const configuredUnitySaveUrl = resolveWorkerTemplate(
@@ -1310,19 +1394,21 @@ export class HyperVAdapter {
         },
       );
     }
-    await this.verifyDeliveryRetryWorkspace(context, deliveryAudit, {
-      signal,
-      onProgress: (phase, message, data = null) =>
-        onProgress?.(
-          phase === "delivery-retry-audit"
-            ? "delivery-audit-post-save"
-            : phase,
-          phase === "delivery-retry-audit"
-            ? "Verifying Unity save did not change the exact audited delivery workspace"
-            : message,
-          data,
-        ),
-    });
+    if (!normalized.advisory) {
+      await this.verifyDeliveryRetryWorkspace(context, finalizationAudit, {
+        signal,
+        onProgress: (phase, message, data = null) =>
+          onProgress?.(
+            phase === "delivery-retry-audit"
+              ? "delivery-audit-post-save"
+              : phase,
+            phase === "delivery-retry-audit"
+              ? "Verifying Unity save did not change the exact audited delivery workspace"
+              : message,
+            data,
+          ),
+      });
+    }
     onProgress?.("commit", "Committing changes inside the guest");
     onProgress?.(
       "push",
@@ -1341,7 +1427,7 @@ export class HyperVAdapter {
         GitAuthorName: this.config.gitAuthorName || "Relay Unity Orchestrator",
         GitAuthorEmail:
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
-        ExpectedAuditJson: JSON.stringify(deliveryAudit),
+        ExpectedAuditJson: JSON.stringify(finalizationAudit),
       },
       { signal },
     );

@@ -40,6 +40,34 @@ function threadIdFromEvent(event) {
   return event.thread_id || event.threadId || event.thread?.id || null;
 }
 
+const TASK_FEEDBACK_AUTHOR = "Relay Task Feedback";
+
+function compactFailureDetails(error, deliveryAudit) {
+  const blockedPaths = [
+    ...(Array.isArray(error?.blockedPaths) ? error.blockedPaths : []),
+    ...(Array.isArray(deliveryAudit?.blockedPaths)
+      ? deliveryAudit.blockedPaths
+      : []),
+  ]
+    .map(String)
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .slice(0, 12);
+  const lines = [
+    `Failure code: ${error?.code || "TURN_EXECUTION_FAILED"}`,
+    `Failure message: ${String(error?.message || error).slice(0, 2_000)}`,
+  ];
+  if (blockedPaths.length) {
+    lines.push(`Affected paths: ${blockedPaths.join(", ")}`);
+  }
+  if (deliveryAudit) {
+    lines.push(
+      `Workspace audit: branch=${deliveryAudit.branch || "unknown"}, head=${deliveryAudit.head || "unknown"}, actualFiles=${Array.isArray(deliveryAudit.files) ? deliveryAudit.files.length : "unknown"}`,
+    );
+  }
+  return lines;
+}
+
 export class Scheduler {
   constructor({ config, store, adapter }) {
     this.config = config;
@@ -183,12 +211,63 @@ export class Scheduler {
     });
   }
 
+  queueTaskFeedback(context, error, { stage, deliveryAudit } = {}) {
+    this.store.failTurn(context.turn.id, error, { preserveWorker: true });
+    if (context.turn.authorName === TASK_FEEDBACK_AUTHOR) {
+      this.emitProgress(
+        context,
+        "task-feedback-exhausted",
+        `${error.message}. The same task Codex already received one automatic correction; the workspace remains preserved for monitoring or user intervention.`,
+        "warning",
+        { code: error.code, stage, taskFeedbackQueued: false },
+      );
+      return null;
+    }
+
+    const existing = this.store
+      .listTaskTurns(context.task.id)
+      .find(
+        (turn) =>
+          turn.status === "queued" && turn.authorName === TASK_FEEDBACK_AUTHOR,
+      );
+    const feedbackTurn =
+      existing ||
+      this.store.appendTurn(context.task.id, {
+        message: [
+          "This is an automatic correction inside the same task, Codex conversation, branch, and preserved workspace. Do not create a separate repair task.",
+          `The previous turn reached stage '${stage || "unknown"}' and could not continue:`,
+          ...compactFailureDetails(error, deliveryAudit),
+          "Inspect the actual branch, HEAD, and Git status; correct the task output or its structured final result, then finish the original task and validation. Preserve all existing work and do not reset or delete files.",
+          "If progress requires missing user input or authorization, return needs_input with the precise question; do not invent permission.",
+        ].join("\n"),
+        priority: context.turn.priority,
+        executionProfile: context.turn.executionProfile,
+        userName: TASK_FEEDBACK_AUTHOR,
+      });
+    this.emitProgress(
+      context,
+      "task-feedback",
+      `${error.message}. Relay queued one concise correction in the original task Codex conversation instead of opening a repair conversation.`,
+      "warning",
+      {
+        code: error.code,
+        stage,
+        taskFeedbackQueued: true,
+        feedbackTurnId: feedbackTurn.id,
+      },
+    );
+    return feedbackTurn;
+  }
+
   async execute(context, controller) {
     const signal = controller.signal;
+    let stage = context.deliveryOnlyRetry ? "delivery-retry" : "prepare";
+    let codexConversationActive = false;
+    let codexFinal;
+    let deliveryAudit = context.turn.deliveryAudit || null;
     try {
-      let codexFinal;
-      let deliveryAudit = context.turn.deliveryAudit || null;
       if (context.deliveryOnlyRetry) {
+        codexConversationActive = true;
         codexFinal = context.turn.codexFinal;
         if (
           codexFinal?.status !== "completed" ||
@@ -222,6 +301,7 @@ export class Scheduler {
         );
       } else {
         if (context.resumePreservedWorkspace) {
+          stage = "workspace-resume";
           this.emitProgress(
             context,
             "resume",
@@ -233,6 +313,7 @@ export class Scheduler {
               this.emitProgress(context, phase, message, "info", data),
           });
         } else {
+          stage = "workspace-prepare";
           this.emitProgress(
             context,
             "prepare",
@@ -254,6 +335,7 @@ export class Scheduler {
         if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
 
         this.store.setTurnPhase(context.turn.id, "running");
+        stage = "codex";
         this.emitProgress(
           context,
           "codex",
@@ -264,6 +346,12 @@ export class Scheduler {
         const codexResult = await this.adapter.runCodex(context, {
           signal,
           onEvent: (event) => {
+            if (
+              ["thread.started", "turn.started"].includes(event?.type) ||
+              event?.type?.startsWith("item.")
+            ) {
+              codexConversationActive = true;
+            }
             const threadId = threadIdFromEvent(event);
             if (threadId) this.store.setTaskThread(context.task.id, threadId);
             const type = event?.type || "codex.event";
@@ -300,6 +388,7 @@ export class Scheduler {
             }
           },
         });
+        codexConversationActive = true;
         this.store.setTaskThread(context.task.id, codexResult.threadId);
         if (this.store.getTurn(context.turn.id)?.status === "cancelled") return;
         codexFinal = codexResult.final;
@@ -310,11 +399,17 @@ export class Scheduler {
           const message = blocked
             ? "Codex reported that the turn is blocked; delivery was suppressed"
             : "Codex requires user input; delivery was suppressed";
-          this.store.failTurn(
-            context.turn.id,
-            Object.assign(new Error(message), { code }),
-            { preserveWorker: true },
-          );
+          const error = Object.assign(new Error(message), { code });
+          if (blocked) {
+            this.queueTaskFeedback(context, error, {
+              stage: "codex-result",
+              deliveryAudit,
+            });
+            return;
+          }
+          this.store.failTurn(context.turn.id, error, {
+            preserveWorker: true,
+          });
           this.emitProgress(
             context,
             blocked ? "blocked" : "needs-input",
@@ -324,6 +419,7 @@ export class Scheduler {
           );
           return;
         }
+        stage = "delivery-audit";
         deliveryAudit = await this.adapter.auditDeliveryWorkspace(
           context,
           codexFinal,
@@ -337,6 +433,7 @@ export class Scheduler {
       }
 
       this.store.setTurnPhase(context.turn.id, "saving");
+      stage = "delivery";
       this.emitProgress(
         context,
         "delivery",
@@ -458,6 +555,28 @@ export class Scheduler {
         return;
       }
       const error = errorWithCode(caught, "TURN_EXECUTION_FAILED");
+      if (
+        !signal.aborted &&
+        (codexConversationActive || codexFinal || context.deliveryOnlyRetry)
+      ) {
+        try {
+          this.queueTaskFeedback(context, error, { stage, deliveryAudit });
+          return;
+        } catch (feedbackError) {
+          const routingError = errorWithCode(
+            feedbackError,
+            "TASK_FEEDBACK_QUEUE_FAILED",
+          );
+          this.emitProgress(
+            context,
+            "failed",
+            `${error.message}. The task feedback turn could not be queued: ${routingError.message}. The worker workspace remains preserved.`,
+            "error",
+            { code: routingError.code, originalCode: error.code, stage },
+          );
+          return;
+        }
+      }
       this.store.failTurn(context.turn.id, error, { preserveWorker: true });
       const failureData = { code: error.code };
       if (Array.isArray(error.blockedPaths) && error.blockedPaths.length) {

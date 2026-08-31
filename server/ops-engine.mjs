@@ -106,7 +106,8 @@ function promptIntegrityExtends(beforeIntegrity, afterIntegrity) {
     : [];
   if (afterArchive.length < beforeArchive.length) return false;
   return beforeArchive.every(
-    (entry, index) => JSON.stringify(afterArchive[index]) === JSON.stringify(entry),
+    (entry, index) =>
+      JSON.stringify(afterArchive[index]) === JSON.stringify(entry),
   );
 }
 
@@ -403,8 +404,8 @@ export class OpsEngine {
       const sameWorker = event.workerId && incident.workerId === event.workerId;
       const sameRecoveryTarget = Boolean(
         sameRecoveryKind &&
-          (!incident.taskId || sameTask) &&
-          (!incident.workerId || sameWorker),
+        (!incident.taskId || sameTask) &&
+        (!incident.workerId || sameWorker),
       );
       if (!sameTask && !sameWorker && !sameRecoveryTarget) continue;
       this.store.updateIncident(incident.id, {
@@ -620,14 +621,14 @@ export class OpsEngine {
       "Your job is to diagnose any Relay, Hyper-V worker, Unity task, Git delivery, web, Guardian, or Relay-code incident.",
       "For each non-terminal task, distinguish normal long-running work from a real stall using task detail, persistent JSONL progress, Worker/Unity health, Git evidence, and delivery state.",
       "Do not declare a task stuck merely because it is slow. Require concrete stale or contradictory evidence.",
-      "When a real problem needs hands-on work, return a codex.repair action targeting the affected task. That launches a fresh GPT-5.6 Sol xhigh conversation with unrestricted machine access.",
-      "Do not try to compress the repair into this supervisor turn and do not substitute worker.restart when a fresh repair conversation can investigate safely.",
-      "Describe the evidence, fault, and required success condition in codex.repair, but do not add tool bans or operational restrictions that are absent from the immutable user prompt or platform policy. The recovery Codex chooses the repair method.",
+      "Task validation, delivery audit, Unity save, Git finalization, and structured blocked results belong to the original task Codex conversation. Use task.continue with a concise error and success condition; do not open a repair conversation for them.",
+      "Use codex.repair only when concrete evidence proves the original task Codex could not start or resume because the worker, runtime, or workspace ownership infrastructure failed before Codex produced a result.",
+      "Describe only the evidence, fault, and required success condition. Avoid duplicating audits, policy restatements, or large context already present in the immutable task prompt.",
       "The complete immutable task prompt archive in the context is authoritative. Never replace, shorten, rewrite, or lose it.",
       ...actionPolicyPrompt(turn),
       "For an attention worker with a preserved failed task, prefer task.continue with precise recovery instructions so the same Codex thread and workspace are resumed without reset.",
       "Use worker.release only when delivery is already durable. Use worker.restart for infrastructure faults, not to discard uncommitted task work.",
-      "For checkpoint-maintenance incidents, use checkpoint.refresh only after the evidence shows the entire Relay task queue is empty, the worker is idle, and the failure is safely retryable. The action atomically rechecks queued and executing turns plus worker readiness, and never touches a busy or attention workspace. Use codex.repair when Git, UnitySkills, DialogGuard, Hyper-V, or retention state needs hands-on diagnosis.",
+      "For checkpoint-maintenance incidents, use checkpoint.refresh only after the evidence shows the entire Relay task queue is empty, the worker is idle, and the failure is safely retryable. The action atomically rechecks queued and executing turns plus worker readiness, and never touches a busy or attention workspace. Use codex.repair only for a pre-Codex infrastructure failure that prevents the original task conversation from running.",
       "Checkpoint-maintenance invariant: never add, commit, or push guest-local .meta drift. The configured remote base branch is authoritative. The guarded refresh restores only pure unstaged Unity-generated .meta drift; if any non-.meta, staged, renamed, or copied work is present, preserve the entire workspace and keep the maintenance gate closed.",
       "Never delete or manipulate AVHDX/VHDX files. Checkpoint rotation is allowed only through the checkpoint maintenance action, which creates and canary-verifies the new PROJECT_READY before pruning the oldest managed checkpoint.",
       "If Relay code is the root cause, use relay.repair with a complete repair instruction. It creates an isolated worktree, rejects file deletions, validates, commits, fast-forwards, and asks Guardian to restart.",
@@ -1049,6 +1050,108 @@ export class OpsEngine {
         reason: "target-left-supervised-state-before-action",
       };
     }
+    if (task) {
+      const taskTurns = this.store.listTaskTurns(task.id);
+      const latestTaskTurn = taskTurns.at(-1) || null;
+      const taskConversationStarted = taskTurns.some(
+        (candidate) => candidate.codexFinal != null,
+      );
+      const activeTaskTurn = taskTurns.find((candidate) =>
+        ["queued", "preparing", "running", "saving"].includes(candidate.status),
+      );
+      if (taskConversationStarted && activeTaskTurn) {
+        this.store.emit({
+          taskId: task.id,
+          turnId: activeTaskTurn.id,
+          opsTurnId: turn.id,
+          actorName: "Relay Persistent Supervisor",
+          type: "ops.recovery.skipped",
+          phase: "ops",
+          message: `Skipped a separate repair conversation because task #${task.number} is already continuing in its original Codex conversation`,
+          data: {
+            targetTaskId: task.id,
+            taskTurnId: activeTaskTurn.id,
+            reason: "original-task-conversation-active",
+          },
+        });
+        return {
+          pending: true,
+          skipped: true,
+          targetTaskId: task.id,
+          taskTurnId: activeTaskTurn.id,
+          reason: "original-task-conversation-active",
+        };
+      }
+      if (latestTaskTurn?.codexFinal) {
+        if (
+          latestTaskTurn.authorName === "Relay Task Feedback" ||
+          latestTaskTurn.codexFinal.status === "needs_input"
+        ) {
+          const reason =
+            latestTaskTurn.codexFinal.status === "needs_input"
+              ? "task-awaiting-user-input"
+              : "task-feedback-already-attempted";
+          this.store.emit({
+            taskId: task.id,
+            turnId: latestTaskTurn.id,
+            opsTurnId: turn.id,
+            actorName: "Relay Persistent Supervisor",
+            type: "ops.recovery.skipped",
+            phase: "ops",
+            message: `Task #${task.number} requires monitoring or user input; preserving its original conversation instead of creating a repair conversation`,
+            data: {
+              targetTaskId: task.id,
+              taskTurnId: latestTaskTurn.id,
+              reason,
+            },
+          });
+          return {
+            pending: false,
+            skipped: true,
+            targetTaskId: task.id,
+            taskTurnId: latestTaskTurn.id,
+            reason,
+          };
+        }
+        const feedbackTurn = this.store.appendTurn(task.id, {
+          message: [
+            "Continue the original task in this same Codex conversation and preserved workspace.",
+            action.message || diagnosis.diagnosis,
+            action.reason ? `Reason: ${action.reason}` : null,
+            diagnosis.verification
+              ? `Success condition: ${diagnosis.verification}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          priority: latestTaskTurn.priority,
+          executionProfile: latestTaskTurn.executionProfile,
+          userName: "Relay Task Feedback",
+        });
+        this.store.emit({
+          taskId: task.id,
+          turnId: feedbackTurn.id,
+          opsTurnId: turn.id,
+          actorName: "Relay Persistent Supervisor",
+          type: "ops.recovery.rerouted",
+          phase: "ops",
+          message: `Rerouted recovery to task #${task.number}'s original Codex conversation`,
+          data: {
+            targetTaskId: task.id,
+            taskTurnId: feedbackTurn.id,
+            reason: "post-codex-failure-belongs-to-task",
+          },
+        });
+        this.scheduler.notifyQueueChanged();
+        return {
+          pending: true,
+          rerouted: true,
+          targetTaskId: task.id,
+          taskTurnId: feedbackTurn.id,
+          reason: "post-codex-failure-belongs-to-task",
+        };
+      }
+    }
     const active = this.store.findActiveRecoveryTurn(targetTaskId);
     if (active) {
       return {
@@ -1189,16 +1292,63 @@ export class OpsEngine {
             "OPS_TARGET_MISSING",
             "Task target is required",
           );
+        const task = this.store.getTask(targetId);
+        if (
+          turn.trigger !== "manual" &&
+          task &&
+          !SUPERVISED_TASK_STATUSES.has(task.status)
+        ) {
+          return {
+            pending: false,
+            skipped: true,
+            targetTaskId: task.id,
+            reason: "target-left-supervised-state-before-action",
+          };
+        }
+        const taskTurns = this.store.listTaskTurns(targetId);
+        const activeTaskTurn = taskTurns.find((candidate) =>
+          ["queued", "preparing", "running", "saving"].includes(
+            candidate.status,
+          ),
+        );
+        if (turn.trigger !== "manual" && activeTaskTurn) {
+          return {
+            pending: true,
+            deduplicated: true,
+            turnId: activeTaskTurn.id,
+          };
+        }
+        const latestTaskTurn = taskTurns.at(-1);
+        if (
+          turn.trigger !== "manual" &&
+          (latestTaskTurn?.authorName === "Relay Task Feedback" ||
+            latestTaskTurn?.codexFinal?.status === "needs_input")
+        ) {
+          return {
+            pending: false,
+            skipped: true,
+            turnId: latestTaskTurn.id,
+            reason: "task-needs-monitoring-or-user-input",
+          };
+        }
         const queued = this.store.appendTurn(targetId, {
           message:
             action.message ||
             `Recover the preserved task after this failure: ${incident?.error || diagnosis.diagnosis}`,
-          userName: actorName,
+          userName:
+            turn.trigger === "manual" ? actorName : "Relay Task Feedback",
         });
         this.scheduler.notifyQueueChanged();
         return { pending: true, turnId: queued.id };
       }
       case "task.retry": {
+        if (turn.trigger !== "manual") {
+          return this.performAction(
+            turn,
+            { ...action, type: "task.continue", targetId },
+            diagnosis,
+          );
+        }
         if (!targetId)
           throw new HttpError(
             400,

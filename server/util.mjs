@@ -13,6 +13,30 @@ export function shortSha(seed = crypto.randomUUID()) {
   return crypto.createHash("sha1").update(seed).digest("hex");
 }
 
+export function deliveryAuditFingerprint({
+  branch,
+  head,
+  changedFiles,
+  validation,
+  files,
+}) {
+  const records = files
+    .map(
+      (file) =>
+        `${file.code}\0${file.originalPath || ""}\0${file.path}\0${file.gitBlob.toLowerCase()}\0${file.sha256.toLowerCase()}`,
+    )
+    .sort();
+  const payload = [
+    "relay-delivery-audit-v1",
+    branch,
+    head.toLowerCase(),
+    [...changedFiles].sort().join("\0"),
+    validation.join("\0"),
+    records.join("\0"),
+  ].join("\0");
+  return crypto.createHash("sha256").update(payload, "utf8").digest("hex");
+}
+
 export function parseJson(value, fallback = null) {
   if (value == null || value === "") return fallback;
   try {

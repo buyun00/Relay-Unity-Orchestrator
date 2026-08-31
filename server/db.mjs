@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   asBoolean,
+  deliveryAuditFingerprint,
   executionProfile,
   HttpError,
   id,
@@ -66,30 +67,6 @@ function stringArray(value) {
 
 function exactJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function deliveryAuditFingerprint({
-  branch,
-  head,
-  changedFiles,
-  validation,
-  files,
-}) {
-  const records = files
-    .map(
-      (file) =>
-        `${file.code}\0${file.originalPath || ""}\0${file.path}\0${file.gitBlob.toLowerCase()}\0${file.sha256.toLowerCase()}`,
-    )
-    .sort();
-  const payload = [
-    "relay-delivery-audit-v1",
-    branch,
-    head.toLowerCase(),
-    [...changedFiles].sort().join("\0"),
-    validation.join("\0"),
-    records.join("\0"),
-  ].join("\0");
-  return createHash("sha256").update(payload, "utf8").digest("hex");
 }
 
 function parseLegacyCodexJsonl(jsonlPath) {

@@ -777,10 +777,7 @@ test("a failed initial preparation without a commit retries preparation without 
   const preparation = calls.find(
     (call) => call.name === "Prepare-Workspace.ps1",
   );
-  assert.equal(
-    preparation.args[preparation.args.indexOf("-Mode") + 1],
-    "new",
-  );
+  assert.equal(preparation.args[preparation.args.indexOf("-Mode") + 1], "new");
   assert.equal(
     calls.some((call) =>
       ["Restore-Worker.ps1", "Recover-Workspace.ps1"].includes(call.name),
@@ -1317,7 +1314,9 @@ test("delivery audit converts assigned host and guest absolute paths to reposito
 test("delivery audit rejects absolute changed files outside assigned project roots", async () => {
   const adapter = new HyperVAdapter(config(), {
     processRunner: async () => {
-      throw new Error("PowerShell must not run for an out-of-root changed file");
+      throw new Error(
+        "PowerShell must not run for an out-of-root changed file",
+      );
     },
     codex: { inspect: async () => ({}) },
   });
@@ -1329,6 +1328,127 @@ test("delivery audit rejects absolute changed files outside assigned project roo
     }),
     (error) => error.code === "DELIVERY_CHANGED_FILE_OUTSIDE_PROJECT",
   );
+});
+
+test("Codex changedFiles mismatch is advisory when the actual tracked workspace is safe", async () => {
+  const calls = [];
+  const deliveredSha = "8".repeat(40);
+  const processRunner = async (_command, args) => {
+    calls.push({ script: scriptName(args), args });
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        commitSha: deliveredSha,
+        remoteSha: deliveredSha,
+        pushed: true,
+        verified: true,
+      }),
+      stderr: "",
+    };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+  const audit = {
+    ...exactDeliveryAudit(),
+    safeForDeliveryRetry: false,
+    completeFileSet: false,
+    changedFiles: ["Assets/AlreadyCommitted.cs"],
+    blockedPaths: ["Assets/AlreadyCommitted.cs"],
+    files: [],
+  };
+  const progress = [];
+
+  const result = await adapter.finalize(context(), {
+    deliveryAudit: audit,
+    onProgress: (phase) => progress.push(phase),
+  });
+
+  assert.equal(result.commitSha, deliveredSha);
+  assert.deepEqual(
+    calls.map((call) => call.script),
+    ["Finalize-Workspace.ps1"],
+  );
+  assert.ok(progress.includes("delivery-audit-advisory"));
+  const expectedAuditIndex = calls[0].args.indexOf("-ExpectedAuditJson");
+  const normalized = JSON.parse(calls[0].args[expectedAuditIndex + 1]);
+  assert.equal(normalized.safeForDeliveryRetry, true);
+  assert.equal(normalized.completeFileSet, true);
+  assert.deepEqual(normalized.changedFiles, []);
+  assert.deepEqual(normalized.blockedPaths, []);
+});
+
+test("actual deletion remains a hard safety stop for task-level correction", async () => {
+  const calls = [];
+  const adapter = new HyperVAdapter(config(), {
+    processRunner: async (_command, args) => {
+      calls.push({ script: scriptName(args), args });
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+    codex: { inspect: async () => ({}) },
+  });
+  const audit = {
+    ...exactDeliveryAudit(),
+    safeForDeliveryRetry: false,
+    completeFileSet: true,
+    changedFiles: ["Assets/Removed.prefab"],
+    blockedPaths: ["Assets/Removed.prefab"],
+    files: [
+      {
+        code: " D",
+        path: "Assets/Removed.prefab",
+        originalPath: null,
+        gitBlob: "",
+        sha256: "",
+        unsafeReason: "deleted",
+      },
+    ],
+  };
+
+  await assert.rejects(
+    adapter.finalize(context(), { deliveryAudit: audit }),
+    (error) =>
+      error.code === "DELIVERY_AUDIT_TASK_CORRECTION_REQUIRED" &&
+      error.blockedPaths.includes("Assets/Removed.prefab"),
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("unrelated tracked drift is never normalized into the task commit", async () => {
+  const calls = [];
+  const adapter = new HyperVAdapter(config(), {
+    processRunner: async (_command, args) => {
+      calls.push({ script: scriptName(args), args });
+      return { exitCode: 0, stdout: "{}", stderr: "" };
+    },
+    codex: { inspect: async () => ({}) },
+  });
+  const audit = {
+    ...exactDeliveryAudit(),
+    safeForDeliveryRetry: false,
+    completeFileSet: false,
+    changedFiles: ["Assets/TaskChange.cs"],
+    blockedPaths: ["Assets/TaskChange.cs", "Assets/Launcher.unity"],
+    files: [
+      {
+        code: " M",
+        path: "Assets/Launcher.unity",
+        originalPath: null,
+        gitBlob: "1".repeat(40),
+        sha256: "2".repeat(64),
+        unsafeReason: null,
+      },
+    ],
+  };
+
+  await assert.rejects(
+    adapter.finalize(context(), { deliveryAudit: audit }),
+    (error) =>
+      error.code === "DELIVERY_AUDIT_TASK_CORRECTION_REQUIRED" &&
+      error.blockedPaths.includes("Assets/Launcher.unity"),
+  );
+  assert.deepEqual(calls, []);
 });
 
 test("Unity save receives only an explicit guest-loopback request URL instead of the corporate authority", async () => {
@@ -1660,7 +1780,9 @@ test("Unity routing falls back to the assigned Worker's resolved health origin",
     call.options.input,
     /assigned Worker unity-worker-02 is http:\/\/172\.30\.240\.12:8090/,
   );
-  assert.ok(call.args.includes('mcp_servers.unity.url="http://172.30.240.12:8090/mcp"'));
+  assert.ok(
+    call.args.includes('mcp_servers.unity.url="http://172.30.240.12:8090/mcp"'),
+  );
 });
 
 test("task 17 invokes Codex resume with the existing durable thread instead of starting a new one", async (t) => {

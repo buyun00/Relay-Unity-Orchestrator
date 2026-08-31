@@ -277,7 +277,7 @@ class UnrestrictedRecoverySession {
   }
 }
 
-test("attention failures automatically enter the persistent Ops conversation and recover", async (t) => {
+test("a started task Codex failure self-corrects without entering Ops repair", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-ops-test-"),
   );
@@ -315,30 +315,22 @@ test("attention failures automatically enter the persistent Ops conversation and
 
   await waitUntil(
     () =>
-      store.listIncidents().some((incident) => incident.resolvedAt) &&
-      store.getWorker(worker.id).status === "ready",
-    "automatic incident recovery",
+      store.listTaskTurns(store.listTasks()[0].id).at(-1)?.status ===
+        "success" && store.getWorker(worker.id).status === "ready",
+    "in-conversation task correction",
   );
-  const incident = store.listIncidents()[0];
-  assert.equal(incident.status, "resolved");
-  assert.ok(incident.attemptCount >= 1);
-  assert.equal(store.getOpsThread().codexThreadId, "ops-codex-thread");
-  assert.ok(
-    store
-      .listOpsActions()
-      .some(
-        (action) =>
-          action.type === "task.continue" && action.status === "completed",
-      ),
-  );
-  assert.equal(
-    store.listTaskTurns(store.listTasks()[0].id).at(-1).status,
-    "success",
-  );
+  assert.deepEqual(store.listIncidents(), []);
+  assert.deepEqual(store.listOpsActions(), []);
+  assert.equal(session.calls.length, 0);
+  const turns = store.listTaskTurns(store.listTasks()[0].id);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].errorCode, "CODEX_EXEC_FAILED");
+  assert.equal(turns[1].authorName, "Relay Task Feedback");
+  assert.equal(turns.at(-1).status, "success");
   assert.ok(
     store
       .listEvents({ limit: 250 })
-      .some((event) => event.type === "ops.incident.resolved"),
+      .some((event) => event.type === "turn.task-feedback"),
   );
 });
 
@@ -849,6 +841,115 @@ test("five-minute supervisor skips a stale repair after the target task finishes
   );
 });
 
+test("a stale repair action for a post-Codex failure is rerouted to the original task conversation", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-ops-reroute-test-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project, worker } = seed(store);
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "Post-Codex delivery failure",
+    message: "Finish the original task.",
+    userName: "Tester",
+  });
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const recovery = new UnrestrictedRecoverySession();
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { recoverySessionRunner: recovery },
+  );
+  t.after(() => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  store.claimNextTurn();
+  store.setTurnPhase(turn.id, "running");
+  store.recordCodexCompletion(turn.id, {
+    status: "completed",
+    summary: "Task work completed before delivery failed.",
+    changedFiles: ["Assets/Changed.cs"],
+    validation: ["Validated"],
+    risks: [],
+  });
+  store.failTurn(
+    turn.id,
+    Object.assign(new Error("Delivery audit needs task correction"), {
+      code: "DELIVERY_AUDIT_TASK_CORRECTION_REQUIRED",
+    }),
+    { preserveWorker: true },
+  );
+  store.ensureOpsThread();
+  const monitorTurn = store.appendOpsTurn({
+    threadId: "ops-system",
+    message: "Stale repair recommendation",
+    trigger: "monitor",
+    authorName: "Relay 5-minute Supervisor",
+  });
+
+  const result = ops.queueRecoveryConversation(
+    monitorTurn,
+    {
+      type: "codex.repair",
+      targetId: task.id,
+      message: "Correct the delivery state.",
+      reason: "The audit reported a task-level issue.",
+    },
+    {
+      diagnosis: "Codex already completed the task turn.",
+      verification: "Deliver the original task successfully.",
+    },
+  );
+
+  assert.equal(result.rerouted, true);
+  assert.equal(result.targetTaskId, task.id);
+  assert.equal(recovery.calls.length, 0);
+  const taskTurns = store.listTaskTurns(task.id);
+  assert.equal(taskTurns.length, 2);
+  assert.equal(taskTurns[1].authorName, "Relay Task Feedback");
+  assert.equal(taskTurns[1].workerId, worker.id);
+  const duplicate = await ops.performAction(
+    monitorTurn,
+    { type: "task.continue", targetId: task.id, message: "Continue again." },
+    { diagnosis: "Repeated stale monitor result." },
+  );
+  assert.equal(duplicate.deduplicated, true);
+  assert.equal(duplicate.turnId, taskTurns[1].id);
+  assert.equal(store.listTaskTurns(task.id).length, 2);
+  store.failTurn(
+    taskTurns[1].id,
+    Object.assign(new Error("The automatic correction could not finish"), {
+      code: "CODEX_BLOCKED",
+    }),
+    { preserveWorker: true },
+  );
+  const exhausted = await ops.performAction(
+    monitorTurn,
+    { type: "task.retry", targetId: task.id, message: "Retry again." },
+    { diagnosis: "Repeated stale monitor result." },
+  );
+  assert.equal(exhausted.skipped, true);
+  assert.equal(store.listTaskTurns(task.id).length, 2);
+  assert.ok(
+    store
+      .listEvents({ limit: 100 })
+      .some((event) => event.type === "ops.recovery.rerouted"),
+  );
+});
+
 test("unrestricted recovery preserves its starting archive while allowing a concurrent append-only user turn", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-recovery-append-only-prompt-test-"),
@@ -871,7 +972,8 @@ test("unrestricted recovery preserves its starting archive while allowing a conc
   const supervisor = new PersistentSupervisorSession(task.id);
   const recovery = new UnrestrictedRecoverySession(() => {
     store.appendTurn(task.id, {
-      message: "A concurrent user refinement must be appended, not mistaken for a rewrite.",
+      message:
+        "A concurrent user refinement must be appended, not mistaken for a rewrite.",
       userName: "Concurrent user",
     });
   });
@@ -901,7 +1003,9 @@ test("unrestricted recovery preserves its starting archive while allowing a conc
     () =>
       store
         .listOpsTurns({ includeCleared: true })
-        .find((turn) => turn.trigger === "repair" && turn.status === "completed"),
+        .find(
+          (turn) => turn.trigger === "repair" && turn.status === "completed",
+        ),
     "append-only recovery conversation",
   );
 
