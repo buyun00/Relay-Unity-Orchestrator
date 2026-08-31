@@ -1416,7 +1416,12 @@ export class HyperVAdapter {
         },
       );
     }
-    const requiresUnitySave = deliveryAudit.source !== "head-commit";
+    const auditedWorkspaceFileCount = Array.isArray(finalizationAudit.files)
+      ? finalizationAudit.files.length
+      : 0;
+    const requiresUnitySave =
+      finalizationAudit.source !== "head-commit" &&
+      auditedWorkspaceFileCount > 0;
     if (configuredUnitySaveUrl && requiresUnitySave) {
       const guestUnitySkillsEndpoint =
         this.config.unityGuestLocalEndpoint || "http://127.0.0.1:8090";
@@ -1437,10 +1442,13 @@ export class HyperVAdapter {
     } else if (configuredUnitySaveUrl) {
       onProgress?.(
         "unity-save",
-        "Skipping redundant Unity save because the exact audit already comes from the committed HEAD",
+        auditedWorkspaceFileCount === 0
+          ? "Skipping Unity save because the exact audit contains no workspace changes to persist"
+          : "Skipping redundant Unity save because the exact audit already comes from the committed HEAD",
         {
-          source: deliveryAudit.source,
-          head: deliveryAudit.head,
+          source: finalizationAudit.source,
+          head: finalizationAudit.head,
+          auditedWorkspaceFileCount,
         },
       );
     }

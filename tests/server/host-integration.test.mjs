@@ -1454,7 +1454,20 @@ test("unrelated tracked drift is never normalized into the task commit", async (
 test("Unity save receives only an explicit guest-loopback request URL instead of the corporate authority", async () => {
   const calls = [];
   const deliveredSha = "8".repeat(40);
-  const deliveryAudit = exactDeliveryAudit();
+  const deliveryAudit = {
+    ...exactDeliveryAudit(),
+    changedFiles: ["Assets/Task.asset"],
+    files: [
+      {
+        code: " M",
+        path: "Assets/Task.asset",
+        originalPath: null,
+        gitBlob: "1".repeat(40),
+        sha256: "2".repeat(64),
+        unsafeReason: null,
+      },
+    ],
+  };
   const processRunner = async (command, args) => {
     calls.push({ script: scriptName(args), args });
     if (scriptName(args) === "Finalize-Workspace.ps1") {
@@ -1512,6 +1525,67 @@ test("Unity save receives only an explicit guest-loopback request URL instead of
       "Get-DeliveryWorkspaceAudit.ps1",
       "Finalize-Workspace.ps1",
     ],
+  );
+});
+
+test("exact validation-only delivery skips Unity save so unrelated runtime scene drift cannot create an audit retry", async () => {
+  const calls = [];
+  const deliveredSha = "6".repeat(40);
+  const deliveryAudit = exactDeliveryAudit();
+  const processRunner = async (command, args) => {
+    const script = scriptName(args);
+    calls.push(script);
+    assert.notEqual(script, "Save-UnityProject.ps1");
+    if (script === "Get-DeliveryWorkspaceAudit.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(deliveryAudit),
+        stderr: "",
+      };
+    }
+    if (script === "Finalize-Workspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          commitSha: deliveredSha,
+          remoteSha: deliveredSha,
+          pushed: true,
+          verified: true,
+        }),
+        stderr: "",
+      };
+    }
+    throw new Error(`Unexpected PowerShell script: ${script}`);
+  };
+  const adapter = new HyperVAdapter(
+    config({
+      allowUnitySaveSkip: false,
+      unityGuestLocalEndpoint: "http://127.0.0.1:8090",
+    }),
+    { processRunner, codex: { inspect: async () => ({}) } },
+  );
+  const deliveryContext = context();
+  deliveryContext.project.unitySaveUrl =
+    "http://{internalIp}:8090/skill/editor_execute_menu";
+  const progress = [];
+
+  await adapter.finalize(deliveryContext, {
+    deliveryAudit,
+    onProgress: (phase, message, data) =>
+      progress.push({ phase, message, data }),
+  });
+
+  assert.deepEqual(calls, [
+    "Get-DeliveryWorkspaceAudit.ps1",
+    "Finalize-Workspace.ps1",
+  ]);
+  assert.ok(
+    progress.some(
+      (entry) =>
+        entry.phase === "unity-save" &&
+        entry.data?.auditedWorkspaceFileCount === 0 &&
+        entry.message.includes("no workspace changes"),
+    ),
   );
 });
 
