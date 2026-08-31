@@ -307,7 +307,9 @@ export class OpsEngine {
     if (activeSystemTurn && !force) return null;
     const message = [
       "Five-minute persistent supervisor check.",
-      "Inspect every listed task and decide whether it is progressing normally or needs a fresh unrestricted repair conversation.",
+      "Check for concrete loss of progress, not missing audit paperwork. Leave normally queued and actively progressing tasks alone.",
+      "Send task-level validation, delivery, and structured-result corrections to the original task Codex. Do not repeat full acceptance checklists or create a competing repair conversation.",
+      "Use a separate recovery conversation only when infrastructure prevents the original task Codex from starting or resuming.",
       ...tasks.map(
         (task) =>
           `Task #${task.number} ${task.id}: status=${task.status}; branch=${task.branchName}; updatedAt=${task.updatedAt}`,
@@ -798,6 +800,7 @@ export class OpsEngine {
       "Do not return merely because you found a likely cause or launched an asynchronous action. Inspect its result, repair follow-on failures, and verify the task state.",
       "The one non-negotiable invariant is task-prompt preservation: never delete, replace, shorten, rewrite, or summarize away the original task title, any user turn, or its attachment references.",
       "Continue the existing Task and Codex thread/workspace whenever they exist. Do not create a replacement task as a shortcut.",
+      "Once the original task Codex is running and producing progress, return immediately. Do not concurrently edit its workspace, drive its Unity session, poll it to completion, or redo its task acceptance. Task-level corrections belong in that original conversation.",
       "A database-level immutable archive protects every prompt. Confirm its fingerprint before and after recovery.",
       "Treat the supervisor's recovery assignment as diagnostic context and a required outcome, not as an extra action restriction. Unless a constraint comes from the immutable user prompt, current user authorization, or platform policy, choose any repair method and use any available tool.",
       "For checkpoint-maintenance recovery, never add, commit, or push guest-local .meta drift. Treat the configured remote base branch as authoritative and use the guarded checkpoint refresh to restore pure unstaged Unity-generated .meta-only drift. Preserve and report the entire workspace instead if any non-.meta, staged, renamed, or copied change is present.",
@@ -872,6 +875,56 @@ export class OpsEngine {
         Object.assign(new Error("Recovery Codex conversation not found"), {
           code: "RECOVERY_THREAD_NOT_FOUND",
         }),
+      );
+      return;
+    }
+    // A recovery can sit in the queue (or be requeued across a restart) long
+    // after its diagnosis went stale. Recheck before launching another writer.
+    const targetTask = turn.targetTaskId
+      ? this.store.getTask(turn.targetTaskId)
+      : null;
+    const targetTurns = targetTask
+      ? this.store.listTaskTurns(targetTask.id)
+      : [];
+    const latestTargetTurn = targetTurns.at(-1);
+    const originalTaskRunning = targetTurns.some((candidate) =>
+      ["running", "saving"].includes(candidate.status),
+    );
+    if (
+      targetTask &&
+      (!SUPERVISED_TASK_STATUSES.has(targetTask.status) ||
+        originalTaskRunning ||
+        latestTargetTurn?.codexFinal)
+    ) {
+      const routing = this.queueRecoveryConversation(
+        { ...turn, trigger: "monitor", incidentId: null },
+        {
+          targetId: targetTask.id,
+          message: [
+            "Resolve the latest task-level failure in this original conversation; validate only the requested change, proportionally.",
+            latestTargetTurn?.errorMessage,
+            latestTargetTurn?.codexFinal?.question,
+          ]
+            .filter(Boolean)
+            .join("\n")
+            .slice(0, 4000),
+        },
+        {
+          diagnosis:
+            "Rechecked a stale queued recovery against current task state.",
+        },
+      );
+      this.store.completeOpsTurn(turn.id, {
+        status: "completed",
+        summary:
+          "Stale separate recovery retired; the original task owns execution and task-level corrections.",
+        routing,
+      });
+      this.emit(
+        turn,
+        "已收敛过期修复会话；原任务负责继续执行和任务内纠偏",
+        "info",
+        routing,
       );
       return;
     }
@@ -1059,7 +1112,11 @@ export class OpsEngine {
       const activeTaskTurn = taskTurns.find((candidate) =>
         ["queued", "preparing", "running", "saving"].includes(candidate.status),
       );
-      if (taskConversationStarted && activeTaskTurn) {
+      if (
+        activeTaskTurn &&
+        (taskConversationStarted ||
+          ["running", "saving"].includes(activeTaskTurn.status))
+      ) {
         this.store.emit({
           taskId: task.id,
           turnId: activeTaskTurn.id,

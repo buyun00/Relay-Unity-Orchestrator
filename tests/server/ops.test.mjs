@@ -841,6 +841,78 @@ test("five-minute supervisor skips a stale repair after the target task finishes
   );
 });
 
+test("queued recovery retires when the original first Codex turn is already running", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-stale-recovery-start-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "Already working",
+    message: "Do the task.",
+    userName: "Tester",
+  });
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const recovery = new UnrestrictedRecoverySession();
+  const ops = new OpsEngine(
+    { config, store, scheduler, repairManager: { run: async () => null } },
+    { recoverySessionRunner: recovery },
+  );
+  t.after(() => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  store.ensureOpsThread();
+  const parent = store.appendOpsTurn({
+    threadId: "ops-system",
+    message: "Old diagnosis",
+    trigger: "monitor",
+  });
+  const queued = ops.queueRecoveryConversation(
+    parent,
+    { targetId: task.id, message: "Recover infrastructure" },
+    {},
+  );
+  store.claimNextTurn();
+  store.setTurnPhase(turn.id, "running");
+  store.setTaskThread(task.id, "original-first-task-thread");
+  await ops.executeRecoveryTurn(
+    store
+      .listOpsTurns({ includeCleared: true })
+      .find((item) => item.id === queued.recoveryTurnId),
+    new AbortController().signal,
+  );
+  assert.equal(recovery.calls.length, 0);
+  assert.equal(store.listTaskTurns(task.id).length, 1);
+  assert.equal(store.getTurn(turn.id).status, "running");
+  assert.equal(
+    store.getTask(task.id).codexThreadId,
+    "original-first-task-thread",
+  );
+  const retired = store
+    .listOpsTurns({ includeCleared: true })
+    .find((item) => item.id === queued.recoveryTurnId);
+  assert.equal(retired.status, "completed");
+  assert.equal(
+    retired.final.routing.reason,
+    "original-task-conversation-active",
+  );
+  const again = ops.queueRecoveryConversation(
+    parent,
+    { targetId: task.id, message: "Stale duplicate" },
+    {},
+  );
+  assert.equal(again.skipped, true);
+});
+
 test("a stale repair action for a post-Codex failure is rerouted to the original task conversation", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-ops-reroute-test-"),
