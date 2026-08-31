@@ -1278,6 +1278,59 @@ test("workspace preparation and finalization receive a repository-local Git iden
   assert.doesNotMatch(finalizeSource, /Invoke-Git\s+@\('add',\s*'-A'/);
 });
 
+test("delivery audit converts assigned host and guest absolute paths to repository-relative paths", async () => {
+  const calls = [];
+  const deliveryAudit = exactDeliveryAudit();
+  const processRunner = async (command, args) => {
+    calls.push({ script: scriptName(args), args });
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify(deliveryAudit),
+      stderr: "",
+    };
+  };
+  const adapter = new HyperVAdapter(config(), {
+    processRunner,
+    codex: { inspect: async () => ({}) },
+  });
+
+  await adapter.auditDeliveryWorkspace(context(), {
+    changedFiles: [
+      "\\\\172.30.240.11\\Work\\UnityProject\\Assets\\Host.cs",
+      "D:\\Work\\UnityProject\\Assets\\Guest.cs",
+      "Assets\\Relative.cs",
+    ],
+    validation: [],
+  });
+
+  const audit = calls.find(
+    (call) => call.script === "Get-DeliveryWorkspaceAudit.ps1",
+  );
+  const changedFilesIndex = audit.args.indexOf("-ChangedFilesJson");
+  assert.deepEqual(JSON.parse(audit.args[changedFilesIndex + 1]), [
+    "Assets/Host.cs",
+    "Assets/Guest.cs",
+    "Assets/Relative.cs",
+  ]);
+});
+
+test("delivery audit rejects absolute changed files outside assigned project roots", async () => {
+  const adapter = new HyperVAdapter(config(), {
+    processRunner: async () => {
+      throw new Error("PowerShell must not run for an out-of-root changed file");
+    },
+    codex: { inspect: async () => ({}) },
+  });
+
+  await assert.rejects(
+    adapter.auditDeliveryWorkspace(context(), {
+      changedFiles: ["C:\\outside\\Unexpected.cs"],
+      validation: [],
+    }),
+    (error) => error.code === "DELIVERY_CHANGED_FILE_OUTSIDE_PROJECT",
+  );
+});
+
 test("Unity save receives only an explicit guest-loopback request URL instead of the corporate authority", async () => {
   const calls = [];
   const deliveredSha = "8".repeat(40);

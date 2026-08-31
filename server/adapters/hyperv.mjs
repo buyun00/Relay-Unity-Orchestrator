@@ -66,6 +66,36 @@ function codexStringArray(value) {
   return value.map((item) => String(item));
 }
 
+function repositoryRelativeCodexPaths(context, value) {
+  const guestRoot = required(
+    context.project.guestProjectPath,
+    "project.guestProjectPath",
+  );
+  const hostRoot = required(context.worker.sharePath, "worker.sharePath");
+  return codexStringArray(value).map((candidate) => {
+    if (!path.win32.isAbsolute(candidate)) {
+      return candidate.replaceAll("\\", "/");
+    }
+    for (const root of [hostRoot, guestRoot]) {
+      const relative = path.win32.relative(root, candidate);
+      if (
+        relative &&
+        relative !== ".." &&
+        !relative.startsWith(`..${path.win32.sep}`) &&
+        !path.win32.isAbsolute(relative)
+      ) {
+        return relative.replaceAll("\\", "/");
+      }
+    }
+    throw Object.assign(
+      new Error(
+        `Codex reported a changed file outside the assigned project roots: '${candidate}'`,
+      ),
+      { code: "DELIVERY_CHANGED_FILE_OUTSIDE_PROJECT" },
+    );
+  });
+}
+
 function guestLocalUnitySaveUrl(configuredSaveUrl, guestEndpoint) {
   let configured;
   let guest;
@@ -1145,7 +1175,7 @@ export class HyperVAdapter {
           "task.baseBranch",
         )}`,
         ChangedFilesJson: JSON.stringify(
-          codexStringArray(codexFinal?.changedFiles),
+          repositoryRelativeCodexPaths(context, codexFinal?.changedFiles),
         ),
         ValidationJson: JSON.stringify(
           codexStringArray(codexFinal?.validation),
@@ -1196,7 +1226,7 @@ export class HyperVAdapter {
         )}`,
         ExpectedHead: required(expectedAudit?.head, "deliveryAudit.head"),
         ChangedFilesJson: JSON.stringify(
-          codexStringArray(expectedAudit?.changedFiles),
+          repositoryRelativeCodexPaths(context, expectedAudit?.changedFiles),
         ),
         ValidationJson: JSON.stringify(
           codexStringArray(expectedAudit?.validation),
