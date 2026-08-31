@@ -23,6 +23,22 @@ namespace Relay.UnityDialogGuard.Tests
 
             Application application = new Application();
             Window window = BuildWindow(mode, output, variant);
+            if (mode == "owned-scene")
+            {
+                Window owner = new Window {
+                    Title = "Fixture Editor", Width = 400, Height = 200,
+                    Content = new TextBlock { Text = "Fixture editor owner window" }
+                };
+                owner.ContentRendered += delegate
+                {
+                    window.Owner = owner;
+                    window.ShowInTaskbar = false;
+                    window.Closed += delegate { owner.Close(); };
+                    window.ShowDialog();
+                };
+                application.Run(owner);
+                return 0;
+            }
             application.Run(window);
             return 0;
         }
@@ -35,14 +51,16 @@ namespace Relay.UnityDialogGuard.Tests
             bool known = String.Equals(
                 mode,
                 "known",
-                StringComparison.OrdinalIgnoreCase);
+                StringComparison.OrdinalIgnoreCase) || mode == "known-stuck";
             bool ai = String.Equals(
                 mode,
                 "ai",
                 StringComparison.OrdinalIgnoreCase);
             Window window = new Window
             {
-                Title = known
+                Title = mode == "owned-scene"
+                    ? "The open scene(s) have been modified externally"
+                    : known
                     ? "UI Document was modified externally"
                     : ai
                         ? "Unknown AI Decision Notice"
@@ -88,10 +106,10 @@ namespace Relay.UnityDialogGuard.Tests
             Grid.SetRow(buttons, 1);
             grid.Children.Add(buttons);
 
-            if (known)
+            if (known || mode == "owned-scene")
             {
-                AddButton(buttons, window, output, "Reload");
-                AddButton(buttons, window, output, "Ignore");
+                AddButton(buttons, window, output, "Reload", mode != "known-stuck");
+                AddButton(buttons, window, output, "Ignore", mode != "known-stuck");
             }
             else if (ai)
             {
@@ -112,7 +130,8 @@ namespace Relay.UnityDialogGuard.Tests
             Panel parent,
             Window window,
             string output,
-            string text)
+            string text,
+            bool closeAfterClick = true)
         {
             Button button = new Button
             {
@@ -125,6 +144,7 @@ namespace Relay.UnityDialogGuard.Tests
             button.Click += delegate
             {
                 File.WriteAllText(output, text, new UTF8Encoding(false));
+                if (!closeAfterClick) return;
                 DispatcherTimer closeTimer = new DispatcherTimer
                 {
                     Interval = TimeSpan.FromMilliseconds(150)

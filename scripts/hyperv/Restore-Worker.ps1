@@ -47,6 +47,17 @@ if (-not $guestReady) {
     throw "VM '$VMName' started, but PowerShell Direct did not become ready within $TimeoutSeconds seconds."
 }
 
+# A checkpoint may contain an older desktop helper. Overlay the last validated
+# host package once, without an AI audit or a new task admission gate.
+$dialogGuardSync = $null
+try {
+    $dialogGuardSync = & (Join-Path $PSScriptRoot 'Sync-UnityDialogGuard.ps1') `
+        -VMName $VMName -CredentialPath $CredentialPath
+} catch {
+    $dialogGuardSync = [pscustomobject]@{ changed = $false; warning = $_.Exception.Message }
+    Write-Warning "Optional DialogGuard sync: $($_.Exception.Message)"
+}
+
 [pscustomobject]@{
     vmName = $VMName
     checkpointName = $CheckpointName
@@ -55,4 +66,5 @@ if (-not $guestReady) {
     guestReady = $true
     savedStateDiscarded = [bool]$startResult.savedStateDiscarded
     resumeError = $startResult.resumeError
+    dialogGuardSync = $dialogGuardSync
 } | ConvertTo-Json -Compress

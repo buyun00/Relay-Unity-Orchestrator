@@ -74,3 +74,28 @@ test("every VM start entry point uses the shared saved-state fallback", () => {
     );
   }
 });
+
+test("checkpoint restore overlays the validated DialogGuard package without gating worker recovery", () => {
+  const restore = fs.readFileSync(
+    path.resolve("scripts/hyperv/Restore-Worker.ps1"),
+    "utf8",
+  );
+  const sync = fs.readFileSync(
+    path.resolve("scripts/hyperv/Sync-UnityDialogGuard.ps1"),
+    "utf8",
+  );
+  const guest = fs.readFileSync(
+    path.resolve("scripts/hyperv/Sync-UnityDialogGuard.Guest.ps1"),
+    "utf8",
+  );
+
+  assert.match(restore, /try\s*\{[\s\S]*Sync-UnityDialogGuard\.ps1[\s\S]*\}\s*catch/u);
+  assert.match(restore, /Optional DialogGuard sync/u);
+  assert.match(sync, /validated[^\r\n]*-ne \$true/u);
+  assert.match(sync, /Get-FileHash[\s\S]*SHA256/u);
+  assert.match(guest, /guard-not-installed/u);
+  assert.match(guest, /already-current/u);
+  assert.match(guest, /update rolled back/u);
+  assert.match(guest, /Stop-Process[\s\S]*\$guard\.ProcessId/u);
+  assert.doesNotMatch(guest, /Stop-Process[^\r\n]*(Unity|Codex)/u);
+});

@@ -107,7 +107,7 @@ namespace Relay.UnityDialogGuard
 
     internal static class BuildInfo
     {
-        public const string Version = "1.1.0";
+        public const string Version = "1.1.7";
     }
 
     internal sealed class CommandLine
@@ -308,6 +308,7 @@ namespace Relay.UnityDialogGuard
             new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly AutomationEventHandler _invokedHandler;
         private readonly NativeInputMonitor _nativeInputMonitor;
+        private int _invokedHandlerRegistered;
         private GuardConfig _config;
         private LearnedRulesFile _learned;
         private DateTime _configWriteTime;
@@ -339,12 +340,46 @@ namespace Relay.UnityDialogGuard
             Directory.CreateDirectory(_responseDirectory);
             LoadConfiguration(true);
             _invokedHandler = OnButtonInvoked;
-            Automation.AddAutomationEventHandler(
-                InvokePattern.InvokedEvent,
-                AutomationElement.RootElement,
-                TreeScope.Subtree,
-                _invokedHandler);
+            // The global UIA event provider is optional. Production Unity
+            // workers learn through the native input monitor below; registering
+            // RootElement.Subtree can deadlock when Unity's UIA provider wedges.
+            // The fixture opts in so the accessibility-learning path remains
+            // covered by the interactive regression suite.
+            if (_config.unityProcessNames.Any(name =>
+                String.Equals(name, "UnityDialogFixture", StringComparison.OrdinalIgnoreCase)))
+            {
+                Thread automationHookThread = new Thread(RegisterAutomationHook);
+                automationHookThread.IsBackground = true;
+                automationHookThread.Name = "UnityDialogGuard.OptionalAutomationHook";
+                automationHookThread.SetApartmentState(ApartmentState.MTA);
+                automationHookThread.Start();
+            }
             _nativeInputMonitor = new NativeInputMonitor(OnNativeInput, _logger);
+        }
+
+        private void RegisterAutomationHook()
+        {
+            try
+            {
+                Automation.AddAutomationEventHandler(
+                    InvokePattern.InvokedEvent,
+                    AutomationElement.RootElement,
+                    TreeScope.Subtree,
+                    _invokedHandler);
+                Interlocked.Exchange(ref _invokedHandlerRegistered, 1);
+                if (_disposed)
+                {
+                    Automation.RemoveAutomationEventHandler(
+                        InvokePattern.InvokedEvent,
+                        AutomationElement.RootElement,
+                        _invokedHandler);
+                    Interlocked.Exchange(ref _invokedHandlerRegistered, 0);
+                }
+            }
+            catch (Exception error)
+            {
+                _logger.Error("Optional UIA learning hook unavailable: " + error.Message);
+            }
         }
 
         public void Run(int runSeconds)
@@ -390,18 +425,20 @@ namespace Relay.UnityDialogGuard
                 if (knownRule != null)
                 {
                     TryApplyKnownRule(snapshot, knownRule);
-                    continue;
                 }
-
-                if (learnedRule != null)
+                else if (learnedRule != null)
                 {
                     TryApplyLearnedRule(snapshot, learnedRule);
-                    continue;
                 }
-
-                if (snapshot.IsLikelyDialog)
+                else if (snapshot.IsLikelyDialog)
                 {
                     RecordUnknown(snapshot);
+                }
+
+                // An attempted click (or exhausted rule) is not proof of closure.
+                if (snapshot.IsLikelyDialog &&
+                    NativeMethods.IsWindowVisible(new IntPtr(snapshot.Handle)))
+                {
                     pending.Add(snapshot);
                 }
             }
@@ -1353,13 +1390,47 @@ namespace Relay.UnityDialogGuard
                 Guid.NewGuid().ToString("N") + ".tmp";
             string json = JsonFormatting.Indent(_serializer.Serialize(value));
             File.WriteAllText(temporaryPath, json, new UTF8Encoding(false));
-            if (File.Exists(path))
+            Exception lastError = null;
+            try
             {
-                File.Replace(temporaryPath, path, null, true);
+                for (int attempt = 0; attempt < 25; attempt += 1)
+                {
+                    try
+                    {
+                        if (File.Exists(path))
+                        {
+                            File.Replace(temporaryPath, path, null, true);
+                        }
+                        else
+                        {
+                            File.Move(temporaryPath, path);
+                        }
+                        return;
+                    }
+                    catch (IOException error)
+                    {
+                        lastError = error;
+                        Thread.Sleep(40 + (attempt * 10));
+                    }
+                }
+                throw new IOException(
+                    "Could not publish the DialogGuard control state after bounded retries.",
+                    lastError);
             }
-            else
+            finally
             {
-                File.Move(temporaryPath, path);
+                try
+                {
+                    if (File.Exists(temporaryPath))
+                    {
+                        File.Delete(temporaryPath);
+                    }
+                }
+                catch
+                {
+                    // A stale temporary state file is non-fatal and can be
+                    // distinguished by its PID/GUID suffix.
+                }
             }
         }
 
@@ -1421,10 +1492,13 @@ namespace Relay.UnityDialogGuard
                 return;
             }
             _disposed = true;
-            Automation.RemoveAutomationEventHandler(
-                InvokePattern.InvokedEvent,
-                AutomationElement.RootElement,
-                _invokedHandler);
+            if (Interlocked.Exchange(ref _invokedHandlerRegistered, 0) == 1)
+            {
+                Automation.RemoveAutomationEventHandler(
+                    InvokePattern.InvokedEvent,
+                    AutomationElement.RootElement,
+                    _invokedHandler);
+            }
             _nativeInputMonitor.Dispose();
         }
     }
@@ -1446,23 +1520,65 @@ namespace Relay.UnityDialogGuard
             HashSet<string> processNames = new HashSet<string>(
                 config.unityProcessNames.Select(NormalizeProcessName),
                 StringComparer.OrdinalIgnoreCase);
-            AutomationElementCollection windows;
-            try
+            List<AutomationElement> windows = new List<AutomationElement>();
+            // Never ask UIA to walk every process on the interactive desktop.
+            // One hung provider can block this single-process guard forever.
+            // EnumWindows is local/native, includes owned top-level HWNDs, and
+            // lets us filter by the configured Unity process before touching UIA.
+            foreach (IntPtr handle in NativeMethods.VisibleTopLevelWindows())
             {
-                windows = AutomationElement.RootElement.FindAll(
-                    TreeScope.Children,
-                    Condition.TrueCondition);
+                try
+                {
+                    uint nativeProcessId;
+                    NativeMethods.GetWindowThreadProcessId(handle, out nativeProcessId);
+                    string processName = Process.GetProcessById((int)nativeProcessId).ProcessName;
+                    if (processNames.Contains(NormalizeProcessName(processName)))
+                    {
+                        string className = NativeMethods.ReadClassName(handle);
+                        bool nativeDialogClass = String.Equals(className, "#32770", StringComparison.Ordinal) ||
+                            Regex.IsMatch(className ?? String.Empty, "(dialog|popup|modal)",
+                                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                        bool hasOwner = NativeMethods.GetWindow(handle, NativeMethods.GW_OWNER) != IntPtr.Zero;
+                        // Reading the caption of Unity's main custom window can
+                        // synchronously call into a wedged GUI thread. The
+                        // modal/owned traits are native metadata, so reject
+                        // ordinary main windows before asking for any text/UIA.
+                        if (!nativeDialogClass && !hasOwner)
+                        {
+                            continue;
+                        }
+                        string title = NativeMethods.ReadWindowText(handle);
+                        if (!DialogSnapshot.IsNativeCandidate(handle, title, className))
+                        {
+                            continue;
+                        }
+                        if (String.Equals(className, "#32770", StringComparison.Ordinal) ||
+                            String.Equals(processName, "Unity", StringComparison.OrdinalIgnoreCase))
+                        {
+                            DialogSnapshot nativeSnapshot = DialogSnapshot.CreateNative(
+                                handle, (int)nativeProcessId, processName, title, className);
+                            if (nativeSnapshot != null) result.Add(nativeSnapshot);
+                            continue;
+                        }
+                        windows.Add(AutomationElement.FromHandle(handle));
+                    }
+                }
+                catch (ArgumentException) { }
+                catch (ElementNotAvailableException) { }
+                catch (InvalidOperationException) { }
+                catch (COMException) { }
             }
-            catch (Exception error)
-            {
-                logger.Error("Unable to enumerate desktop windows: " + error.Message);
-                return result;
-            }
+
+            HashSet<int> seenHandles = new HashSet<int>();
 
             foreach (AutomationElement window in windows)
             {
                 try
                 {
+                    if (!seenHandles.Add(window.Current.NativeWindowHandle))
+                    {
+                        continue;
+                    }
                     int processId = window.Current.ProcessId;
                     if (processId <= 0)
                     {
@@ -1643,6 +1759,57 @@ namespace Relay.UnityDialogGuard
         public string DialogId { get; private set; }
         public bool IsLikelyDialog { get; private set; }
 
+        public static bool IsNativeCandidate(IntPtr handle, string title, string className)
+        {
+            if (NativeMethods.GetWindow(handle, NativeMethods.GW_OWNER) != IntPtr.Zero ||
+                String.Equals(className, "#32770", StringComparison.Ordinal) ||
+                Regex.IsMatch(className ?? String.Empty, "(dialog|popup|modal)",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                return true;
+            }
+            return Regex.IsMatch(
+                title ?? String.Empty,
+                "^(Unity)$|(dialog|warning|error|notice|reload|safe mode|consent|update required|" +
+                "modified externally|crash|failed|警告|错误|通知|重新加载|重载|" +
+                "安全模式|需要更新|外部修改|崩溃|失败)",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        }
+
+        public static DialogSnapshot CreateNative(
+            IntPtr handle,
+            int processId,
+            string processName,
+            string title,
+            string className)
+        {
+            DialogSnapshot result = new DialogSnapshot
+            {
+                Window = null,
+                Handle = handle.ToInt32(),
+                ProcessId = processId,
+                ProcessName = processName,
+                Title = title ?? String.Empty,
+                ClassName = className ?? String.Empty,
+                Bounds = Rect.Empty,
+                HasOwner = NativeMethods.GetWindow(handle, NativeMethods.GW_OWNER) != IntPtr.Zero,
+                Texts = new List<string>(),
+                Buttons = new List<ButtonSnapshot>()
+            };
+            HashSet<string> textSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> buttonIds = new HashSet<string>(StringComparer.Ordinal);
+            NativeMethods.AddNativeControls(handle, result.Texts, result.Buttons, textSet, buttonIds, false);
+            result.CombinedText = String.Join(" | ", result.Texts.Take(100).ToArray());
+            result.SearchableText = result.Title + " | " + result.CombinedText;
+            result.ButtonSearchText = String.Join(" | ", result.Buttons.Select(button => button.Name).ToArray());
+            result.CanonicalTitle = TextFingerprint.Canonicalize(result.Title);
+            result.CanonicalText = TextFingerprint.CanonicalizeFragments(result.Texts);
+            result.Fingerprint = TextFingerprint.For(result);
+            result.DialogId = result.Handle + "|" + result.Fingerprint;
+            result.IsLikelyDialog = true;
+            return result;
+        }
+
         public static DialogSnapshot Create(
             AutomationElement window,
             int processId,
@@ -1761,7 +1928,8 @@ namespace Relay.UnityDialogGuard
                 result.Texts,
                 result.Buttons,
                 textSet,
-                buttonIds);
+                buttonIds,
+                true);
 
             result.CombinedText = String.Join(" | ", result.Texts.Take(100).ToArray());
             result.SearchableText = result.Title + " | " + result.CombinedText;
@@ -2541,6 +2709,26 @@ namespace Relay.UnityDialogGuard
             EnumWindowsProc callback,
             IntPtr parameter);
 
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr handle);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
+
+        public static List<IntPtr> VisibleTopLevelWindows()
+        {
+            List<IntPtr> handles = new List<IntPtr>();
+            EnumWindows(delegate(IntPtr handle, IntPtr parameter)
+            {
+                if (IsWindowVisible(handle)) handles.Add(handle);
+                return true;
+            }, IntPtr.Zero);
+            return handles;
+        }
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetClassName(
             IntPtr handle,
@@ -2558,7 +2746,8 @@ namespace Relay.UnityDialogGuard
             List<string> texts,
             List<ButtonSnapshot> buttons,
             HashSet<string> textSet,
-            HashSet<string> buttonIds)
+            HashSet<string> buttonIds,
+            bool attachAutomationElements)
         {
             EnumChildWindows(window, delegate(IntPtr handle, IntPtr parameter)
             {
@@ -2569,7 +2758,10 @@ namespace Relay.UnityDialogGuard
                     AutomationElement element = null;
                     try
                     {
-                        element = AutomationElement.FromHandle(handle);
+                        if (attachAutomationElements)
+                        {
+                            element = AutomationElement.FromHandle(handle);
+                        }
                     }
                     catch (Exception)
                     {
@@ -2590,14 +2782,14 @@ namespace Relay.UnityDialogGuard
             }, IntPtr.Zero);
         }
 
-        private static string ReadClassName(IntPtr handle)
+        public static string ReadClassName(IntPtr handle)
         {
             StringBuilder buffer = new StringBuilder(256);
             GetClassName(handle, buffer, buffer.Capacity);
             return buffer.ToString();
         }
 
-        private static string ReadWindowText(IntPtr handle)
+        public static string ReadWindowText(IntPtr handle)
         {
             StringBuilder buffer = new StringBuilder(4096);
             GetWindowText(handle, buffer, buffer.Capacity);

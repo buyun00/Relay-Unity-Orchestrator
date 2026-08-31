@@ -9,7 +9,18 @@ PowerShell Direct 只用于可选的 AI 未知窗口决策接口。
 - 每 400 ms 扫描由 `Unity.exe` 创建的候选弹窗。先排除普通 Editor 主窗口，
   再以最大深度和节点数限制逐层读取 UI Automation 子树，避免 Unity
   可访问性树递归导致栈溢出或假活。
+- 1.1.7 使用原生顶层窗口枚举后先按 Unity 进程、owner 与窗口类过滤，再读取标题
+  或对候选窗口接入
+  UIA；标准 `#32770` 弹窗全程使用原生控件，不再被卡住的 Unity UIA provider
+  阻塞。它也不再扫描整个桌面，从而避免被
+  无关或卡住的 UIA provider 拖死，并避免遗漏 owned 模态窗口。已尝试点击但仍然
+  可见的弹窗继续出现在 pendingDialogs，不将“点击过”当作“已解决”。
+- 生产 Unity 进程的扫描与交互学习使用原生窗口/输入钩子，不注册全桌面 UIA
+  子树；UIA学习路径只在独立回归fixture中启用。系统UIA provider卡住时，原生
+  扫描、心跳及业务解阻仍继续，学习能力不再成为主流程门禁。
+- 控制状态原子替换遇到短暂读锁时做有界重试，避免健康进程长期留下旧心跳。
 - 首批 `config.json` 规则会自动处理：
+  - 场景被外部修改：选择 `Ignore` 保留内存；原任务另行保全脏场景后再决定加载磁盘；
   - 外部修改的 UI Document、资源或脚本：选择 `Reload` / `Recompile`；
   - API Updater 同意窗口：选择备份确认、`Update` 或 `Yes`；
   - `Enter Safe Mode?`：默认选择 `Ignore`；
@@ -31,6 +42,15 @@ PowerShell Direct 只用于可选的 AI 未知窗口决策接口。
 或文件编号时仍可复用。
 
 ## 构建
+
+### 检查点恢复后的版本同步
+
+宿主 `.pipeline-data/unity-dialog-guard` 可放置经过完整交互回归的
+`UnityDialogGuard.exe` 与 `manifest.json`（schemaVersion=1、validated=true、
+version、sha256、additiveRule）。只能发布已验证的精确二进制，不在恢复时构建。
+`Restore-Worker.ps1` 在来宾就绪后调用 `Sync-UnityDialogGuard.ps1`：版本无变化时
+不重启；更新时只重启 Guard，保留自定义配置、禁用规则、学习规则、日志及独占
+回滚备份，核验新进程心跳。失败回滚并告警，不阻塞后续业务；未安装则跳过。
 
 在 Windows PowerShell 5.1 中运行：
 

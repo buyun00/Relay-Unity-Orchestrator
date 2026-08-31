@@ -12,6 +12,17 @@
   ],
   "rules": [
     {
+      "id": "keep-memory-scene-on-external-change",
+      "enabled": true,
+      "titleRegex": "^(The open scene\\(s\\) have been modified externally|打开的场景已被外部修改)$",
+      "buttonRegex": "(Ignore|忽略)",
+      "targetButtonNames": ["Ignore", "忽略"],
+      "targetButtonRegex": "^(Ignore|忽略)$",
+      "delayMs": 600,
+      "maxAttemptsPerDialog": 1,
+      "note": "Keep the in-memory scene and unblock Unity. The original task must preserve any dirty scene before reloading disk content; never auto-discard or overwrite it."
+    },
+    {
       "id": "reload-ui-document-modified-externally",
       "enabled": true,
       "titleRegex": "(UI Document was modified externally|Unity)",

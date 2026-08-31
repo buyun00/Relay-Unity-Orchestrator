@@ -14,7 +14,7 @@ function Start-GuardProcess {
     )
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = $Executable
-    $info.Arguments = '--config "{0}" --learned "{1}" --log-dir "{2}" --control-dir "{3}" --run-seconds 30 --no-mutex' -f `
+    $info.Arguments = '--config "{0}" --learned "{1}" --log-dir "{2}" --control-dir "{3}" --run-seconds 90 --no-mutex' -f `
         $ConfigPath, $LearnedPath, $LogDirectory, $ControlDirectory
     $info.UseShellExecute = $false
     return [System.Diagnostics.Process]::Start($info)
@@ -49,6 +49,18 @@ function Wait-Until {
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     throw $FailureMessage
+}
+
+function Read-ControlState {
+    param([string]$Path)
+    for ($attempt = 0; $attempt -lt 20; $attempt += 1) {
+        try {
+            return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    throw "Control state '$Path' remained unavailable."
 }
 
 function Invoke-DialogButton {
@@ -143,6 +155,27 @@ try {
         throw "Known dialog selected '$knownResult' instead of 'Reload'."
     }
 
+    $ownedOutput = Join-Path $testRoot 'owned-scene-result.txt'
+    $ownedFixture = Start-FixtureProcess -Executable $fixtureExecutable -Mode 'owned-scene' -OutputPath $ownedOutput
+    $fixtures.Add($ownedFixture)
+    Wait-Until -Condition { Test-Path -LiteralPath $ownedOutput } -FailureMessage 'Owned external-scene dialog was not handled.'
+    if ((Get-Content -LiteralPath $ownedOutput -Raw) -ne 'Ignore') {
+        throw 'External scene dialog did not preserve in-memory changes.'
+    }
+
+    $stuckOutput = Join-Path $testRoot 'known-stuck-result.txt'
+    $stuckFixture = Start-FixtureProcess -Executable $fixtureExecutable -Mode 'known-stuck' -OutputPath $stuckOutput
+    $fixtures.Add($stuckFixture)
+    Wait-Until -Condition { Test-Path -LiteralPath $stuckOutput } -FailureMessage 'Stuck known dialog never received its first action.'
+    Start-Sleep -Milliseconds 400
+    $statePath = Join-Path $controlDirectory 'state.json'
+    Wait-Until -Condition {
+        $pending = (Read-ControlState -Path $statePath).pendingDialogs
+        @($pending | Where-Object { $_.processId -eq $stuckFixture.Id }).Count -eq 1
+    } -FailureMessage 'A known dialog still open after the automatic action disappeared from pending state.'
+    $stuckFixture.Kill()
+    $stuckFixture.WaitForExit(3000) | Out-Null
+
     $aiOutput = Join-Path $testRoot 'ai-result.txt'
     $aiFixture = Start-FixtureProcess `
         -Executable $fixtureExecutable `
@@ -153,11 +186,10 @@ try {
     Wait-Until `
         -Condition {
             (Test-Path -LiteralPath $statePath) -and
-            (Get-Content -LiteralPath $statePath -Raw -Encoding UTF8) -match 'Unknown AI Decision Notice'
+            ((Read-ControlState -Path $statePath) | ConvertTo-Json -Depth 20) -match 'Unknown AI Decision Notice'
         } `
         -FailureMessage 'The AI control state did not expose the unknown dialog.'
-    $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 |
-        ConvertFrom-Json
+    $state = Read-ControlState -Path $statePath
     $aiDialog = $state.pendingDialogs |
         Where-Object { $_.title -eq 'Unknown AI Decision Notice' } |
         Select-Object -First 1
@@ -265,6 +297,8 @@ try {
     [pscustomobject]@{
         passed = $true
         knownDialogAction = $knownResult
+        ownedScenePreserved = $true
+        unresolvedKnownDialogRemainsVisible = $true
         aiDialogExposed = $true
         aiDialogAction = $aiResult
         unknownDialogRecorded = $true
