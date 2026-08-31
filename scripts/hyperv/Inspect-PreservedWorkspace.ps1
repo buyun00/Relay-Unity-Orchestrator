@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$CredentialPath,
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$GuestProjectPath,
     [ValidateNotNullOrEmpty()][string]$ApprovedOverlayPathsJson = '[]',
-    [ValidateRange(10, 300)][int]$TimeoutSeconds = 60
+    [ValidateRange(10, 300)][int]$TimeoutSeconds = 180
 )
 
 $ErrorActionPreference = 'Stop'

@@ -525,9 +525,9 @@ test("an established task branch uses preserved verification without restart or 
   preservedContext.task.branchName = "codex/task-0017-task";
   preservedContext.task.codexThreadId = "019fa356-ef1d-75b1-b402-dd4adc895039";
   preservedContext.workspaceEstablished = true;
-  const processRunner = async (command, args) => {
+  const processRunner = async (command, args, options) => {
     const name = scriptName(args);
-    calls.push({ name, args });
+    calls.push({ name, args, options });
     return {
       exitCode: 0,
       stdout: JSON.stringify(
@@ -589,6 +589,14 @@ test("an established task branch uses preserved verification without restart or 
       "Get-WorkerHealth.ps1",
     ],
   );
+  const inspection = calls.find(
+    (call) => call.name === "Inspect-PreservedWorkspace.ps1",
+  );
+  assert.equal(
+    inspection.args[inspection.args.indexOf("-TimeoutSeconds") + 1],
+    "180",
+  );
+  assert.equal(inspection.options.timeoutMs, 240_000);
   assert.equal(
     calls.some((call) =>
       [

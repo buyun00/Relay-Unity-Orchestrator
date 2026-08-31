@@ -775,8 +775,9 @@ export class HyperVAdapter {
             context.project.guestProjectPath,
             "project.guestProjectPath",
           ),
+          TimeoutSeconds: 180,
         },
-        { signal, timeoutMs: 90_000 },
+        { signal, timeoutMs: 240_000 },
       ),
     );
     if (!inspection.ready || !inspection.repositoryExists) {
