@@ -1017,10 +1017,10 @@ $taskRemoteExists = -not [string]::IsNullOrWhiteSpace($taskTipQuery.result.stdou
 $fetchBranch = if ($taskRemoteExists) { $Branch } else { $Base }
 $fetchDestination = "refs/remotes/origin/$fetchBranch"
 # Restored PROJECT_READY workers can be several large packs behind a shared
-# remote. Keep the fetch bounded below the outer 340-second PowerShell Direct
-# budget, leaving time for branch and overlay verification after one cold
-# transfer instead of killing and restarting it every 45 seconds.
-$prepareBranchFetchTimeoutSeconds = 270
+# remote. A current cold transfer can exceed 270 seconds while still making
+# steady progress, so leave it one bounded 14-minute window below the outer
+# PowerShell Direct budget instead of repeatedly discarding a partial pack.
+$prepareBranchFetchTimeoutSeconds = 840
 Invoke-RelayGitWithRetry $ProjectPath @(
     'fetch', '--no-tags', '--no-prune', 'origin',
     "refs/heads/$($fetchBranch):$fetchDestination"

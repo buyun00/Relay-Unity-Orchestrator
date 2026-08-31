@@ -1828,12 +1828,20 @@ test("initial preparation gives a cold shared-remote fetch one bounded transfer 
     path.resolve("scripts/hyperv/Prepare-Workspace.ps1"),
     "utf8",
   );
-  assert.match(source, /\$prepareBranchFetchTimeoutSeconds = 270/u);
+  const adapterSource = fs.readFileSync(
+    path.resolve("server/adapters/hyperv.mjs"),
+    "utf8",
+  );
+  assert.match(source, /\$prepareBranchFetchTimeoutSeconds = 840/u);
   assert.match(
     source,
     /'prepare-branch-fetch' @\{\} \$prepareBranchFetchTimeoutSeconds 1 0/u,
   );
-  assert.match(hostSource, /\[int\]\$TimeoutSeconds = 340/u);
+  assert.match(hostSource, /\[int\]\$TimeoutSeconds = 900/u);
+  assert.equal(
+    (adapterSource.match(/timeoutMs: 960_000/gu) || []).length,
+    2,
+  );
 });
 
 test("three exhausted transient failures retain every attempt and backoff", () => {

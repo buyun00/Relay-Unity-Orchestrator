@@ -15,7 +15,7 @@ param(
     # Retained for compatibility. Workspace preparation intentionally does not
     # probe or wait for the Unity Skill health endpoint.
     [string]$UnityHealthUrl,
-    [ValidateRange(30, 900)][int]$TimeoutSeconds = 340,
+    [ValidateRange(30, 1200)][int]$TimeoutSeconds = 900,
     [switch]$OutputObject
 )
 
