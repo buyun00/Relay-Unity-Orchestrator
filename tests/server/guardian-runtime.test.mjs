@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +31,76 @@ async function waitFor(url, timeoutMs = 10_000) {
   }
   assert.fail(`Timed out waiting for ${url}`);
 }
+
+test("Guardian refuses busy restart and leaves pending deployment unactivated", async (t) => {
+  const relay = http.createServer((request, response) => {
+    assert.equal(request.method, "GET", "busy Relay must not even be paused");
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(
+      JSON.stringify({
+        ok: true,
+        scheduler: { activeTurns: 3, paused: false },
+      }),
+    );
+  });
+  await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => relay.close(resolve)));
+  const guardianPort = await freePort();
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-busy-deploy-test-"),
+  );
+  const deploymentPath = path.join(dataDirectory, "deployment-state.json");
+  fs.writeFileSync(
+    deploymentPath,
+    JSON.stringify({
+      status: "pending",
+      repairId: "busy-fixture",
+      attempts: 0,
+    }),
+  );
+  const child = spawn(process.execPath, ["server/guardian.mjs"], {
+    cwd: path.resolve("."),
+    env: {
+      ...process.env,
+      PIPELINE_GUARDIAN_HOST: "127.0.0.1",
+      PIPELINE_GUARDIAN_PORT: String(guardianPort),
+      PIPELINE_PORT: String(relay.address().port),
+      PORT: String(await freePort()),
+      PIPELINE_GUARDIAN_FAILURE_THRESHOLD: "1000",
+      PIPELINE_GUARDIAN_INTERVAL_MS: "1000",
+      PIPELINE_DATA_DIR: dataDirectory,
+    },
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  t.after(async () => {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  const base = `http://127.0.0.1:${guardianPort}`;
+  await waitFor(`${base}/api/health`);
+  const response = await fetch(`${base}/api/actions/restart-relay`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).error.code, "RELAY_BUSY");
+  await fetch(`${base}/api/actions/deployment-restart`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+  assert.equal(deployment.status, "pending");
+  assert.equal(deployment.attempts, 0);
+  assert.match(deployment.deferredReason, /3 active business turns/u);
+  const health = await (await fetch(`${base}/api/health`)).json();
+  assert.equal(health.relay.restarts, 0);
+  assert.equal(health.web.restarts, 0);
+});
 
 test("Guardian exposes an independent recovery page and System Codex snapshot while Relay is down", async (t) => {
   const guardianPort = await freePort();
