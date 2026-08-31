@@ -42,7 +42,7 @@ function threadIdFromEvent(event) {
 
 const TASK_FEEDBACK_AUTHOR = "Relay Task Feedback";
 
-function compactFailureDetails(error, deliveryAudit) {
+function compactFailureDetails(error, deliveryAudit, codexFinal) {
   const blockedPaths = [
     ...(Array.isArray(error?.blockedPaths) ? error.blockedPaths : []),
     ...(Array.isArray(deliveryAudit?.blockedPaths)
@@ -57,6 +57,18 @@ function compactFailureDetails(error, deliveryAudit) {
     `Failure code: ${error?.code || "TURN_EXECUTION_FAILED"}`,
     `Failure message: ${String(error?.message || error).slice(0, 2_000)}`,
   ];
+  if (codexFinal) {
+    lines.push(`Original Codex status: ${String(codexFinal.status || "unknown").slice(0, 80)}`);
+    for (const field of ["summary", "question"]) {
+      if (typeof codexFinal[field] === "string" && codexFinal[field].trim()) {
+        lines.push(`Original ${field}: ${codexFinal[field].trim().slice(0, 1_200)}`);
+      }
+    }
+    for (const field of ["risks", "validation"]) {
+      const items = Array.isArray(codexFinal[field]) ? codexFinal[field].slice(-4) : [];
+      for (const item of items) lines.push(`Original ${field}: ${String(item).slice(0, 300)}`);
+    }
+  }
   if (blockedPaths.length) {
     lines.push(`Affected paths: ${blockedPaths.join(", ")}`);
   }
@@ -211,7 +223,7 @@ export class Scheduler {
     });
   }
 
-  queueTaskFeedback(context, error, { stage, deliveryAudit } = {}) {
+  queueTaskFeedback(context, error, { stage, deliveryAudit, codexFinal } = {}) {
     this.store.failTurn(context.turn.id, error, { preserveWorker: true });
     if (context.turn.authorName === TASK_FEEDBACK_AUTHOR) {
       this.emitProgress(
@@ -236,8 +248,8 @@ export class Scheduler {
         message: [
           "This is an automatic correction inside the same task, Codex conversation, branch, and preserved workspace. Do not create a separate repair task.",
           `The previous turn reached stage '${stage || "unknown"}' and could not continue:`,
-          ...compactFailureDetails(error, deliveryAudit),
-          "Inspect the actual branch, HEAD, and Git status; correct the task output or its structured final result, then finish the original task and validation. Preserve all existing work and do not reset or delete files.",
+          ...compactFailureDetails(error, deliveryAudit, codexFinal),
+          "Address the concrete blocker above in this existing conversation. Use only the relevant checks; do not repeat full history or prompt-integrity audits. Preserve all existing work and do not reset or delete files. Never replace missing validation with a completed status just to pass delivery.",
           "If progress requires missing user input or authorization, return needs_input with the precise question; do not invent permission.",
         ].join("\n"),
         priority: context.turn.priority,
@@ -404,6 +416,7 @@ export class Scheduler {
             this.queueTaskFeedback(context, error, {
               stage: "codex-result",
               deliveryAudit,
+              codexFinal,
             });
             return;
           }

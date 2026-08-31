@@ -477,6 +477,9 @@ test("structured blocked result is sent back to the same task Codex conversation
   assert.equal(turn.codexFinal.status, "blocked");
   assert.equal(feedbackTurn.authorName, "Relay Task Feedback");
   assert.equal(feedbackTurn.status, "success");
+  assert.match(feedbackTurn.userMessage, /Original summary: Unity requires operator attention/u);
+  assert.match(feedbackTurn.userMessage, /Original risks: Workspace must remain preserved/u);
+  assert.match(feedbackTurn.userMessage, /Never replace missing validation with a completed status/u);
   assert.equal(adapter.codexContexts.length, 2);
   assert.equal(adapter.auditCalls, 1);
   assert.equal(adapter.finalizeCalls, 1);
