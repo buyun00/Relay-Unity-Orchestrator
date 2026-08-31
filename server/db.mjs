@@ -1486,7 +1486,11 @@ export class Store {
       this.db
         .prepare(
           `SELECT MAX(created_at) AS at FROM events
-         WHERE task_id=? AND (type LIKE 'codex.%' OR type LIKE 'turn.%')`,
+         WHERE task_id=? AND (
+           type IN ('codex.item.started', 'codex.item.completed',
+                    'codex.agent_message', 'codex.thread.started',
+                    'codex.turn.started', 'codex.turn.completed')
+           OR type LIKE 'turn.%')`,
         )
         .get(taskId)?.at || null
     );

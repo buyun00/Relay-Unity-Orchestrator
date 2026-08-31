@@ -1204,6 +1204,13 @@ test("supervisor ignores 100 normally waiting tasks and fresh Codex progress", (
   store.db
     .prepare("UPDATE events SET created_at=? WHERE task_id=?")
     .run("2020-01-01T00:00:00.000Z", active.task.id);
+  store.emit({
+    taskId: active.task.id,
+    turnId: active.turn.id,
+    type: "codex.codex.stderr",
+    phase: "codex",
+    message: "Repeated cache error is not task progress",
+  });
   assert.deepEqual(
     ops.supervisorCandidates().map((task) => task.id),
     [active.task.id],
