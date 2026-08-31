@@ -25,14 +25,17 @@ Set-StrictMode -Version Latest
 $OutputEncoding = [Console]::OutputEncoding
 . (Join-Path $PSScriptRoot 'Credential.ps1')
 . (Join-Path $PSScriptRoot 'PowerShell-Direct.ps1')
+. (Join-Path $PSScriptRoot 'Host-Workspace.ps1')
 $credential = Import-RelayCredential -Path $CredentialPath
 
 # The guest script can create or check out the task branch. Prove the host
 # delivery path before allowing that mutation so an SMB outage cannot leave a
 # correctly prepared guest workspace without the scheduler's durable
 # workspace-established event.
-if (-not [string]::IsNullOrWhiteSpace($SharePath) -and -not (Test-Path -LiteralPath $SharePath)) {
-    throw "Host SMB workspace '$SharePath' is not reachable before guest workspace preparation; the guest workspace was not touched."
+$hostSmbWaitSeconds = [Math]::Min(60, $TimeoutSeconds)
+$smbReady = Wait-RelayHostWorkspace -SharePath $SharePath -TimeoutSeconds $hostSmbWaitSeconds
+if (-not $smbReady) {
+    throw "Host SMB workspace '$SharePath' is not reachable before guest workspace preparation after a $hostSmbWaitSeconds second readiness wait; the guest workspace was not touched."
 }
 
 $helperPath = Join-Path $PSScriptRoot 'Workspace-Git.ps1'
@@ -121,7 +124,8 @@ do {
 } while ([DateTime]::UtcNow -lt $deadline)
 
 if (-not $unityReady) { throw "Unity did not become ready inside '$VMName'." }
-if (-not [string]::IsNullOrWhiteSpace($SharePath) -and -not (Test-Path -LiteralPath $SharePath)) {
+$smbReady = Wait-RelayHostWorkspace -SharePath $SharePath -TimeoutSeconds $hostSmbWaitSeconds
+if (-not $smbReady) {
     throw "Host SMB workspace '$SharePath' became unreachable after guest workspace preparation."
 }
 
@@ -169,7 +173,7 @@ $result = [pscustomobject]@{
     approvedOverlayPreservationVerified = $gitResult.approvedOverlayPreservationVerified
     unityReady = $unityReady
     skillReady = $null
-    smbReady = [string]::IsNullOrWhiteSpace($SharePath) -or (Test-Path -LiteralPath $SharePath)
+    smbReady = $smbReady
 }
 if ($OutputObject) {
     return $result
