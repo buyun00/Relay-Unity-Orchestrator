@@ -20,6 +20,11 @@ import {
   projectManagementTaskPrompt,
   projectManagementTaskTitle,
 } from "./project-management-client.mjs";
+import {
+  handleUnitySkillsMcpRequest,
+  isLoopbackAddress,
+  resolveUnitySkillsBaseUrl,
+} from "./unityskills-mcp-bridge.mjs";
 
 const PROJECT_MANAGEMENT_SESSION_COOKIE = "relay-project-management-session";
 const PROJECT_MANAGEMENT_BROWSER_COOKIE = "relay-project-management-browser";
@@ -524,12 +529,10 @@ export class PipelineHttpServer {
           remoteAddress: request.socket?.remoteAddress,
           body,
         });
-        json(
-          response,
-          result.statusCode ?? result.status ?? 500,
-          result.body,
-          { ...cors, ...(result.headers || {}) },
-        );
+        json(response, result.statusCode ?? result.status ?? 500, result.body, {
+          ...cors,
+          ...(result.headers || {}),
+        });
         return;
       }
 
@@ -1398,6 +1401,34 @@ export class PipelineHttpServer {
           { ok: true, workers: this.store.listWorkers() },
           cors,
         );
+        return;
+      }
+      const workerUnityMcp = pathname.match(
+        /^\/api\/workers\/([^/]+)\/unity-mcp$/,
+      );
+      if (workerUnityMcp) {
+        if (!isLoopbackAddress(request.socket?.remoteAddress))
+          throw new HttpError(
+            403,
+            "UNITY_MCP_LOOPBACK_REQUIRED",
+            "The Relay UnitySkills MCP bridge is available only on loopback",
+          );
+        const worker = this.store.getWorker(
+          decodeURIComponent(workerUnityMcp[1]),
+        );
+        if (!worker)
+          throw new HttpError(404, "WORKER_NOT_FOUND", "Worker not found");
+        const project = this.store.getProject(worker.projectId);
+        if (!project)
+          throw new HttpError(404, "PROJECT_NOT_FOUND", "Project not found");
+        const baseUrl = resolveUnitySkillsBaseUrl(project, worker);
+        if (!baseUrl)
+          throw new HttpError(
+            503,
+            "UNITY_SKILLS_ENDPOINT_MISSING",
+            "The Worker has no resolvable UnitySkills endpoint",
+          );
+        await handleUnitySkillsMcpRequest({ request, response, baseUrl });
         return;
       }
       if (request.method === "POST" && pathname === "/api/workers") {

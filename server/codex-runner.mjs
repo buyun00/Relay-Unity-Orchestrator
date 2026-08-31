@@ -68,6 +68,12 @@ function workerUnityEndpoints(context) {
   }
 }
 
+function workerUnityMcpBridgeUrl(config, context) {
+  if (!context.worker?.id) return workerUnityEndpoints(context).mcpUrl;
+  const port = Number(config.port) || 4317;
+  return `http://127.0.0.1:${port}/api/workers/${encodeURIComponent(context.worker.id)}/unity-mcp`;
+}
+
 function buildPrompt(context) {
   const profile = context.turn.executionProfile || "auto";
   const unityEndpoints = workerUnityEndpoints(context);
@@ -238,7 +244,7 @@ export class CodexRunner {
       "-c",
       `features.fast_mode=${codexFastMode}`,
     ];
-    const unitySkillUrl = workerUnityEndpoints(context).mcpUrl;
+    const unitySkillUrl = workerUnityMcpBridgeUrl(this.config, context);
     if (unitySkillUrl && context.turn.executionProfile === "unity_asset") {
       args.push(
         "-c",

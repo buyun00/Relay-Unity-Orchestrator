@@ -1697,8 +1697,14 @@ test("Codex turns pin the Relay model, reasoning effort, and standard speed", as
   assert.match(prompt, /Invoke-UnityDialogGuardAction\.ps1/);
   assert.match(prompt, /VMName unity-worker-01/);
   assert.match(prompt, /Never authorize a high-risk action/);
-  assert.match(prompt, /Unity MCP availability is not a task-startup prerequisite/);
-  assert.match(prompt, /preserve all requested runtime and visual verification/);
+  assert.match(
+    prompt,
+    /Unity MCP availability is not a task-startup prerequisite/,
+  );
+  assert.match(
+    prompt,
+    /preserve all requested runtime and visual verification/,
+  );
 });
 
 test("Relay execution profiles keep code turns away from Unity and gate auto escalation", async (t) => {
@@ -1784,7 +1790,9 @@ test("Unity routing falls back to the assigned Worker's resolved health origin",
     /assigned Worker unity-worker-02 is http:\/\/172\.30\.240\.12:8090/,
   );
   assert.ok(
-    call.args.includes('mcp_servers.unity.url="http://172.30.240.12:8090/mcp"'),
+    call.args.includes(
+      'mcp_servers.unity.url="http://127.0.0.1:4317/api/workers/worker-real/unity-mcp"',
+    ),
   );
 });
 
