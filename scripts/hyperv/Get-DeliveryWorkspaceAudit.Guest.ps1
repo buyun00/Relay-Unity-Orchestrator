@@ -183,6 +183,21 @@ function Get-CommittedHeadStatus {
         -not (Test-ExactStringArray -Left $sortedExpected -Right $sortedAll) -or
         -not (Test-ExactStringArray -Left $sortedExpected -Right $sortedAuditable)
     ) {
+        # A worker's remote base ref may move (or remain pinned to an older
+        # task baseline) after Codex has already committed a one-commit task
+        # result. The configured-base delta then contains unrelated history
+        # and cannot prove the exact Codex file set. In that case, retry only
+        # against HEAD's single parent. The same exact-set checks below still
+        # reject multi-commit omissions, deletes, renames, copies, or any
+        # additional path in the final commit.
+        if (-not [string]::IsNullOrWhiteSpace($BaseRef)) {
+            return @(
+                Get-CommittedHeadStatus `
+                    -RepositoryPath $RepositoryPath `
+                    -ExpectedPaths $ExpectedPaths `
+                    -BaseRef $null
+            )
+        }
         return @()
     }
 

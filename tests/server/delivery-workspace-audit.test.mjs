@@ -276,6 +276,47 @@ test("delivery audit reconstructs committed additions from a clean HEAD", async 
   assert.deepEqual(recorded.blockedPaths, []);
 });
 
+test("delivery audit falls back to the exact HEAD commit when the remote base delta contains unrelated history", async (t) => {
+  const { repository } = await createRepository(t);
+  await run(git, ["-C", repository, "add", "--", "Assets/Only.cs"]);
+  await run(git, ["-C", repository, "commit", "-m", "task base"]);
+
+  const staleBase = (
+    await run(git, ["-C", repository, "rev-parse", "HEAD"])
+  ).stdout.trim();
+  const unrelatedPath = "Assets/Unrelated.cs";
+  fs.writeFileSync(path.join(repository, unrelatedPath), "unrelated\n");
+  await run(git, ["-C", repository, "add", "--", unrelatedPath]);
+  await run(git, ["-C", repository, "commit", "-m", "unrelated history"]);
+  await run(git, [
+    "-C",
+    repository,
+    "update-ref",
+    "refs/remotes/origin/main",
+    staleBase,
+  ]);
+
+  fs.writeFileSync(path.join(repository, "Assets", "Only.cs"), "task result\n");
+  await run(git, ["-C", repository, "add", "--", "Assets/Only.cs"]);
+  await run(git, ["-C", repository, "commit", "-m", "task result"]);
+
+  const recorded = await invokeAudit({
+    repository,
+    changedFiles: ["Assets/Only.cs"],
+    baseRef: "refs/remotes/origin/main",
+  });
+  assert.equal(recorded.ready, true);
+  assert.equal(recorded.exact, true);
+  assert.equal(recorded.completeFileSet, true);
+  assert.equal(recorded.safeForDeliveryRetry, true);
+  assert.equal(recorded.source, "head-commit");
+  assert.deepEqual(
+    recorded.files.map(({ code, path: filePath }) => ({ code, filePath })),
+    [{ code: " M", filePath: "Assets/Only.cs" }],
+  );
+  assert.deepEqual(recorded.blockedPaths, []);
+});
+
 test("delivery audit reconstructs a clean multi-commit result from its configured remote base ref", async (t) => {
   const { repository } = await createRepository(t);
   fs.writeFileSync(path.join(repository, "Assets", "Only.cs"), "baseline\n");
