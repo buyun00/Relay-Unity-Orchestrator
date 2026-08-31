@@ -1229,6 +1229,64 @@ test("supervisor ignores 100 normally waiting tasks and fresh Codex progress", (
   assert.deepEqual(ops.supervisorCandidates(), []);
 });
 
+test("supervisor does not repeatedly audit an exhausted automatic correction", (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-feedback-quiet-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const ops = new OpsEngine({
+    config,
+    store,
+    scheduler,
+    repairManager: { run: async () => null },
+  });
+  t.after(() => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "Permission boundary",
+    message: "Preserve all changes",
+    userName: "Tester",
+  });
+  const blocked = Object.assign(new Error("Explicit authorization required"), {
+    code: "CODEX_BLOCKED",
+  });
+  store.failTurn(turn.id, blocked, { preserveWorker: true });
+  assert.equal(ops.supervisorCandidates().length, 1);
+  const feedback = store.appendTurn(task.id, {
+    message: "Correct within existing authority",
+    userName: "Relay Task Feedback",
+  });
+  store.failTurn(feedback.id, blocked, { preserveWorker: true });
+  assert.deepEqual(ops.supervisorCandidates(), []);
+  assert.equal(
+    store.getTask(task.id).status,
+    "failed",
+    "the unresolved task is not hidden or marked successful",
+  );
+  const manual = store.appendTurn(task.id, {
+    message: "New operator direction",
+    userName: "Tester",
+  });
+  store.failTurn(manual.id, blocked, { preserveWorker: true });
+  assert.equal(
+    ops.supervisorCandidates().length,
+    1,
+    "new operator evidence can be diagnosed again",
+  );
+});
+
 test("the persistent supervisor stays quiet without tasks and checks after the configured interval", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-supervisor-interval-test-"),
