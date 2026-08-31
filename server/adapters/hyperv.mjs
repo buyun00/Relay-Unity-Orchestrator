@@ -1282,7 +1282,8 @@ export class HyperVAdapter {
         },
       );
     }
-    if (configuredUnitySaveUrl) {
+    const requiresUnitySave = deliveryAudit.source !== "head-commit";
+    if (configuredUnitySaveUrl && requiresUnitySave) {
       const guestUnitySkillsEndpoint =
         this.config.unityGuestLocalEndpoint || "http://127.0.0.1:8090";
       const unitySaveUrl = guestLocalUnitySaveUrl(
@@ -1298,6 +1299,15 @@ export class HyperVAdapter {
           GuestUnitySkillsEndpoint: guestUnitySkillsEndpoint,
         },
         { signal, timeoutMs: 120_000 },
+      );
+    } else if (configuredUnitySaveUrl) {
+      onProgress?.(
+        "unity-save",
+        "Skipping redundant Unity save because the exact audit already comes from the committed HEAD",
+        {
+          source: deliveryAudit.source,
+          head: deliveryAudit.head,
+        },
       );
     }
     await this.verifyDeliveryRetryWorkspace(context, deliveryAudit, {

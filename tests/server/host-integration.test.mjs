@@ -1395,6 +1395,70 @@ test("Unity save receives only an explicit guest-loopback request URL instead of
   );
 });
 
+test("committed HEAD delivery skips redundant Unity save before exact verification", async () => {
+  const calls = [];
+  const deliveredSha = "7".repeat(40);
+  const deliveryAudit = {
+    ...exactDeliveryAudit(),
+    source: "head-commit",
+  };
+  const processRunner = async (command, args) => {
+    const script = scriptName(args);
+    calls.push(script);
+    assert.notEqual(script, "Save-UnityProject.ps1");
+    if (script === "Get-DeliveryWorkspaceAudit.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(deliveryAudit),
+        stderr: "",
+      };
+    }
+    if (script === "Finalize-Workspace.ps1") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          commitSha: deliveredSha,
+          remoteSha: deliveredSha,
+          pushed: true,
+          verified: true,
+        }),
+        stderr: "",
+      };
+    }
+    throw new Error(`Unexpected PowerShell script: ${script}`);
+  };
+  const adapter = new HyperVAdapter(
+    config({
+      allowUnitySaveSkip: false,
+      unityGuestLocalEndpoint: "http://127.0.0.1:8090",
+    }),
+    { processRunner, codex: { inspect: async () => ({}) } },
+  );
+  const deliveryContext = context();
+  deliveryContext.project.unitySaveUrl =
+    "http://{internalIp}:8090/skill/editor_execute_menu";
+
+  const progress = [];
+  await adapter.finalize(deliveryContext, {
+    deliveryAudit,
+    onProgress: (phase, message, data) =>
+      progress.push({ phase, message, data }),
+  });
+
+  assert.deepEqual(calls, [
+    "Get-DeliveryWorkspaceAudit.ps1",
+    "Finalize-Workspace.ps1",
+  ]);
+  assert.ok(
+    progress.some(
+      (entry) =>
+        entry.phase === "unity-save" &&
+        entry.data?.source === "head-commit" &&
+        entry.data?.head === deliveryAudit.head,
+    ),
+  );
+});
+
 test("checkpoint refresh resolves project Unity URLs for the selected worker", async () => {
   const calls = [];
   const processRunner = async (command, args) => {
