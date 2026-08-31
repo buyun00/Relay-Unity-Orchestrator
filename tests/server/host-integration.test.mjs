@@ -1751,6 +1751,14 @@ test("Relay execution profiles keep code turns away from Unity and gate auto esc
   assert.match(autoCall.options.input, /auto never waives them/);
   assert.match(
     autoCall.options.input,
+    /Do not repeat full-history JSONL or database audits/,
+  );
+  assert.match(
+    autoCall.options.input,
+    /never instantiate Store or open the production database/,
+  );
+  assert.match(
+    autoCall.options.input,
     /absence of an Editor on the Relay host/,
   );
   assert.match(

@@ -110,6 +110,7 @@ function buildPrompt(context) {
   return [
     `You are executing turn ${context.turn.sequence} for persistent task #${context.task.number}: ${context.task.title}.`,
     `Work only on branch ${context.task.branchName}. The workspace is managed externally; do not switch branches or push.`,
+    "Relay already established this turn's assigned workspace and owns prompt-integrity bookkeeping. Do not repeat full-history JSONL or database audits before doing the requested work. If relevant task context is genuinely missing, read the task detail through Relay's GET /api/tasks/{taskId}; never instantiate Store or open the production database from a task conversation. Verify only the current Git state and evidence needed for the requested change.",
     ...routeInstructions,
     "Complete the requested change, validate proportionally, and return the required structured result.",
     "",
