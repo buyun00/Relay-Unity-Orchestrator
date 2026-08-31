@@ -1287,6 +1287,151 @@ test("supervisor does not repeatedly audit an exhausted automatic correction", (
   );
 });
 
+test("blocked repairs stay quiet until real prerequisites or task instructions change", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-blocked-recovery-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project, worker } = seed(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  let repairCalls = 0;
+  const ops = new OpsEngine(
+    { config, store, scheduler, repairManager: {} },
+    {
+      recoverySessionRunner: {
+        run: async () => {
+          repairCalls += 1;
+          return {
+            threadId: "license-repair",
+            final: {
+              status: "blocked",
+              summary: "Machine license activation requires its account holder",
+            },
+          };
+        },
+      },
+    },
+  );
+  t.after(() => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "License missing",
+    message: "Run task",
+    userName: "Tester",
+  });
+  store.claimNextTurn();
+  store.failTurn(
+    turn.id,
+    Object.assign(new Error("Unity license missing"), {
+      code: "PRESERVED_WORKSPACE_NOT_READY",
+    }),
+    { preserveWorker: true },
+  );
+  store.updateWorkerHealth(worker.id, {
+    vm: true,
+    heartbeat: true,
+    smb: true,
+    unity: false,
+    ready: false,
+  });
+  const parent = store.appendOpsTurn({
+    threadId: "ops-system",
+    message: "Recover",
+    trigger: "monitor",
+  });
+  const queued = ops.queueRecoveryConversation(
+    parent,
+    { targetId: task.id },
+    {},
+  );
+  await ops.executeRecoveryTurn(
+    store.getOpsTurn(queued.recoveryTurnId),
+    new AbortController().signal,
+  );
+  assert.equal(repairCalls, 1);
+  assert.equal(store.getOpsTurn(queued.recoveryTurnId).final.status, "blocked");
+  assert.deepEqual(ops.supervisorCandidates(), []);
+  store.updateWorkerHealth(worker.id, {
+    vm: true,
+    heartbeat: true,
+    smb: true,
+    unity: false,
+    ready: false,
+  });
+  assert.deepEqual(
+    ops.supervisorCandidates(),
+    [],
+    "a new checkedAt is not new evidence",
+  );
+  const repeated = ops.queueRecoveryConversation(
+    parent,
+    { targetId: task.id },
+    {},
+  );
+  assert.equal(repeated.reason, "blocked-recovery-state-unchanged");
+  const manualRetry = store.appendOpsTurn({
+    threadId: "ops-system",
+    message: "Explicitly retry recovery",
+    trigger: "manual",
+  });
+  const requested = ops.queueRecoveryConversation(
+    manualRetry,
+    { targetId: task.id },
+    {},
+  );
+  await ops.executeRecoveryTurn(
+    store.getOpsTurn(requested.recoveryTurnId),
+    new AbortController().signal,
+  );
+  assert.equal(repairCalls, 2, "explicit operator retry remains possible");
+  assert.equal(
+    store.getTask(task.id).status,
+    "failed",
+    "do not hide the unresolved task",
+  );
+  store.updateWorkerHealth(worker.id, {
+    vm: true,
+    heartbeat: true,
+    smb: true,
+    unity: true,
+    ready: true,
+  });
+  assert.equal(
+    ops.supervisorCandidates().length,
+    1,
+    "a healthy Unity endpoint permits another recovery",
+  );
+  store.updateWorkerHealth(worker.id, {
+    vm: true,
+    heartbeat: true,
+    smb: true,
+    unity: false,
+    ready: false,
+  });
+  const next = store.appendTurn(task.id, {
+    message: "New user direction",
+    userName: "Tester",
+  });
+  store.failTurn(next.id, new Error("A new attempt failed"), {
+    preserveWorker: true,
+  });
+  assert.equal(
+    ops.supervisorCandidates().length,
+    1,
+    "new task instructions are not suppressed",
+  );
+});
+
 test("the persistent supervisor stays quiet without tasks and checks after the configured interval", async (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-supervisor-interval-test-"),

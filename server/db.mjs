@@ -4135,6 +4135,17 @@ export class Store {
     );
   }
 
+  latestCompletedRecoveryTurn(taskId) {
+    return opsTurnFromRow(
+      this.db
+        .prepare(
+          `SELECT * FROM ops_turns WHERE target_task_id=? AND status='completed'
+       ORDER BY finished_at DESC, created_at DESC LIMIT 1`,
+        )
+        .get(taskId),
+    );
+  }
+
   findActiveRecoveryTurn(targetTaskId = null) {
     const row = targetTaskId
       ? this.db

@@ -238,6 +238,42 @@ export class OpsEngine {
       .filter((task) => SUPERVISED_TASK_STATUSES.has(task.status));
   }
 
+  recoveryState(taskId) {
+    const task = this.store.getTask(taskId);
+    const latest = this.store.listTaskTurns(taskId).at(-1);
+    const worker = latest?.workerId
+      ? this.store.getWorker(latest.workerId)
+      : null;
+    // Ignore polling timestamps: only new work, errors, or prerequisite changes
+    // can make a previously blocked repair useful again.
+    return JSON.stringify({
+      taskStatus: task?.status,
+      taskTurnId: latest?.id,
+      turnStatus: latest?.status,
+      errorCode: latest?.errorCode,
+      errorMessage: latest?.errorMessage,
+      commit: task?.latestCommitSha,
+      workerId: worker?.id,
+      enabled: worker?.enabled,
+      workerStatus: worker?.status,
+      currentTurnId: worker?.currentTurnId,
+      checkpointName: worker?.checkpointName,
+      vm: worker?.health?.vm,
+      heartbeat: worker?.health?.heartbeat,
+      smb: worker?.health?.smb,
+      unity: worker?.health?.unity,
+    });
+  }
+
+  unchangedBlockedRecovery(taskId) {
+    if (!taskId) return null;
+    const previous = this.store.latestCompletedRecoveryTurn(taskId);
+    return previous?.final?.status === "blocked" &&
+      previous.final.blockedState === this.recoveryState(taskId)
+      ? previous
+      : null;
+  }
+
   supervisorCandidates() {
     if (this.scheduler.status().paused) return [];
     const cutoff =
@@ -247,6 +283,7 @@ export class OpsEngine {
     const queuedProjects = new Set();
     return this.supervisedTasks().filter((task) => {
       if (this.store.findActiveRecoveryTurn(task.id)) return false;
+      if (this.unchangedBlockedRecovery(task.id)) return false;
       const latest = this.store.listTaskTurns(task.id).at(-1);
       if (latest?.codexFinal?.status === "needs_input") return false;
       // The action router already refuses another automatic attempt here.
@@ -513,6 +550,7 @@ export class OpsEngine {
     }
     if (
       this.config.opsAutoHandle &&
+      !this.unchangedBlockedRecovery(incident.taskId) &&
       !incident.resolvedAt &&
       incident.attemptCount < this.config.opsMaxAttempts &&
       !["queued", "diagnosing", "acting"].includes(incident.status)
@@ -919,6 +957,21 @@ export class OpsEngine {
       );
       return;
     }
+    const manualParent =
+      turn.parentOpsTurnId &&
+      this.store.getOpsTurn(turn.parentOpsTurnId)?.trigger === "manual";
+    const priorBlock =
+      !manualParent && this.unchangedBlockedRecovery(turn.targetTaskId);
+    if (priorBlock) {
+      this.store.completeOpsTurn(turn.id, {
+        status: "blocked",
+        summary: priorBlock.final.summary,
+        blockedState: priorBlock.final.blockedState,
+        reason: "blocked-recovery-state-unchanged",
+        previousRecoveryTurnId: priorBlock.id,
+      });
+      return;
+    }
     // A recovery can sit in the queue (or be requeued across a restart) long
     // after its diagnosis went stale. Recheck before launching another writer.
     const targetTask = turn.targetTaskId
@@ -1045,6 +1098,9 @@ export class OpsEngine {
         (task.status === "queued" && this.store.hasActiveTurn(task.id));
       const final = {
         ...result.final,
+        ...(result.final.status === "blocked" && turn.targetTaskId
+          ? { blockedState: this.recoveryState(turn.targetTaskId) }
+          : {}),
         status:
           result.final.status === "completed" && !taskStarted
             ? "monitoring"
@@ -1076,7 +1132,9 @@ export class OpsEngine {
         turn,
         taskStarted
           ? "修复对话已完成，原任务提示词完整且任务已恢复到可运行状态"
-          : "修复对话已结束，但原任务尚未启动；五分钟监督会继续追踪",
+          : final.status === "blocked"
+            ? "修复仍受阻；保留结果，等待实际状态变化或用户新指示，不重复派发同一修复"
+            : "修复对话已结束，但原任务尚未启动；五分钟监督会继续追踪",
         taskStarted ? "info" : "warning",
         {
           status: final.status,
@@ -1117,6 +1175,17 @@ export class OpsEngine {
       incident?.taskId ||
       null;
     const task = targetTaskId ? this.store.getTask(targetTaskId) : null;
+    const priorBlock =
+      turn.trigger !== "manual" && this.unchangedBlockedRecovery(targetTaskId);
+    if (priorBlock) {
+      return {
+        pending: false,
+        skipped: true,
+        targetTaskId,
+        reason: "blocked-recovery-state-unchanged",
+        previousRecoveryTurnId: priorBlock.id,
+      };
+    }
     if (
       turn.trigger === "monitor" &&
       !turn.incidentId &&
