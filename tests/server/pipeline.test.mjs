@@ -1192,6 +1192,53 @@ test("automatic task feedback resumes the preserved worker without preparing aga
   );
 });
 
+test("preserved automatic feedback runs before an older pinned retry without blocking other workers", (t) => {
+  const { store, scheduler, project, worker } = createHarness(t);
+  const current = createTask(store, project.id, {
+    title: "Unpublished current task",
+  });
+  const context = store.claimNextTurn();
+  assert.equal(context.turn.id, current.turn.id);
+
+  const olderRetry = createTask(store, project.id, {
+    title: "Older pinned retry",
+    priority: 100,
+  });
+  store.assignNextQueuedTurn(olderRetry.task.id, worker.id);
+  const feedback = scheduler.queueTaskFeedback(
+    context,
+    Object.assign(new Error("Runtime evidence unavailable"), {
+      code: "CODEX_BLOCKED",
+    }),
+    { stage: "codex-result" },
+  );
+  assert.equal(feedback.workerId, worker.id);
+  assert.equal(store.queuePosition(feedback.id), 1);
+  assert.equal(store.queuePosition(olderRetry.turn.id), 2);
+
+  const next = store.claimNextTurn();
+  assert.equal(next.turn.id, feedback.id);
+  assert.equal(next.worker.id, worker.id);
+  assert.equal(next.resumePreservedWorkspace, true);
+  assert.equal(store.getTurn(olderRetry.turn.id).status, "queued");
+
+  const spare = store.createWorker({
+    name: "spare-worker",
+    vmName: "spare-worker",
+    projectId: project.id,
+    checkpointName: "PROJECT_READY",
+    internalIp: "172.30.240.12",
+    sharePath: "\\\\spare-worker\\Work\\test-unity",
+    status: "ready",
+  });
+  const independent = createTask(store, project.id, {
+    title: "Independent work",
+  });
+  const parallel = store.claimNextTurn();
+  assert.equal(parallel.turn.id, independent.turn.id);
+  assert.equal(parallel.worker.id, spare.id);
+});
+
 test("clean task 17 recovery resumes its durable Codex thread without branch recovery", async (t) => {
   const config = createConfig();
   const adapter = new TrackingFakeAdapter(config);

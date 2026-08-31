@@ -33,6 +33,13 @@ const EXECUTING_TURN_STATUSES = [
   "cancel_requested",
 ];
 
+// Finish the correction on its preserved workspace before another queued turn
+// can replace that workspace or restore away its unpublished task commit.
+const QUEUED_TURN_ORDER = `
+  CASE WHEN turns.worker_id IS NOT NULL
+    AND turns.author_name='Relay Task Feedback' THEN 0 ELSE 1 END,
+  turns.priority DESC, turns.created_at ASC`;
+
 const PROTECTED_LEGACY_DELIVERY_RETRIES = [
   {
     taskId: "task-0c378492-19ee-45be-8397-ff85af8cdf1d",
@@ -2397,7 +2404,7 @@ export class Store {
     const queued = this.db
       .prepare(
         `
-      SELECT id FROM turns WHERE status='queued' ORDER BY priority DESC, created_at ASC
+      SELECT id FROM turns WHERE status='queued' ORDER BY ${QUEUED_TURN_ORDER}
     `,
       )
       .all();
@@ -2419,7 +2426,7 @@ export class Store {
         WHERE turns.status='queued' AND tasks.status='queued'
           AND workers.enabled=1 AND workers.status='stopped'
           AND workers.current_turn_id IS NULL
-        ORDER BY turns.priority DESC, turns.created_at ASC,
+        ORDER BY ${QUEUED_TURN_ORDER},
           CASE WHEN workers.project_id=tasks.project_id THEN 0 ELSE 1 END,
           workers.name
         LIMIT 1
@@ -2447,7 +2454,7 @@ export class Store {
         SELECT turns.*, tasks.project_id
         FROM turns JOIN tasks ON tasks.id=turns.task_id
         WHERE turns.status='queued' AND tasks.status='queued'
-        ORDER BY turns.priority DESC, turns.created_at ASC
+        ORDER BY ${QUEUED_TURN_ORDER}
       `,
         )
         .all();
