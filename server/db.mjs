@@ -2239,11 +2239,91 @@ export class Store {
       );
     }
 
-    const queuedTurns = this.db
+    let queuedTurns = this.db
       .prepare(
         "SELECT * FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence",
       )
       .all(taskId);
+    if (queuedTurns.length === 0) {
+      const failed = this.db
+        .prepare(
+          "SELECT * FROM turns WHERE task_id=? ORDER BY sequence DESC LIMIT 1",
+        )
+        .get(taskId);
+      const failedWorker = failed?.worker_id
+        ? this.getWorker(failed.worker_id)
+        : null;
+      const safeWorkspaceRefusal =
+        failed?.status === "failed" &&
+        failed.error_code === "WORKSPACE_BASE_BRANCH_MISMATCH" &&
+        failed.codex_final_json == null &&
+        failed.delivery_audit_json == null &&
+        failed.commit_sha == null &&
+        failedWorker?.enabled === true &&
+        failedWorker.status === "attention" &&
+        failedWorker.currentTurnId == null &&
+        (failedWorker.projectId === task.projectId ||
+          failedWorker.projectId == null);
+      if (!safeWorkspaceRefusal) {
+        throw new HttpError(
+          409,
+          "PRESERVED_RESUME_TURN_AMBIGUOUS",
+          "Exactly one queued turn or one unchanged pre-Codex workspace refusal is required for preserved recovery",
+        );
+      }
+
+      const timestamp = now();
+      let event;
+      this.transaction(() => {
+        const updated = this.db
+          .prepare(
+            `UPDATE turns
+             SET status='queued', started_at=NULL, finished_at=NULL,
+               error_code=NULL, error_message=NULL
+             WHERE id=? AND task_id=? AND status='failed'
+               AND error_code='WORKSPACE_BASE_BRANCH_MISMATCH'
+               AND codex_final_json IS NULL AND delivery_audit_json IS NULL
+               AND commit_sha IS NULL`,
+          )
+          .run(failed.id, taskId);
+        if (!updated.changes) {
+          throw new HttpError(
+            409,
+            "PRESERVED_RESUME_STATE_CHANGED",
+            "The refused turn changed while preserved recovery was being requeued",
+          );
+        }
+        this.db
+          .prepare(
+            `UPDATE tasks SET status='queued', closed_at=NULL,
+              completion_status='idle', completion_step=NULL,
+              completion_error_code=NULL, completion_error_message=NULL,
+              completion_started_at=NULL, completion_completed_at=NULL,
+              updated_at=? WHERE id=?`,
+          )
+          .run(timestamp, taskId);
+        event = this.insertEvent({
+          taskId,
+          turnId: failed.id,
+          workerId: failed.worker_id,
+          actorName,
+          type: "turn.preserved-worker.requeued",
+          phase: "queued",
+          message:
+            "Requeued the same pre-Codex turn after a non-mutating workspace refusal; the archived prompt and worker identity are unchanged",
+          data: {
+            workerId: failed.worker_id,
+            branchName: task.branchName,
+            expectedHead: task.latestCommitSha,
+            previousErrorCode: failed.error_code,
+          },
+        });
+      });
+      this.notifyEvent(event);
+      queuedTurns = [
+        this.db.prepare("SELECT * FROM turns WHERE id=?").get(failed.id),
+      ];
+    }
     if (queuedTurns.length !== 1) {
       throw new HttpError(
         409,

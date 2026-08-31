@@ -125,18 +125,43 @@ $workspaceState = Get-CompleteWorkspaceState
 if ($workspaceState.status.Count -gt 0) {
     return (Complete-Refusal (New-RecoveryRefusal -Code 'WORKSPACE_DIRTY_REFUSED' -Stage 'workspace-cleanliness' -Message 'Recovery refused because complete porcelain v2 or untracked state is not clean; no remote or branch operation was attempted.' -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead))
 }
-if ($originalBranch -ne $BaseBranch) {
-    return (Complete-Refusal (New-RecoveryRefusal -Code 'WORKSPACE_BASE_BRANCH_MISMATCH' -Stage 'workspace-branch' -Message "Recovery expected clean restored branch '$BaseBranch', but found '$originalBranch'; no mutation was attempted." -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead))
-}
-$baseRefHead = Get-GitValue @('rev-parse', '--verify', "refs/heads/$BaseBranch")
-if ($baseRefHead -ne $originalHead) {
-    return (Complete-Refusal (New-RecoveryRefusal -Code 'WORKSPACE_BASE_REF_MISMATCH' -Stage 'workspace-branch' -Message "Checked-out '$BaseBranch' did not resolve to '$originalHead'; no mutation was attempted." -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead))
-}
-$ExpectedRemoteTip = $ExpectedRemoteTip.ToLowerInvariant()
 $originUrl = Get-GitValue @('remote', 'get-url', 'origin')
 if ($originUrl -ne $RepositoryUrl) {
     return (Complete-Refusal (New-RecoveryRefusal -Code 'WORKSPACE_REMOTE_MISMATCH' -Stage 'remote-identity' -Message "Configured origin '$originUrl' does not equal expected '$RepositoryUrl'; Relay did not change it." -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead))
 }
+if ([string]::IsNullOrWhiteSpace($originalBranch)) {
+    return (Complete-Refusal (New-RecoveryRefusal -Code 'WORKSPACE_DETACHED_HEAD' -Stage 'workspace-branch' -Message "Recovery requires a named clean source branch at '$originalHead'; detached HEAD was preserved without mutation." -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead))
+}
+$sourceRefHead = Get-GitValue @('rev-parse', '--verify', "refs/heads/$originalBranch")
+if ($sourceRefHead -ne $originalHead) {
+    return (Complete-Refusal (New-RecoveryRefusal -Code 'WORKSPACE_SOURCE_REF_MISMATCH' -Stage 'workspace-branch' -Message "Checked-out '$originalBranch' did not resolve to '$originalHead'; no mutation was attempted." -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead))
+}
+
+$sourceRemoteRef = $null
+$sourceRemoteTip = $null
+$sourceRemoteTipAttempts = @()
+if ($originalBranch -ne $BaseBranch) {
+    $sourceRemoteRef = "refs/heads/$originalBranch"
+    try {
+        $sourceTipQuery = Invoke-RelayGitWithRetry $ProjectPath @(
+            'ls-remote', '--exit-code', '--refs', 'origin', $sourceRemoteRef
+        ) 'source-branch-ls-remote' @{} $GitNetworkTimeoutSeconds 3 1000
+    } catch {
+        $failure = New-RecoveryRefusal -Code 'RECOVERY_SOURCE_BRANCH_QUERY_FAILED' -Stage ([string]$_.Exception.Data['relayStage']) -Message $_.Exception.Message -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead -Attempts @($_.Exception.Data['relayAttempts']) -ExitCode $_.Exception.Data['relayExitCode'] -Stdout ([string]$_.Exception.Data['relayStdout']) -Stderr ([string]$_.Exception.Data['relayStderr']) -TimedOut ([bool]$_.Exception.Data['relayTimedOut'])
+        return (Complete-Refusal $failure)
+    }
+    $sourceRemoteTipAttempts = @($sourceTipQuery.attempts)
+    $sourceTipLines = @($sourceTipQuery.result.stdout.Trim() -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($sourceTipLines.Count -ne 1 -or $sourceTipLines[0] -notmatch '^([0-9a-fA-F]{40})\s+(.+)$' -or $Matches[2] -ne $sourceRemoteRef) {
+        return (Complete-Refusal (New-RecoveryRefusal -Code 'RECOVERY_SOURCE_BRANCH_INVALID' -Stage 'source-branch-ls-remote' -Message "Remote tip query returned an invalid or ambiguous result for preserved '$sourceRemoteRef'." -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead -Attempts $sourceRemoteTipAttempts -Stdout $sourceTipQuery.result.stdout -Stderr $sourceTipQuery.result.stderr))
+    }
+    $sourceRemoteTip = $Matches[1].ToLowerInvariant()
+    if ($sourceRemoteTip -ne $originalHead) {
+        return (Complete-Refusal (New-RecoveryRefusal -Code 'RECOVERY_SOURCE_BRANCH_NOT_DURABLE' -Stage 'source-branch-verification' -Message "Clean preserved branch '$originalBranch' is at '$originalHead', but remote '$sourceRemoteRef' is at '$sourceRemoteTip'; no branch operation was attempted." -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead -Attempts $sourceRemoteTipAttempts -RemoteTip $sourceRemoteTip))
+    }
+}
+
+$ExpectedRemoteTip = $ExpectedRemoteTip.ToLowerInvariant()
 
 try {
     $tipQuery = Invoke-RelayGitWithRetry $ProjectPath @(
@@ -239,6 +264,10 @@ Complete-RecoveryResult ([pscustomobject]@{
     remoteTip = $remoteTip
     remoteRef = $expectedRemoteRef
     remoteTipAttempts = @($tipQuery.attempts)
+    sourceRemoteRef = $sourceRemoteRef
+    sourceRemoteTip = $sourceRemoteTip
+    sourceRemoteTipAttempts = @($sourceRemoteTipAttempts)
+    sourceBranchDurable = ($originalBranch -eq $BaseBranch -or $sourceRemoteTip -eq $originalHead)
     fetchAttempts = @($fetch.attempts)
     branchAction = $branchAction
     localTaskHeadBefore = $localTaskHeadBefore

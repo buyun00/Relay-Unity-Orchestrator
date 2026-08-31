@@ -846,10 +846,9 @@ test("new preparation preserves approved overlays when the base branch changes t
   assert.equal(result.ready, true, JSON.stringify(result, null, 2));
   assert.equal(result.approvedOverlayPreservationVerified, true);
   assert.deepEqual(
-    result.approvedOverlayPreservation.map(({ path: overlayPath, reapplied }) => [
-      overlayPath,
-      reapplied,
-    ]),
+    result.approvedOverlayPreservation.map(
+      ({ path: overlayPath, reapplied }) => [overlayPath, reapplied],
+    ),
     overlayPaths.map((overlayPath) => [overlayPath, true]),
   );
   assert.equal(
@@ -1689,6 +1688,68 @@ test("clean main recovery verifies the exact remote tip and creates a tracking b
   );
 });
 
+test("a clean remote-backed task branch hands off without reset or history rewrite", (t) => {
+  const repository = createRepository(t);
+  const previousBranch = "codex/task-0121-previous-preserved-work";
+  const previousTip = publishRecoveryTip(repository, previousBranch);
+  const remoteTip = publishRecoveryTip(repository);
+  const project = clone(repository, "remote-backed-task-handoff");
+  git(project, "checkout", "-q", "--track", "origin/" + previousBranch);
+  const previousRefBefore = git(
+    project,
+    "rev-parse",
+    "refs/heads/" + previousBranch,
+  );
+
+  const result = recoverClean(project, repository, remoteTip);
+
+  assert.equal(result.ready, true, JSON.stringify(result, null, 2));
+  assert.equal(result.originalBranch, previousBranch);
+  assert.equal(result.originalHead, previousTip);
+  assert.equal(result.sourceRemoteRef, "refs/heads/" + previousBranch);
+  assert.equal(result.sourceRemoteTip, previousTip);
+  assert.equal(result.sourceBranchDurable, true);
+  assert.equal(result.branch, recoveryTaskBranch);
+  assert.equal(result.head, remoteTip);
+  assert.equal(git(project, "status", "--porcelain=v1"), "");
+  assert.equal(
+    git(project, "rev-parse", "refs/heads/" + previousBranch),
+    previousRefBefore,
+  );
+  assert.equal(previousRefBefore, previousTip);
+});
+
+test("a clean unpublished source branch is preserved and not handed off", (t) => {
+  const repository = createRepository(t);
+  const remoteTip = publishRecoveryTip(repository);
+  const project = clone(repository, "unpublished-source-refusal");
+  const unpublished = "codex/task-0997-unpublished-source";
+  git(project, "checkout", "-q", "-b", unpublished);
+  write(path.join(project, "unpublished.txt"), "keep this commit\n");
+  git(project, "add", "unpublished.txt");
+  git(
+    project,
+    "-c",
+    "user.name=Relay Test",
+    "-c",
+    "user.email=relay@test.invalid",
+    "commit",
+    "-q",
+    "-m",
+    "unpublished preserved work",
+  );
+  const unpublishedHead = git(project, "rev-parse", "HEAD");
+
+  const result = recoverClean(project, repository, remoteTip);
+
+  assert.equal(result.ready, false);
+  assert.equal(result.code, "RECOVERY_SOURCE_BRANCH_QUERY_FAILED");
+  assert.equal(git(project, "branch", "--show-current"), unpublished);
+  assert.equal(git(project, "rev-parse", "HEAD"), unpublishedHead);
+  assert.equal(git(project, "status", "--porcelain=v1"), "");
+  assert.deepEqual(refs(project, "refs/heads/" + recoveryTaskBranch), []);
+});
+
 test("an existing compatible local task branch is reused without overwrite", (t) => {
   const repository = createRepository(t);
   const remoteTip = publishRecoveryTip(repository);
@@ -1838,10 +1899,7 @@ test("initial preparation gives a cold shared-remote fetch one bounded transfer 
     /'prepare-branch-fetch' @\{\} \$prepareBranchFetchTimeoutSeconds 1 0/u,
   );
   assert.match(hostSource, /\[int\]\$TimeoutSeconds = 900/u);
-  assert.equal(
-    (adapterSource.match(/timeoutMs: 960_000/gu) || []).length,
-    2,
-  );
+  assert.equal((adapterSource.match(/timeoutMs: 960_000/gu) || []).length, 2);
 });
 
 test("three exhausted transient failures retain every attempt and backoff", () => {

@@ -1512,6 +1512,73 @@ test("an existing queued turn can rebind to its prior attention worker without r
   assert.equal(resumed.resumePreservedWorkspace, true);
 });
 
+test("a non-mutating pre-Codex workspace refusal requeues the same archived turn", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Same-turn workspace recovery",
+    message: "Keep every archived prompt byte",
+  });
+  const first = store.claimNextTurn();
+  store.setTaskThread(created.task.id, "thread-same-turn-recovery");
+  store.completeTurn(first.turn.id, {
+    codexFinal: {
+      status: "completed",
+      summary: "Committed before runtime validation",
+      changedFiles: [],
+      validation: [],
+      risks: [],
+    },
+    commitSha: "b".repeat(40),
+  });
+  store.setWorkerState(worker.id, "ready", {
+    currentTurnId: null,
+    error: null,
+  });
+  const continued = store.appendTurn(created.task.id, {
+    message: "Continue runtime validation in this exact turn",
+  });
+  const fingerprint = store.taskPromptFingerprint(created.task.id);
+  store.setWorkerState(worker.id, "attention", {
+    currentTurnId: null,
+    error: "Preserved after infrastructure recovery",
+  });
+  store.rebindQueuedTurnToPreservedWorker(created.task.id, "Recovery operator");
+  const claimed = store.claimNextTurn();
+  assert.equal(claimed.turn.id, continued.id);
+  store.failTurn(
+    continued.id,
+    Object.assign(
+      new Error(
+        "Recovery expected clean restored branch 'main', but found a durable task branch; no mutation was attempted.",
+      ),
+      { code: "WORKSPACE_BASE_BRANCH_MISMATCH" },
+    ),
+  );
+
+  const requeued = store.rebindQueuedTurnToPreservedWorker(
+    created.task.id,
+    "Recovery operator",
+  );
+
+  assert.equal(requeued.id, continued.id);
+  assert.equal(requeued.status, "queued");
+  assert.equal(requeued.workerId, worker.id);
+  assert.equal(requeued.startedAt, null);
+  assert.equal(requeued.finishedAt, null);
+  assert.equal(requeued.errorCode, null);
+  assert.equal(store.taskPromptFingerprint(created.task.id), fingerprint);
+  assert.equal(store.listTaskTurns(created.task.id).length, 2);
+  assert.equal(
+    store
+      .listTaskEvents(created.task.id)
+      .some((event) => event.type === "turn.preserved-worker.requeued"),
+    true,
+  );
+  const resumed = store.claimNextTurn();
+  assert.equal(resumed.turn.id, continued.id);
+  assert.equal(resumed.resumePreservedWorkspace, true);
+});
+
 test("autoRelease=false leaves a successful worker reserved", async (t) => {
   const config = createConfig();
   const adapter = new TrackingFakeAdapter(config);
