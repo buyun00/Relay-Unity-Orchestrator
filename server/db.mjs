@@ -1367,6 +1367,21 @@ export class Store {
          WHERE status='attention'`,
       )
       .run(timestamp);
+    this.db
+      .prepare(
+        `
+        UPDATE tasks SET status='waiting_user', updated_at=?
+        WHERE status='failed'
+          AND (
+            SELECT turns.error_code
+            FROM turns
+            WHERE turns.task_id=tasks.id
+            ORDER BY turns.sequence DESC
+            LIMIT 1
+          )='CODEX_NEEDS_INPUT'
+      `,
+      )
+      .run(timestamp);
     this.db.exec(`
       UPDATE ops_turns
       SET status='interrupted', error_code='SERVER_RESTARTED',
@@ -2636,7 +2651,8 @@ export class Store {
       const candidates = this.db
         .prepare(
           `
-        SELECT turns.*, tasks.project_id
+        SELECT turns.*, tasks.project_id,
+          tasks.codex_thread_id, tasks.latest_commit_sha
         FROM turns JOIN tasks ON tasks.id=turns.task_id
         WHERE turns.status='queued' AND tasks.status='queued'
         ORDER BY ${QUEUED_TURN_ORDER}
@@ -2644,8 +2660,9 @@ export class Store {
         )
         .all();
       for (const candidate of candidates) {
-        const resumesPreservedWorkspace = Boolean(candidate.worker_id);
-        const workerRow = resumesPreservedWorkspace
+        let resumesPreservedWorkspace = Boolean(candidate.worker_id);
+        let reassignedFromWorkerId = null;
+        let workerRow = resumesPreservedWorkspace
           ? this.db
               .prepare(
                 `
@@ -2668,6 +2685,31 @@ export class Store {
               `,
               )
               .get(candidate.project_id, candidate.project_id);
+        if (!workerRow && candidate.worker_id) {
+          const pinnedWorker = this.db
+            .prepare("SELECT enabled FROM workers WHERE id=?")
+            .get(candidate.worker_id);
+          const durableElsewhere = Boolean(
+            candidate.codex_thread_id && candidate.latest_commit_sha,
+          );
+          if (pinnedWorker?.enabled === 0 && durableElsewhere) {
+            workerRow = this.db
+              .prepare(
+                `
+                SELECT * FROM workers
+                WHERE enabled=1 AND status='ready' AND current_turn_id IS NULL
+                  AND (project_id=? OR project_id IS NULL)
+                ORDER BY CASE WHEN project_id=? THEN 0 ELSE 1 END, name
+                LIMIT 1
+              `,
+              )
+              .get(candidate.project_id, candidate.project_id);
+            if (workerRow) {
+              reassignedFromWorkerId = candidate.worker_id;
+              resumesPreservedWorkspace = false;
+            }
+          }
+        }
         if (!workerRow) continue;
         const timestamp = now();
         const turnUpdate = this.db
@@ -2692,6 +2734,7 @@ export class Store {
           .run(timestamp, candidate.task_id);
         return {
           ...this.getExecutionContext(candidate.id),
+          reassignedFromWorkerId,
           resumePreservedWorkspace:
             resumesPreservedWorkspace &&
             (candidate.execution_mode || "full") !== "delivery_only",
@@ -3334,7 +3377,11 @@ export class Store {
     return this.getBuildDispatch(dispatchId);
   }
 
-  failTurn(turnId, error, { preserveWorker = true } = {}) {
+  failTurn(
+    turnId,
+    error,
+    { preserveWorker = true, taskStatus = null } = {},
+  ) {
     const turn = this.getTurn(turnId);
     if (!turn) return null;
     const timestamp = now();
@@ -3358,7 +3405,11 @@ export class Store {
         .get(turn.taskId);
       this.db
         .prepare(`UPDATE tasks SET status=?, updated_at=? WHERE id=?`)
-        .run(queued ? "queued" : "failed", timestamp, turn.taskId);
+        .run(
+          queued ? "queued" : taskStatus || "failed",
+          timestamp,
+          turn.taskId,
+        );
       if (turn.workerId) {
         if (queued && preserveWorker) {
           this.db

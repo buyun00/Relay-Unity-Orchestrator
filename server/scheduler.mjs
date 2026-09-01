@@ -50,6 +50,23 @@ const INFRASTRUCTURE_RECOVERY_CODES = new Set([
 ]);
 const DIRECT_VM_RESTART_LIMIT = 1;
 
+function codexNeedsInfrastructureRecovery(codexFinal) {
+  if (codexFinal?.status !== "needs_input") return false;
+  const text = [
+    codexFinal.summary,
+    codexFinal.question,
+    ...(Array.isArray(codexFinal.risks) ? codexFinal.risks : []),
+  ]
+    .filter(Boolean)
+    .map(String)
+    .join("\n");
+  const infrastructure =
+    /(?:UnitySkills|Unity Editor|\bworker\b|\bVM\b|8090|heartbeat|SMB|checkpoint|虚拟机|工位|快照)/iu;
+  const unavailable =
+    /(?:restart|recover|restore|unavailable|offline|timeout|crash|license|重启|恢复|无法|未.{0,12}监听|超时|离线|崩溃|许可)/iu;
+  return infrastructure.test(text) && unavailable.test(text);
+}
+
 function isInfrastructureFailure(stage, error) {
   if (!["prepare", "workspace-prepare", "workspace-resume"].includes(stage))
     return false;
@@ -224,6 +241,23 @@ export class Scheduler {
           }
           continue;
         }
+        if (context.reassignedFromWorkerId) {
+          this.store.emit({
+            taskId: context.task.id,
+            turnId: context.turn.id,
+            workerId: context.worker.id,
+            type: "turn.worker-reassigned",
+            phase: "queue",
+            level: "warning",
+            message: `Queued turn moved from disabled worker ${context.reassignedFromWorkerId} to ${context.worker.name} using its durable branch and Codex conversation`,
+            data: {
+              previousWorkerId: context.reassignedFromWorkerId,
+              workerId: context.worker.id,
+              branchName: context.task.branchName,
+              latestCommitSha: context.task.latestCommitSha,
+            },
+          });
+        }
         const controller = new AbortController();
         this.controllers.set(context.turn.id, controller);
         const execution = this.execute(context, controller);
@@ -314,7 +348,7 @@ export class Scheduler {
     return feedbackTurn;
   }
 
-  async recoverInfrastructure(context, error) {
+  async recoverInfrastructure(context, error, { afterCodex = false } = {}) {
     const priorAttempts = this.store
       .listTaskEvents(context.task.id)
       .filter(
@@ -352,7 +386,7 @@ export class Scheduler {
     this.emitProgress(
       context,
       "infrastructure-recovery.started",
-      `Infrastructure prerequisite failed before Codex started; preserving the same turn and restarting VM ${context.worker.name}. Unity will only be started by the VM login startup chain.`,
+      `${afterCodex ? "Codex identified a worker infrastructure failure" : "Infrastructure prerequisite failed before Codex started"}; preserving the same turn and restarting VM ${context.worker.name}. Unity will only be started by the VM login startup chain.`,
       "warning",
       { code: error.code, restartAttempt: priorAttempts + 1 },
     );
@@ -531,8 +565,16 @@ export class Scheduler {
             });
             return;
           }
+          if (codexNeedsInfrastructureRecovery(codexFinal)) {
+            error.code = "CODEX_INFRASTRUCTURE_RECOVERY_REQUIRED";
+            await this.recoverInfrastructure(context, error, {
+              afterCodex: true,
+            });
+            return;
+          }
           this.store.failTurn(context.turn.id, error, {
             preserveWorker: true,
+            taskStatus: "waiting_user",
           });
           this.emitProgress(
             context,

@@ -283,6 +283,40 @@ class AlwaysBlockedResultFakeAdapter extends TrackingFakeAdapter {
   }
 }
 
+class InfrastructureNeedsInputFakeAdapter extends TrackingFakeAdapter {
+  needsRecovery = true;
+
+  async runCodex(...args) {
+    const result = await super.runCodex(...args);
+    if (this.needsRecovery) {
+      this.needsRecovery = false;
+      result.final = {
+        ...result.final,
+        status: "needs_input",
+        summary: "UnitySkills did not recover after Play Mode",
+        question:
+          "Please restart this worker VM so UnitySkills 8090 can recover",
+        risks: ["Unity Editor remains unavailable"],
+      };
+    }
+    return result;
+  }
+}
+
+class UserNeedsInputFakeAdapter extends TrackingFakeAdapter {
+  async runCodex(...args) {
+    const result = await super.runCodex(...args);
+    result.final = {
+      ...result.final,
+      status: "needs_input",
+      summary: "A product fixture is required",
+      question: "Which account should be used for the paid reward scenario?",
+      risks: ["The requested server state is not available"],
+    };
+    return result;
+  }
+}
+
 class FailFirstDeliveryFakeAdapter extends TrackingFakeAdapter {
   shouldFailDelivery = true;
 
@@ -570,6 +604,126 @@ test("repeated blocked results stay in the original conversation before supervis
     .find((event) => event.type === "turn.task-feedback-exhausted");
   assert.equal(exhausted.level, "error");
   assert.equal(exhausted.data.priorFeedbackCount, 3);
+});
+
+test("infrastructure needs_input restarts the VM and resumes the same turn", async (t) => {
+  const config = createConfig();
+  const adapter = new InfrastructureNeedsInputFakeAdapter(config);
+  const { store, scheduler, project, worker } = createHarness(t, { adapter });
+  const created = createTask(store, project.id, {
+    title: "Recover Unity after Codex detects infrastructure loss",
+  });
+
+  await scheduler.start();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      scheduler.status().activeTurns === 0,
+    "the same turn to complete after Codex-triggered VM recovery",
+  );
+
+  assert.equal(store.listTaskTurns(created.task.id).length, 1);
+  assert.equal(adapter.codexContexts.length, 2);
+  assert.deepEqual(adapter.controlCalls, ["restart"]);
+  assert.equal(store.getWorker(worker.id).status, "ready");
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some(
+        (event) =>
+          event.turnId === created.turn.id &&
+          event.type === "turn.infrastructure-recovery.started" &&
+          event.data.code === "CODEX_INFRASTRUCTURE_RECOVERY_REQUIRED",
+      ),
+  );
+});
+
+test("genuine needs_input waits on the task without creating a worker error", async (t) => {
+  const config = createConfig();
+  const adapter = new UserNeedsInputFakeAdapter(config);
+  const { store, scheduler, project, worker } = createHarness(t, { adapter });
+  const created = createTask(store, project.id, {
+    title: "Wait for a real product decision",
+  });
+
+  await scheduler.start();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "failed" &&
+      scheduler.status().activeTurns === 0,
+    "the task to wait for genuine user input",
+  );
+
+  assert.equal(store.getTurn(created.turn.id).errorCode, "CODEX_NEEDS_INPUT");
+  assert.equal(store.getTask(created.task.id).status, "waiting_user");
+  assert.equal(store.getWorker(worker.id).status, "reserved");
+  assert.deepEqual(adapter.controlCalls, []);
+});
+
+test("durable queued turn leaves a disabled pinned worker for a ready worker", async (t) => {
+  const { store, scheduler, project, worker } = createHarness(t);
+  const disabled = store.createWorker({
+    id: "worker-disabled-pinned",
+    name: "lin-worker-disabled-pinned",
+    vmName: "lin-worker-disabled-pinned",
+    projectId: project.id,
+    checkpointName: "PROJECT_READY",
+    internalIp: "172.30.240.12",
+    sharePath: project.smbPath,
+    status: "reserved",
+    enabled: false,
+  });
+  const created = createTask(store, project.id, {
+    title: "Move durable work away from a disabled worker",
+  });
+  store.db
+    .prepare(
+      "UPDATE tasks SET codex_thread_id=?, latest_commit_sha=? WHERE id=?",
+    )
+    .run("thread-durable-disabled-worker", "a".repeat(40), created.task.id);
+  store.db
+    .prepare("UPDATE turns SET worker_id=? WHERE id=?")
+    .run(disabled.id, created.turn.id);
+
+  await scheduler.start();
+  await waitUntil(
+    () =>
+      store.getTurn(created.turn.id).status === "success" &&
+      scheduler.status().activeTurns === 0,
+    "the durable turn to move to a ready worker",
+  );
+
+  assert.equal(store.getTurn(created.turn.id).workerId, worker.id);
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some((event) => event.type === "turn.worker-reassigned"),
+  );
+});
+
+test("queued turn without durable identity stays pinned to a disabled worker", (t) => {
+  const { store, project } = createHarness(t, { workerStatus: "reserved" });
+  const disabled = store.createWorker({
+    id: "worker-disabled-unique-workspace",
+    name: "lin-worker-disabled-unique-workspace",
+    vmName: "lin-worker-disabled-unique-workspace",
+    projectId: project.id,
+    checkpointName: "PROJECT_READY",
+    internalIp: "172.30.240.13",
+    sharePath: project.smbPath,
+    status: "reserved",
+    enabled: false,
+  });
+  const created = createTask(store, project.id, {
+    title: "Keep unique workspace pinned",
+  });
+  store.db
+    .prepare("UPDATE turns SET worker_id=? WHERE id=?")
+    .run(disabled.id, created.turn.id);
+
+  assert.equal(store.claimNextTurn(), null);
+  assert.equal(store.getTurn(created.turn.id).workerId, disabled.id);
+  assert.equal(store.getTurn(created.turn.id).status, "queued");
 });
 
 test("delivery failure automatically resumes the original task Codex once", async (t) => {

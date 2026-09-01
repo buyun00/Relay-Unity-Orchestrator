@@ -1274,7 +1274,7 @@ test("supervisor ignores 100 normally waiting tasks and fresh Codex progress", (
   assert.deepEqual(ops.supervisorCandidates(), []);
 });
 
-test("supervisor does not repeatedly audit an exhausted automatic correction", (t) => {
+test("supervisor keeps an exhausted automatic correction in the original task", (t) => {
   const dataDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "relay-feedback-quiet-"),
   );
@@ -1314,7 +1314,10 @@ test("supervisor does not repeatedly audit an exhausted automatic correction", (
     userName: "Relay Task Feedback",
   });
   store.failTurn(feedback.id, blocked, { preserveWorker: true });
-  assert.deepEqual(ops.supervisorCandidates(), []);
+  assert.deepEqual(
+    ops.supervisorCandidates().map((candidate) => candidate.id),
+    [task.id],
+  );
   assert.equal(
     store.getTask(task.id).status,
     "failed",

@@ -286,14 +286,6 @@ export class OpsEngine {
       if (this.unchangedBlockedRecovery(task.id)) return false;
       const latest = this.store.listTaskTurns(task.id).at(-1);
       if (latest?.codexFinal?.status === "needs_input") return false;
-      // The action router already refuses another automatic attempt here.
-      // Re-diagnosing the same exhausted correction cannot supply permission
-      // or new evidence; leave it visible for the external monitor/operator.
-      if (
-        task.status === "failed" &&
-        latest?.authorName === "Relay Task Feedback"
-      )
-        return false;
       if (task.status === "failed") return true;
       const progressAt =
         this.store.latestTaskProgressAt(task.id) || task.updatedAt;
