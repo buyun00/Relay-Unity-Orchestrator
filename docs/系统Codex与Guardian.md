@@ -2,13 +2,13 @@
 
 ## 目标状态
 
-Relay 不再要求用户先发现 `attention` Worker 或手工进入桌面 Codex。控制服务保留一条 GPT-5.6 Luna Max 常驻监督会话：只要存在 `queued`、`running` 或 `failed` Task，它就每 5 分钟复用同一个 Codex thread，检查 Task、JSONL、Worker、Unity、Git 和交付证据。执行失败、Worker 动作失败、健康异常、Relay 运行前置失败和 Guardian 故障仍会立即唤醒监督会话。网页“系统助手”同时支持多个独立人工会话。
+Relay 不再为 Worker 设置人工处理状态。控制服务保留一条 GPT-5.6 Luna Max 常驻监督会话：只要存在 `queued`、`running` 或 `failed` Task，它就每 5 分钟复用同一个 Codex thread，检查 Task、JSONL、Worker、Unity、Git 和交付证据。执行失败、Worker 动作失败、健康异常、Relay 运行前置失败和 Guardian 故障仍会立即唤醒监督会话。网页“系统助手”同时支持多个独立人工会话。
 
 每条会话分别保存 Codex thread、模型、推理深度和 Fast 设置。不同会话最多按 `PIPELINE_OPS_MAX_CONCURRENT_SESSIONS` 并行运行，同一会话内的轮次始终串行，所有会改变外部状态的结构化动作还会经过全局串行执行器，避免并发重启或修复相互冲突。
 
 “清屏”会把当前最大轮次写入 `cleared_through_sequence`，只改变网页可见范围；数据库轮次、Codex thread、事故和动作审计均不会删除。需要完全独立上下文时应新建对话，而不是清屏。
 
-监督 Codex 负责判断任务是在正常长耗时还是实际卡住。发现真实故障时，它优先返回 `codex.repair`，由 Relay 新建一条 GPT-5.6 Sol xhigh 修复会话。修复会话使用 `danger-full-access`，不受旧版只读沙箱和结构化动作目录限制，可以直接使用 PowerShell Direct、本机 API、Git、Unity 端点、服务控制和源码修改，直到原 Task 恢复到可执行状态。其他兼容动作仍包括：
+监督 Codex 负责判断任务是在正常长耗时还是实际卡住。任务输出、验证、保存和交付问题必须用 `task.continue` 回到原 Task/Codex 对话；只有证据表明原 Codex 在启动前被基础设施阻断时，才返回 `codex.repair`，由 Relay 新建一条 GPT-5.6 Sol xhigh 修复会话。修复会话使用 `danger-full-access`，可直接使用 PowerShell Direct、本机 API、Git、Unity 端点、服务控制和源码修改，直到原 Task 恢复到可执行状态。其他兼容动作仍包括：
 
 - 在原 Task、原 Codex thread 和保留的 Worker workspace 上追加恢复消息；
 - 重试或重新打开 Task；
@@ -22,9 +22,11 @@ Relay 不再要求用户先发现 `attention` Worker 或手工进入桌面 Codex
 
 如果修复过程中 Relay 重启，运行中的 `repair` Turn 会重新入队，并用已经持久化的修复 Codex thread 继续，而不是从头丢失现场。
 
-## attention 自动恢复
+## 工位自动恢复
 
-Turn 执行、Unity 保存、Git 交付或 Worker 释放失败后，原有状态机仍先把 Worker 置为 `attention` 并保留现场。Ops 引擎订阅对应错误事件并立即创建事故。对于尚未完成的 Task，系统优先追加一轮恢复指令；数据库会把新 Turn 固定回原 `attention` Worker，Scheduler 通过 `resumePreserved` 跳过检查点恢复和 Git reset。
+Worker 不再有人工处理状态。任务执行、Unity 保存或 Git 交付失败后，工作区进入 `reserved`，系统把精确失败信息追加到原 Task/Codex 对话，并由 `resumePreserved` 在同一工作区继续。Codex 启动前若 VM、PowerShell Direct、SMB 或 Unity 前置条件失败，数据库保留并重新排队同一个 Turn，调度器重启对应 VM；Unity 只允许由虚拟机登录启动链恢复。若一次确定性重启仍未恢复，Worker 保持 `offline/preparing`，由基础设施守护链继续执行结构化 `worker.restart`，不会转成人工门禁。
+
+Relay 后端重启时，运行中的原 Turn 也会直接重新排队，Worker 暂记 `offline` 并在健康探测通过后回到 `ready`。旧数据库中的历史人工状态会在启动时归一化为 `offline`。
 
 如果交付已经持久化，只是释放失败，Ops Codex 可以调用 `worker.release`。相同事故的自动尝试受 `PIPELINE_OPS_MAX_ATTEMPTS` 限制，避免无穷循环；新的错误证据会重新打开正在监控的事故。
 

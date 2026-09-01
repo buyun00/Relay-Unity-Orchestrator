@@ -447,7 +447,6 @@ const workerStatusLabel: Record<string, string> = {
   busy: "使用中",
   preparing: "准备中",
   reserved: "已保留",
-  attention: "需要处理",
   offline: "离线",
   stopped: "已关闭",
   restarting: "重启中",
@@ -969,7 +968,7 @@ export default function ControlDesk() {
             typeof Notification !== "undefined" &&
             Notification.permission === "granted" &&
             (newestEvent.level === "error" ||
-              /delivered|failed|attention/.test(newestEvent.type))
+              /delivered|failed|unhealthy/.test(newestEvent.type))
           ) {
             new Notification(
               newestEvent.level === "error"
@@ -1319,8 +1318,7 @@ export default function ControlDesk() {
     };
     const destructive =
       ["forceOff", "restore", "release"].includes(action) ||
-      (action === "restart" &&
-        ["busy", "attention", "reserved"].includes(worker.status));
+      (action === "restart" && ["busy", "reserved"].includes(worker.status));
     const execute = () =>
       runMutation(
         () =>
@@ -2101,10 +2099,7 @@ function monitorTurnLabel(turn: OpsTurn) {
 }
 
 function systemEventKind(event: PipelineEvent) {
-  if (
-    event.level === "error" ||
-    /failed|error|unhealthy|attention/i.test(event.type)
-  )
+  if (event.level === "error" || /failed|error|unhealthy/i.test(event.type))
     return { label: "任务出错", tone: "error", icon: AlertTriangle };
   if (/resolved|recovered|repair.*completed/i.test(event.type))
     return { label: "错误已解决", tone: "recovered", icon: ShieldCheck };
@@ -2616,7 +2611,7 @@ export function LegacyOpsPage({
           <StatusBadge
             status={
               snapshot.server.recoveryMode
-                ? "attention"
+                ? "preparing"
                 : snapshot.server.ops?.running
                   ? "ready"
                   : "offline"
@@ -4662,7 +4657,7 @@ function WorkersPage({
     { label: "正在使用", statuses: ["busy"] },
     { label: "可用", statuses: ["ready"] },
     { label: "准备或保留", statuses: ["preparing", "restarting", "reserved"] },
-    { label: "需要处理", statuses: ["attention", "offline"] },
+    { label: "自动恢复中", statuses: ["offline"] },
     { label: "已关闭", statuses: ["stopped"] },
   ];
   return (
@@ -4957,7 +4952,7 @@ function WorkerInspector({
           <OctagonX size={15} />
           强制关闭
         </button>
-        {["attention", "reserved"].includes(worker.status) && (
+        {worker.status === "reserved" && (
           <button onClick={() => onAction(worker, "release")}>
             <CheckCircle2 size={15} />
             解除隔离

@@ -110,7 +110,11 @@ function workerIsReady(worker) {
   );
 }
 
-function unresolvedCheckpointIncident(store, worker, recoveryIncidentId = null) {
+function unresolvedCheckpointIncident(
+  store,
+  worker,
+  recoveryIncidentId = null,
+) {
   if (typeof store?.listIncidents !== "function" || !worker?.id) return null;
   return (
     store
@@ -421,7 +425,7 @@ export class CheckpointMaintenance {
         }
         this.store.setWorkerState(
           worker.id,
-          health?.ready ? "ready" : "attention",
+          health?.ready ? "ready" : "offline",
           {
             currentTurnId: null,
             error: health?.ready ? null : error?.message || String(error),
@@ -451,8 +455,7 @@ export class CheckpointMaintenance {
     const finalScheduledHour = this.hours.at(-1);
     const slotHour = /^\d{4}-\d{2}-\d{2}T(\d{2})$/u.exec(attemptSlot);
     const windowExhausted =
-      windowFailures.length > 0 &&
-      Number(slotHour?.[1]) === finalScheduledHour;
+      windowFailures.length > 0 && Number(slotHour?.[1]) === finalScheduledHour;
     const now = this.now().toISOString();
     this.state.lastResults = results;
     if (!failures.length && results.length > 0) {

@@ -202,6 +202,21 @@ class RecoveryFailingFakeAdapter extends TrackingFakeAdapter {
   }
 }
 
+class PrerequisiteRecoveringFakeAdapter extends TrackingFakeAdapter {
+  shouldFailResume = true;
+
+  async resumePreserved(...args) {
+    if (this.shouldFailResume) {
+      this.shouldFailResume = false;
+      this.resumeCalls += 1;
+      throw Object.assign(new Error("Unity is unavailable after a crash"), {
+        code: "PRESERVED_WORKSPACE_NOT_READY",
+      });
+    }
+    return super.resumePreserved(...args);
+  }
+}
+
 class StartFailingFakeAdapter extends FakeAdapter {
   startCalls = 0;
 
@@ -247,10 +262,23 @@ class BlockedResultFakeAdapter extends TrackingFakeAdapter {
       result.final = {
         ...result.final,
         status: "blocked",
-        summary: "Unity requires operator attention",
+        summary: "Unity validation is blocked",
         risks: ["Workspace must remain preserved"],
       };
     }
+    return result;
+  }
+}
+
+class AlwaysBlockedResultFakeAdapter extends TrackingFakeAdapter {
+  async runCodex(...args) {
+    const result = await super.runCodex(...args);
+    result.final = {
+      ...result.final,
+      status: "blocked",
+      summary: "The task correction is still incomplete",
+      risks: ["Keep the same workspace and conversation"],
+    };
     return result;
   }
 }
@@ -273,7 +301,7 @@ class FailFirstDeliveryFakeAdapter extends TrackingFakeAdapter {
 
 test("priority/FIFO queue waits without a free worker, then dispatches in order", async (t) => {
   const { store, scheduler, project, worker } = createHarness(t, {
-    workerStatus: "attention",
+    workerStatus: "reserved",
   });
   const deliveredTaskIds = [];
   store.onEvent((event) => {
@@ -477,9 +505,18 @@ test("structured blocked result is sent back to the same task Codex conversation
   assert.equal(turn.codexFinal.status, "blocked");
   assert.equal(feedbackTurn.authorName, "Relay Task Feedback");
   assert.equal(feedbackTurn.status, "success");
-  assert.match(feedbackTurn.userMessage, /Original summary: Unity requires operator attention/u);
-  assert.match(feedbackTurn.userMessage, /Original risks: Workspace must remain preserved/u);
-  assert.match(feedbackTurn.userMessage, /Never replace missing validation with a completed status/u);
+  assert.match(
+    feedbackTurn.userMessage,
+    /Original summary: Unity validation is blocked/u,
+  );
+  assert.match(
+    feedbackTurn.userMessage,
+    /Original risks: Workspace must remain preserved/u,
+  );
+  assert.match(
+    feedbackTurn.userMessage,
+    /Never replace missing validation with a completed status/u,
+  );
   assert.equal(adapter.codexContexts.length, 2);
   assert.equal(adapter.auditCalls, 1);
   assert.equal(adapter.finalizeCalls, 1);
@@ -494,6 +531,45 @@ test("structured blocked result is sent back to the same task Codex conversation
           event.type === "turn.task-feedback",
       ),
   );
+});
+
+test("repeated blocked results stay in the original conversation before supervisor escalation", async (t) => {
+  const config = createConfig();
+  const adapter = new AlwaysBlockedResultFakeAdapter(config);
+  const { store, scheduler, project, worker } = createHarness(t, { adapter });
+  const created = createTask(store, project.id, {
+    title: "Repeated task correction",
+    message: "Keep correcting this task in the original conversation",
+  });
+
+  await scheduler.start();
+  await waitUntil(
+    () =>
+      store.listTaskTurns(created.task.id).length === 4 &&
+      store
+        .listTaskTurns(created.task.id)
+        .every((turn) => turn.status === "failed") &&
+      scheduler.status().activeTurns === 0,
+    "three direct corrections before supervisor escalation",
+  );
+
+  const turns = store.listTaskTurns(created.task.id);
+  assert.deepEqual(
+    turns.map((turn) => turn.authorName),
+    [
+      "未记录用户",
+      "Relay Task Feedback",
+      "Relay Task Feedback",
+      "Relay Task Feedback",
+    ],
+  );
+  assert.equal(store.getWorker(worker.id).status, "reserved");
+  assert.equal(adapter.codexContexts.length, 4);
+  const exhausted = store
+    .listTaskEvents(created.task.id)
+    .find((event) => event.type === "turn.task-feedback-exhausted");
+  assert.equal(exhausted.level, "error");
+  assert.equal(exhausted.data.priorFeedbackCount, 3);
 });
 
 test("delivery failure automatically resumes the original task Codex once", async (t) => {
@@ -674,7 +750,7 @@ test("delivery-only retry refuses altered recorded output without queuing or app
     (error) => error.code === "DELIVERY_RETRY_AUDIT_UNSAFE",
   );
   assert.equal(store.getTurn(created.turn.id).status, "failed");
-  assert.equal(store.getWorker(worker.id).status, "attention");
+  assert.equal(store.getWorker(worker.id).status, "reserved");
   assert.deepEqual(
     store.listTaskTurns(created.task.id).map((turn) => turn.id),
     [created.turn.id],
@@ -804,7 +880,7 @@ test("delivery-only retry rejects every unsafe recorded audit category before qu
         (error) => error.code === "DELIVERY_RETRY_AUDIT_UNSAFE",
       );
       assert.equal(store.getTurn(created.turn.id).status, "failed");
-      assert.equal(store.getWorker(worker.id).status, "attention");
+      assert.equal(store.getWorker(worker.id).status, "reserved");
       assert.equal(store.listTaskTurns(created.task.id).length, 1);
     });
   }
@@ -865,7 +941,7 @@ test("delivery-only retry rejects valid-looking HEAD and content-hash drift befo
         store.getTurn(created.turn.id).errorCode,
         "DELIVERY_RETRY_AUDIT_MISMATCH",
       );
-      assert.equal(store.getWorker(worker.id).status, "attention");
+      assert.equal(store.getWorker(worker.id).status, "reserved");
       assert.equal(adapter.codexContexts.length, 0);
       assert.equal(adapter.finalizeCalls, 0);
       assert.equal(
@@ -913,7 +989,7 @@ test("a queued turn automatically starts a stopped compatible worker", async (t)
   );
 });
 
-test("unsafe workspace preparation keeps attention and reports every blocked path", async (t) => {
+test("unsafe workspace preparation reserves the workspace and reports every blocked path", async (t) => {
   const adapter = new WorkspaceRefusingFakeAdapter({ phaseMs: 1 });
   const { store, scheduler, project, worker } = createHarness(t, { adapter });
   const created = createTask(store, project.id, {
@@ -926,7 +1002,7 @@ test("unsafe workspace preparation keeps attention and reports every blocked pat
   await waitUntil(
     () =>
       store.getTurn(created.turn.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention" &&
+      store.getWorker(worker.id).status === "reserved" &&
       scheduler.status().activeTurns === 0,
     "unsafe workspace refusal to preserve the worker",
   );
@@ -950,7 +1026,7 @@ test("unsafe workspace preparation keeps attention and reports every blocked pat
   assert.equal(preservedWorker.currentTurnId, null);
 });
 
-test("a failed automatic worker start is surfaced once as attention", async (t) => {
+test("a failed automatic worker start stays offline for infrastructure recovery", async (t) => {
   const adapter = new StartFailingFakeAdapter({ phaseMs: 1 });
   const { store, scheduler, project, worker } = createHarness(t, {
     workerStatus: "stopped",
@@ -963,8 +1039,8 @@ test("a failed automatic worker start is surfaced once as attention", async (t) 
 
   await scheduler.start();
   await waitUntil(
-    () => store.getWorker(worker.id).status === "attention",
-    "the startup failure to require attention",
+    () => store.getWorker(worker.id).status === "offline",
+    "the startup failure to stay in automatic recovery",
   );
   await new Promise((resolve) => setTimeout(resolve, 30));
 
@@ -1278,7 +1354,7 @@ test("clean task 17 recovery resumes its durable Codex thread without branch rec
     }),
     { preserveWorker: true },
   );
-  assert.equal(store.getWorker(worker.id).status, "attention");
+  assert.equal(store.getWorker(worker.id).status, "reserved");
 
   const continued = store.appendTurn(created.task.id, {
     message: "Continue the existing thread",
@@ -1314,9 +1390,9 @@ test("clean task 17 recovery resumes its durable Codex thread without branch rec
   );
 });
 
-test("a pre-Codex prepare failure routes its attention worker through recovery, not verification", async (t) => {
+test("a pre-Codex infrastructure failure restarts the VM and resumes the same turn", async (t) => {
   const config = createConfig();
-  const adapter = new TrackingFakeAdapter(config);
+  const adapter = new PrerequisiteRecoveringFakeAdapter(config);
   const store = new Store(config);
   const { project, worker } = seedProjectAndWorker(store);
   const scheduler = new Scheduler({ config, store, adapter });
@@ -1332,54 +1408,48 @@ test("a pre-Codex prepare failure routes its attention worker through recovery, 
   });
 
   const created = createTask(store, project.id, {
-    title: "Prepare failed before task branch creation",
-    message: "Initial preparation fails [fake:fail=prepare]",
+    title: "Resume after Unity infrastructure recovery",
+    message: "Establish the original task conversation",
   });
-  scheduler.start();
-  scheduler.notifyQueueChanged();
-  await waitUntil(
-    () =>
-      store.getTurn(created.turn.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention" &&
-      scheduler.status().activeTurns === 0,
-    "the initial preparation failure",
+  const first = store.claimNextTurn();
+  store.setTaskThread(created.task.id, "thread-infrastructure-recovery");
+  store.failTurn(
+    first.turn.id,
+    Object.assign(new Error("Preserve the established workspace"), {
+      code: "PRESERVED_FAILURE",
+    }),
   );
-  assert.equal(store.getTask(created.task.id).codexThreadId, null);
-  assert.equal(
-    store
-      .listTaskEvents(created.task.id)
-      .some((event) => event.type === "turn.workspace-established"),
-    false,
-  );
-
   const continued = store.appendTurn(created.task.id, {
-    message: "Recover the preserved main workspace and continue",
+    message: "Continue the original turn after infrastructure recovery",
   });
-  scheduler.notifyQueueChanged();
+  const turnCount = store.listTaskTurns(created.task.id).length;
+
+  await scheduler.start();
   await waitUntil(
     () =>
       store.getTurn(continued.id).status === "success" &&
       scheduler.status().activeTurns === 0,
-    "the non-destructive recovery continuation",
+    "the same turn to resume after VM restart",
   );
 
-  assert.equal(adapter.prepareCalls, 1);
-  assert.equal(adapter.resumeCalls, 1);
-  assert.equal(adapter.verifyCalls, 0);
-  assert.equal(adapter.recoveryCalls, 1);
-  assert.deepEqual(adapter.controlCalls, []);
+  assert.equal(store.listTaskTurns(created.task.id).length, turnCount);
+  assert.equal(adapter.resumeCalls, 2);
+  assert.equal(adapter.verifyCalls, 1);
+  assert.equal(adapter.recoveryCalls, 0);
+  assert.deepEqual(adapter.controlCalls, ["restart"]);
+  assert.equal(store.getWorker(worker.id).status, "ready");
   assert.ok(
     store
       .listTaskEvents(created.task.id)
       .some(
         (event) =>
           event.turnId === continued.id &&
-          event.type === "turn.workspace-recovery",
+          event.type === "turn.infrastructure-recovery.started",
       ),
   );
 });
 
-test("failed recovery keeps attention without checkpoint, reset, restart, or release", async (t) => {
+test("failed workspace proof reserves the workspace without VM restart or release", async (t) => {
   const config = createConfig();
   const adapter = new RecoveryFailingFakeAdapter(config);
   const store = new Store(config);
@@ -1398,24 +1468,23 @@ test("failed recovery keeps attention without checkpoint, reset, restart, or rel
 
   const created = createTask(store, project.id, {
     title: "Recovery proof failure",
-    message: "Initial preparation fails [fake:fail=prepare]",
+    message: "Preserve the initial workspace",
   });
-  scheduler.start();
-  scheduler.notifyQueueChanged();
-  await waitUntil(
-    () =>
-      store.getTurn(created.turn.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention",
-    "the initial preparation failure",
+  store.claimNextTurn();
+  store.failTurn(
+    created.turn.id,
+    Object.assign(new Error("Initial preparation was interrupted"), {
+      code: "PREPARE_INTERRUPTED",
+    }),
   );
   const continued = store.appendTurn(created.task.id, {
     message: "Attempt evidence-backed recovery",
   });
-  scheduler.notifyQueueChanged();
+  await scheduler.start();
   await waitUntil(
     () =>
       store.getTurn(continued.id).status === "failed" &&
-      store.getWorker(worker.id).status === "attention" &&
+      store.getWorker(worker.id).status === "reserved" &&
       scheduler.status().activeTurns === 0,
     "the recovery proof failure",
   );
@@ -1444,7 +1513,7 @@ test("failed recovery keeps attention without checkpoint, reset, restart, or rel
   );
 });
 
-test("claiming preserved work atomically marks its attention worker busy", (t) => {
+test("claiming preserved work atomically marks its reserved worker busy", (t) => {
   const { store, project, worker } = createHarness(t);
   const created = createTask(store, project.id, {
     title: "Preserved atomic claim",
@@ -1470,7 +1539,7 @@ test("claiming preserved work atomically marks its attention worker busy", (t) =
   assert.equal(store.getWorker(worker.id).currentTurnId, continued.id);
 });
 
-test("an existing queued turn can rebind to its prior attention worker without replacing the prompt", (t) => {
+test("an existing queued turn can rebind to its prior reserved worker without replacing the prompt", (t) => {
   const { store, project, worker } = createHarness(t);
   const created = createTask(store, project.id, {
     title: "Queued recovery rebind",
@@ -1498,7 +1567,7 @@ test("an existing queued turn can rebind to its prior attention worker without r
   assert.equal(continued.workerId, null);
   const fingerprintBefore = store.taskPromptFingerprint(created.task.id);
 
-  store.setWorkerState(worker.id, "attention", {
+  store.setWorkerState(worker.id, "reserved", {
     currentTurnId: null,
     error: "Infrastructure restarted while another turn was active",
   });
@@ -1541,7 +1610,7 @@ test("a non-mutating pre-Codex workspace refusal requeues the same archived turn
     message: "Continue runtime validation in this exact turn",
   });
   const fingerprint = store.taskPromptFingerprint(created.task.id);
-  store.setWorkerState(worker.id, "attention", {
+  store.setWorkerState(worker.id, "reserved", {
     currentTurnId: null,
     error: "Preserved after infrastructure recovery",
   });
@@ -1650,7 +1719,7 @@ test("pausing the scheduler preserves queued work and resuming dispatches it", a
   );
 });
 
-test("opening a second Store cannot mark live work interrupted", (t) => {
+test("opening a second Store cannot recover live work until server startup", (t) => {
   const config = createConfig();
   const owner = new Store(config);
   const { project, worker } = seedProjectAndWorker(owner);
@@ -1670,10 +1739,12 @@ test("opening a second Store cannot mark live work interrupted", (t) => {
   assert.equal(owner.getTask(created.task.id).status, "running");
   assert.equal(owner.getWorker(worker.id).currentTurnId, created.turn.id);
   assert.equal(owner.getWorker(worker.id).status, "busy");
-  // A real server startup still recovers abandoned work, explicitly.
+  // A real server startup explicitly requeues abandoned work for recovery.
   auxiliary.reconcileInterruptedWork();
-  assert.equal(owner.getTurn(created.turn.id).status, "interrupted");
-  assert.equal(owner.getTurn(created.turn.id).errorCode, "SERVER_RESTARTED");
+  assert.equal(owner.getTurn(created.turn.id).status, "queued");
+  assert.equal(owner.getTurn(created.turn.id).errorCode, null);
+  assert.equal(owner.getTask(created.task.id).status, "queued");
+  assert.equal(owner.getWorker(worker.id).status, "offline");
   const source = fs.readFileSync(path.resolve("server/index.mjs"), "utf8");
   assert.ok(
     source.indexOf("await api.listen();") <

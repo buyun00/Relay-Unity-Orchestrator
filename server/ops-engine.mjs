@@ -429,8 +429,7 @@ export class OpsEngine {
       }
     }
     for (const worker of this.store.listWorkers()) {
-      if (!worker.enabled || !["attention", "offline"].includes(worker.status))
-        continue;
+      if (!worker.enabled || worker.status !== "offline") continue;
       if (
         this.store
           .listIncidents()
@@ -714,9 +713,9 @@ export class OpsEngine {
       "Describe only the evidence, fault, and required success condition. Avoid duplicating audits, policy restatements, or large context already present in the immutable task prompt.",
       "The complete immutable task prompt archive in the context is authoritative. Never replace, shorten, rewrite, or lose it.",
       ...actionPolicyPrompt(turn),
-      "For an attention worker with a preserved failed task, prefer task.continue with precise recovery instructions so the same Codex thread and workspace are resumed without reset.",
-      "Use worker.release only when delivery is already durable. Use worker.restart for infrastructure faults, not to discard uncommitted task work.",
-      "For checkpoint-maintenance incidents, use checkpoint.refresh only after the evidence shows the entire Relay task queue is empty, the worker is idle, and the failure is safely retryable. The action atomically rechecks queued and executing turns plus worker readiness, and never touches a busy or attention workspace. Use codex.repair only for a pre-Codex infrastructure failure that prevents the original task conversation from running.",
+      "A normal task or validation failure must continue in the original task Codex conversation on its reserved workspace. Infrastructure failures must restart the exact VM and leave the same turn queued; never command-start Unity because the VM login startup chain owns Unity startup.",
+      "Use worker.release only when delivery is already durable. Use worker.restart for infrastructure faults, not to discard uncommitted task work. Keep recoverable infrastructure offline/preparing until it becomes ready, and keep task work reserved for its original conversation; no worker state requires manual intervention.",
+      "For checkpoint-maintenance incidents, use checkpoint.refresh only after the evidence shows the entire Relay task queue is empty, the worker is idle, and the failure is safely retryable. The action atomically rechecks queued and executing turns plus worker readiness, and never touches a busy or reserved workspace. Use codex.repair only for a pre-Codex infrastructure failure that prevents the original task conversation from running.",
       "Checkpoint-maintenance invariant: never add, commit, or push guest-local .meta drift. The configured remote base branch is authoritative. The guarded refresh restores only pure unstaged Unity-generated .meta drift; if any non-.meta, staged, renamed, or copied work is present, preserve the entire workspace and keep the maintenance gate closed.",
       "Never delete or manipulate AVHDX/VHDX files. Checkpoint rotation is allowed only through the checkpoint maintenance action, which creates and canary-verifies the new PROJECT_READY before pruning the oldest managed checkpoint.",
       "If Relay code is the root cause, use relay.repair with a complete repair instruction. It creates an isolated worktree, rejects file deletions, validates, commits, fast-forwards, and asks Guardian to restart.",

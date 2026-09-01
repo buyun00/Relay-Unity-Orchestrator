@@ -573,7 +573,7 @@ function validateRecoveryProof(
   ) {
     throw Object.assign(
       new Error(
-        "Clean recovery proof did not match the inspected base workspace, durable remote tip, bounded attempt evidence, and final task branch; the worker remains in attention",
+        "Clean recovery proof did not match the inspected base workspace, durable remote tip, bounded attempt evidence, and final task branch; the workspace remains reserved",
       ),
       {
         code: "WORKSPACE_RECOVERY_PROOF_MISMATCH",
@@ -1202,7 +1202,7 @@ export class HyperVAdapter {
     ) {
       throw Object.assign(
         new Error(
-          "Recovery preparation did not return complete preservation proof; the worker remains in attention",
+          "Recovery preparation did not return complete preservation proof; the workspace remains reserved",
         ),
         {
           code: "WORKSPACE_PRESERVATION_UNPROVEN",

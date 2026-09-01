@@ -865,7 +865,6 @@ kbd {
   border-color: rgba(116, 167, 255, 0.22);
   background: rgba(116, 167, 255, 0.1);
 }
-.worker-attention,
 .worker-offline {
   color: var(--danger);
   border-color: rgba(255, 114, 121, 0.22);
@@ -1380,7 +1379,6 @@ kbd {
 }
 .status-needs_attention,
 .status-failed,
-.status-attention,
 .status-offline {
   color: var(--danger);
   background: rgba(255, 114, 121, 0.075);

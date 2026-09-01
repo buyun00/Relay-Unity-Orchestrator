@@ -130,7 +130,7 @@ function legacyDeliveryRetryEvidence(config, task, turn, worker) {
     turn.workerId !== worker?.id
   ) {
     refusal(
-      "The protected legacy turn no longer matches its recorded task branch, Codex thread, or attention worker",
+      "The protected legacy turn no longer matches its recorded task branch, Codex thread, or preserved worker",
     );
   }
   const basename = `${turn.sequence}-${turn.id}`;
@@ -1308,23 +1308,37 @@ export class Store {
     if (active.length > 0) {
       this.transaction(() => {
         for (const turn of active) {
-          this.db
-            .prepare(
-              `
-          UPDATE turns SET status='interrupted', error_code='SERVER_RESTARTED',
-            error_message='Backend restarted while this turn was active', finished_at=?
-          WHERE id=?
-        `,
-            )
-            .run(timestamp, turn.id);
           const queued = this.db
             .prepare(
               "SELECT id FROM turns WHERE task_id=? AND status='queued' ORDER BY sequence LIMIT 1",
             )
             .get(turn.task_id);
+          if (queued) {
+            this.db
+              .prepare(
+                `
+            UPDATE turns SET status='interrupted', error_code='SERVER_RESTARTED',
+              error_message='Backend restarted while this turn was active', finished_at=?
+            WHERE id=?
+          `,
+              )
+              .run(timestamp, turn.id);
+          } else {
+            this.db
+              .prepare(
+                `
+            UPDATE turns SET status='queued', error_code=NULL,
+              error_message=NULL, started_at=NULL, finished_at=NULL
+            WHERE id=?
+          `,
+              )
+              .run(turn.id);
+          }
           this.db
-            .prepare(`UPDATE tasks SET status=?, updated_at=? WHERE id=?`)
-            .run(queued ? "queued" : "failed", timestamp, turn.task_id);
+            .prepare(
+              "UPDATE tasks SET status='queued', updated_at=? WHERE id=?",
+            )
+            .run(timestamp, turn.task_id);
           if (turn.worker_id) {
             if (queued) {
               this.db
@@ -1336,8 +1350,8 @@ export class Store {
             this.db
               .prepare(
                 `
-            UPDATE workers SET status='attention', current_turn_id=NULL,
-              last_error='Backend restarted during active work; inspect preserved workspace', updated_at=?
+            UPDATE workers SET status='offline', current_turn_id=NULL,
+              last_error='Backend restarted during active work; the original turn is queued for recovery', updated_at=?
             WHERE id=?
           `,
               )
@@ -1346,6 +1360,13 @@ export class Store {
         }
       });
     }
+    this.db
+      .prepare(
+        `UPDATE workers SET status='offline', current_turn_id=NULL,
+          last_error=COALESCE(last_error, 'Legacy worker state queued for automatic recovery'), updated_at=?
+         WHERE status='attention'`,
+      )
+      .run(timestamp);
     this.db.exec(`
       UPDATE ops_turns
       SET status='interrupted', error_code='SERVER_RESTARTED',
@@ -1741,7 +1762,7 @@ export class Store {
     let nextStatus = worker.status;
     if (
       !worker.currentTurnId &&
-      !["attention", "preparing"].includes(worker.status)
+      !["reserved", "preparing"].includes(worker.status)
     ) {
       nextStatus =
         health.vm === false
@@ -2155,7 +2176,7 @@ export class Store {
             JOIN workers ON workers.id=turns.worker_id
             WHERE turns.task_id=?
               AND turns.status IN ('failed','cancelled','interrupted')
-              AND workers.status='attention'
+              AND workers.status='reserved'
             ORDER BY turns.sequence DESC
             LIMIT 1
           `,
@@ -2259,7 +2280,7 @@ export class Store {
         failed.delivery_audit_json == null &&
         failed.commit_sha == null &&
         failedWorker?.enabled === true &&
-        failedWorker.status === "attention" &&
+        failedWorker.status === "reserved" &&
         failedWorker.currentTurnId == null &&
         (failedWorker.projectId === task.projectId ||
           failedWorker.projectId == null);
@@ -2341,7 +2362,7 @@ export class Store {
         JOIN workers ON workers.id=turns.worker_id
         WHERE turns.task_id=? AND turns.id<>?
           AND turns.status IN ('success','failed','cancelled','interrupted')
-          AND workers.enabled=1 AND workers.status='attention'
+          AND workers.enabled=1 AND workers.status='reserved'
           AND workers.current_turn_id IS NULL
           AND (workers.project_id=? OR workers.project_id IS NULL)
         ORDER BY turns.sequence DESC
@@ -2353,7 +2374,7 @@ export class Store {
       throw new HttpError(
         409,
         "PRESERVED_RESUME_WORKER_UNAVAILABLE",
-        "No idle attention worker from this task history is available for preserved recovery",
+        "No idle preserved worker from this task history is available for recovery",
       );
     }
 
@@ -2380,7 +2401,7 @@ export class Store {
         type: "turn.preserved-worker.rebound",
         phase: "queued",
         message:
-          "Rebound the existing queued turn to its prior attention worker without changing the prompt or workspace",
+          "Rebound the existing queued turn to its prior preserved worker without changing the prompt or workspace",
         data: {
           workerId: preserved.worker_id,
           branchName: task.branchName,
@@ -2630,7 +2651,7 @@ export class Store {
                 `
                 SELECT * FROM workers
                 WHERE id=? AND enabled=1 AND current_turn_id IS NULL
-                  AND status IN ('attention','ready','reserved')
+                  AND status IN ('ready','reserved')
                   AND (project_id=? OR project_id IS NULL)
                 LIMIT 1
               `,
@@ -2661,7 +2682,7 @@ export class Store {
           .prepare(
             `
           UPDATE workers SET status='busy', current_turn_id=?, last_error=NULL, updated_at=?
-          WHERE id=? AND status IN ('attention','ready','reserved')
+          WHERE id=? AND status IN ('ready','reserved')
             AND current_turn_id IS NULL
         `,
           )
@@ -3353,12 +3374,48 @@ export class Store {
         `,
           )
           .run(
-            preserveWorker ? "attention" : "ready",
+            preserveWorker ? "reserved" : "ready",
             error.message || String(error),
             timestamp,
             turn.workerId,
           );
       }
+    });
+    return this.getTurn(turnId);
+  }
+
+  requeueTurnForInfrastructureRecovery(turnId, error) {
+    const turn = this.getTurn(turnId);
+    if (!turn || !turn.workerId) return null;
+    const timestamp = now();
+    this.transaction(() => {
+      const updated = this.db
+        .prepare(
+          `
+        UPDATE turns SET status='queued', started_at=NULL, finished_at=NULL,
+          error_code=NULL, error_message=NULL
+        WHERE id=? AND status IN ('preparing','running')
+      `,
+        )
+        .run(turnId);
+      if (!updated.changes) {
+        throw new HttpError(
+          409,
+          "INFRASTRUCTURE_RECOVERY_STATE_CHANGED",
+          "The turn changed before infrastructure recovery could preserve it",
+        );
+      }
+      this.db
+        .prepare("UPDATE tasks SET status='queued', updated_at=? WHERE id=?")
+        .run(timestamp, turn.taskId);
+      this.db
+        .prepare(
+          `
+        UPDATE workers SET status='offline', current_turn_id=NULL,
+          last_error=?, updated_at=? WHERE id=?
+      `,
+        )
+        .run(error.message || String(error), timestamp, turn.workerId);
     });
     return this.getTurn(turnId);
   }
@@ -3448,7 +3505,7 @@ export class Store {
         this.db
           .prepare(
             `
-          UPDATE workers SET status='attention', current_turn_id=NULL,
+          UPDATE workers SET status='reserved', current_turn_id=NULL,
             last_error='Turn cancelled after execution began; workspace preserved', updated_at=? WHERE id=?
         `,
           )
@@ -3597,13 +3654,13 @@ export class Store {
       }
       if (
         !worker ||
-        worker.status !== "attention" ||
+        worker.status !== "reserved" ||
         worker.currentTurnId != null
       ) {
         throw new HttpError(
           409,
           "DELIVERY_RETRY_WORKER_NOT_PRESERVED",
-          "Delivery-only retry requires the original preserved attention worker",
+          "Delivery-only retry requires the original preserved worker",
         );
       }
       const timestamp = now();
@@ -4911,9 +4968,6 @@ export class Store {
         queuedTurns: queue.length,
         runningTurns: turns.filter((turn) =>
           ["preparing", "running", "saving"].includes(turn.status),
-        ).length,
-        attentionWorkers: workers.filter(
-          (worker) => worker.status === "attention",
         ).length,
         pendingBuildDispatches: this.db
           .prepare(

@@ -5,7 +5,6 @@ export type WorkerStatus =
   | "busy"
   | "preparing"
   | "reserved"
-  | "attention"
   | "offline"
   | "stopped"
   | "restarting";

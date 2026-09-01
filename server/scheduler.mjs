@@ -41,6 +41,28 @@ function threadIdFromEvent(event) {
 }
 
 const TASK_FEEDBACK_AUTHOR = "Relay Task Feedback";
+const TASK_FEEDBACK_DIRECT_LIMIT = 3;
+const INFRASTRUCTURE_RECOVERY_CODES = new Set([
+  "PRESERVED_WORKSPACE_NOT_READY",
+  "CHECKPOINT_RESTORE_FAILED",
+  "WORKER_NOT_READY",
+  "WORKER_START_FAILED",
+]);
+const DIRECT_VM_RESTART_LIMIT = 1;
+
+function isInfrastructureFailure(stage, error) {
+  if (!["prepare", "workspace-prepare", "workspace-resume"].includes(stage))
+    return false;
+  if (INFRASTRUCTURE_RECOVERY_CODES.has(error?.code)) return true;
+  return (
+    error?.code === "HYPERV_COMMAND_FAILED" &&
+    [
+      "Control-Worker.ps1",
+      "Ensure-WorkerReady.ps1",
+      "Get-WorkerHealth.ps1",
+    ].includes(error?.operation)
+  );
+}
 
 function compactFailureDetails(error, deliveryAudit, codexFinal) {
   const blockedPaths = [
@@ -58,15 +80,22 @@ function compactFailureDetails(error, deliveryAudit, codexFinal) {
     `Failure message: ${String(error?.message || error).slice(0, 2_000)}`,
   ];
   if (codexFinal) {
-    lines.push(`Original Codex status: ${String(codexFinal.status || "unknown").slice(0, 80)}`);
+    lines.push(
+      `Original Codex status: ${String(codexFinal.status || "unknown").slice(0, 80)}`,
+    );
     for (const field of ["summary", "question"]) {
       if (typeof codexFinal[field] === "string" && codexFinal[field].trim()) {
-        lines.push(`Original ${field}: ${codexFinal[field].trim().slice(0, 1_200)}`);
+        lines.push(
+          `Original ${field}: ${codexFinal[field].trim().slice(0, 1_200)}`,
+        );
       }
     }
     for (const field of ["risks", "validation"]) {
-      const items = Array.isArray(codexFinal[field]) ? codexFinal[field].slice(-4) : [];
-      for (const item of items) lines.push(`Original ${field}: ${String(item).slice(0, 300)}`);
+      const items = Array.isArray(codexFinal[field])
+        ? codexFinal[field].slice(-4)
+        : [];
+      for (const item of items)
+        lines.push(`Original ${field}: ${String(item).slice(0, 300)}`);
     }
   }
   if (blockedPaths.length) {
@@ -190,7 +219,7 @@ export class Scheduler {
             await this.controlWorker(stoppedWorker.id, "start");
           } catch {
             // controlWorker already records the failure and moves the worker
-            // to attention. Continue so another compatible stopped worker can
+            // offline. Continue so another compatible stopped worker can
             // be tried without leaving the queue silently blocked.
           }
           continue;
@@ -225,13 +254,27 @@ export class Scheduler {
 
   queueTaskFeedback(context, error, { stage, deliveryAudit, codexFinal } = {}) {
     this.store.failTurn(context.turn.id, error, { preserveWorker: true });
-    if (context.turn.authorName === TASK_FEEDBACK_AUTHOR) {
+    const taskTurns = this.store.listTaskTurns(context.task.id);
+    const currentIndex = taskTurns.findIndex(
+      (turn) => turn.id === context.turn.id,
+    );
+    let priorFeedbackCount = 0;
+    for (let index = currentIndex; index >= 0; index -= 1) {
+      if (taskTurns[index]?.authorName !== TASK_FEEDBACK_AUTHOR) break;
+      priorFeedbackCount += 1;
+    }
+    if (priorFeedbackCount >= TASK_FEEDBACK_DIRECT_LIMIT) {
       this.emitProgress(
         context,
         "task-feedback-exhausted",
-        `${error.message}. The same task Codex already received one automatic correction; the workspace remains preserved for monitoring or user intervention.`,
-        "warning",
-        { code: error.code, stage, taskFeedbackQueued: false },
+        `${error.message}. The original task Codex received ${priorFeedbackCount} concise corrections without completing; the workspace remains reserved and the persistent supervisor must continue the same task conversation.`,
+        "error",
+        {
+          code: error.code,
+          stage,
+          taskFeedbackQueued: false,
+          priorFeedbackCount,
+        },
       );
       return null;
     }
@@ -269,6 +312,74 @@ export class Scheduler {
       },
     );
     return feedbackTurn;
+  }
+
+  async recoverInfrastructure(context, error) {
+    const priorAttempts = this.store
+      .listTaskEvents(context.task.id)
+      .filter(
+        (event) =>
+          event.turnId === context.turn.id &&
+          event.type === "turn.infrastructure-recovery.started",
+      ).length;
+    this.store.requeueTurnForInfrastructureRecovery(context.turn.id, error);
+
+    if (priorAttempts >= DIRECT_VM_RESTART_LIMIT) {
+      this.emitProgress(
+        context,
+        "infrastructure-recovery-delegated",
+        `Worker infrastructure is still unavailable after ${priorAttempts} VM restart; the same turn remains queued and the infrastructure guard must recover ${context.worker.name}.`,
+        "error",
+        { code: error.code, restartAttempts: priorAttempts },
+      );
+      this.store.emit({
+        taskId: context.task.id,
+        turnId: context.turn.id,
+        workerId: context.worker.id,
+        type: "worker.unhealthy",
+        phase: "infrastructure-recovery",
+        level: "error",
+        message: `${context.worker.name} remained unavailable after automatic VM restart; the original task turn is still queued`,
+        data: {
+          code: error.code,
+          restartAttempts: priorAttempts,
+          queuedTurnPreserved: true,
+        },
+      });
+      return;
+    }
+
+    this.emitProgress(
+      context,
+      "infrastructure-recovery.started",
+      `Infrastructure prerequisite failed before Codex started; preserving the same turn and restarting VM ${context.worker.name}. Unity will only be started by the VM login startup chain.`,
+      "warning",
+      { code: error.code, restartAttempt: priorAttempts + 1 },
+    );
+    try {
+      await this.controlWorker(context.worker.id, "restart", {
+        actorName: "Relay Infrastructure Guard",
+        notify: false,
+      });
+      this.emitProgress(
+        context,
+        "infrastructure-recovery.completed",
+        `VM ${context.worker.name} recovered; the same original turn will resume automatically.`,
+        "info",
+        { restartAttempt: priorAttempts + 1 },
+      );
+    } catch (restartError) {
+      this.emitProgress(
+        context,
+        "infrastructure-recovery.deferred",
+        `VM restart did not restore ${context.worker.name}: ${restartError.message}. The same turn remains queued for the infrastructure guard.`,
+        "error",
+        {
+          code: restartError.code || "WORKER_RESTART_FAILED",
+          restartAttempt: priorAttempts + 1,
+        },
+      );
+    }
   }
 
   async execute(context, controller) {
@@ -426,7 +537,7 @@ export class Scheduler {
           this.emitProgress(
             context,
             blocked ? "blocked" : "needs-input",
-            `${message}. Worker workspace remains in attention.`,
+            `${message}. Worker workspace remains reserved for this task.`,
             "warning",
             { code, structuredStatus: codexFinal?.status || null },
           );
@@ -545,7 +656,7 @@ export class Scheduler {
       } catch (releaseError) {
         const error = errorWithCode(releaseError, "WORKER_RELEASE_FAILED");
         this.store.assignNextQueuedTurn(context.task.id, context.worker.id);
-        this.store.setWorkerState(context.worker.id, "attention", {
+        this.store.setWorkerState(context.worker.id, "offline", {
           currentTurnId: null,
           error: error.message,
         });
@@ -560,7 +671,7 @@ export class Scheduler {
     } catch (caught) {
       const currentTurn = this.store.getTurn(context.turn.id);
       if (currentTurn?.status === "cancelled") {
-        this.store.setWorkerState(context.worker.id, "attention", {
+        this.store.setWorkerState(context.worker.id, "reserved", {
           currentTurnId: null,
           error:
             "Turn cancelled after execution began; inspect preserved workspace",
@@ -568,6 +679,16 @@ export class Scheduler {
         return;
       }
       const error = errorWithCode(caught, "TURN_EXECUTION_FAILED");
+      if (
+        !signal.aborted &&
+        !codexConversationActive &&
+        !codexFinal &&
+        !context.deliveryOnlyRetry &&
+        isInfrastructureFailure(stage, error)
+      ) {
+        await this.recoverInfrastructure(context, error);
+        return;
+      }
       if (
         !signal.aborted &&
         (codexConversationActive || codexFinal || context.deliveryOnlyRetry)
@@ -644,7 +765,7 @@ export class Scheduler {
         });
         const updated = this.store.updateWorkerHealth(worker.id, health);
         const wasUnhealthy =
-          ["attention", "offline"].includes(worker.status) ||
+          worker.status === "offline" ||
           ["vm", "heartbeat", "smb", "unity"].some(
             (key) => worker.health?.[key] === "error",
           );
@@ -654,7 +775,7 @@ export class Scheduler {
           health.heartbeat === false ||
           health.smb === false ||
           health.unity === false ||
-          ["attention", "offline"].includes(updated?.status);
+          updated?.status === "offline";
         if (
           isUnhealthy &&
           (!wasUnhealthy || (health.error && health.error !== worker.lastError))
@@ -683,7 +804,7 @@ export class Scheduler {
   async controlWorker(
     workerId,
     action,
-    { force = false, actorName = null } = {},
+    { force = false, actorName = null, notify = true } = {},
   ) {
     const allowed = [
       "start",
@@ -750,10 +871,10 @@ export class Scheduler {
         message: `${action} completed for ${worker.name}`,
         data: { action },
       });
-      this.notifyQueueChanged();
+      if (notify) this.notifyQueueChanged();
       return updated;
     } catch (error) {
-      this.store.setWorkerState(workerId, "attention", {
+      this.store.setWorkerState(workerId, "offline", {
         currentTurnId: null,
         error: error.message,
       });

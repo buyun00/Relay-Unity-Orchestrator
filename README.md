@@ -2,7 +2,7 @@
 
 Relay 是一个运行在 Hyper-V 宿主机上的自建调度与管理系统，不依赖 Sites 或其他托管网页服务。它把一个长期任务拆成可排队的多轮执行：没有空闲虚拟机时自动等待；工位释放后，Codex 对话、Git 分支、提交锚点和完整历史仍然保留。用户可以在同一任务中继续追加微调，而不必重新描述上下文。
 
-Relay 同时内置持久化“系统助手”。GPT-5.6 Luna Max 常驻监督会话会在存在非终态 Task 时每 5 分钟复用同一个 Codex thread，综合 Task、JSONL、Worker、Unity、Git 和交付证据判断是否真正卡住。发现故障后，系统会新建 GPT-5.6 Sol xhigh 全权限修复会话；它不受旧版只读沙箱和动作目录限制，可直接修复宿主机、Hyper-V、Unity、Git、Relay 代码与服务，并持续到原 Task 恢复运行。Task 标题、每轮用户提示词和附件引用会写入 SQLite 不可变归档并在修复前后校验，修复不能用替代 Task 绕过原需求。网页仍可创建多个相互独立、可并行运行的人工对话，每条对话分别保存 Codex thread、模型、推理深度与 Fast 设置。独立 Guardian 与 Relay 相互探活和拉起，主 API 不可用时仍可从 Guardian 恢复页继续与 Emergency Codex 对话。
+Relay 同时内置持久化“系统助手”。GPT-5.6 Luna Max 常驻监督会话会在存在非终态 Task 时每 5 分钟复用同一个 Codex thread，综合 Task、JSONL、Worker、Unity、Git 和交付证据判断是否真正卡住。任务结果、验证和交付问题会直接回到原 Task 的 Codex 对话修正；只有原 Codex 因 Worker、运行时或工作区基础设施而无法启动时，才允许新建 GPT-5.6 Sol xhigh 全权限修复会话。Task 标题、每轮用户提示词和附件引用会写入 SQLite 不可变归档并在修复前后校验，修复不能用替代 Task 绕过原需求。网页仍可创建多个相互独立、可并行运行的人工对话，每条对话分别保存 Codex thread、模型、推理深度与 Fast 设置。独立 Guardian 与 Relay 相互探活和拉起，主 API 不可用时仍可从 Guardian 恢复页继续与 Emergency Codex 对话。
 
 完整权限边界、数据模型、恢复流程和部署方式见 [`docs/系统Codex与Guardian.md`](./docs/系统Codex与Guardian.md)。
 
@@ -24,7 +24,7 @@ Unity 保存 → 来宾 commit / push → 远程 SHA 核验
 释放工位；启用检查点后可恢复 PROJECT_READY；Task / thread / branch 永久保留
 ```
 
-如果保存、提交、推送或远程 SHA 核验失败，系统不会恢复检查点，而是把工位置为 `attention` 并保留现场，避免丢失未持久化修改。
+如果任务结果、保存、提交、推送或远程 SHA 核验失败，系统不会恢复检查点，而是把工作区置为 `reserved` 并将简短纠错消息送回原 Codex 对话。若 Codex 启动前的 VM、PowerShell Direct、SMB 或 Unity 前置条件失败，同一 Turn 保持排队并重启对应 VM；Unity 只由虚拟机登录启动链拉起，不从命令行启动。
 
 ## 网页使用说明
 

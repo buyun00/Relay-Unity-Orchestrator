@@ -818,7 +818,6 @@ function recoverySnapshot() {
       busyWorkers: 0,
       queuedTurns: 0,
       runningTurns: 0,
-      attentionWorkers: 0,
     },
     ops: {
       thread: defaultThread,
