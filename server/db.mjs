@@ -2306,6 +2306,7 @@ export class Store {
         failed?.status === "failed" &&
         [
           "WORKSPACE_BASE_BRANCH_MISMATCH",
+          "RECOVERY_REMOTE_TIP_QUERY_FAILED",
           "RECOVERY_FETCH_FAILED",
           "WORKSPACE_RECOVERY_PROOF_MISMATCH",
         ].includes(failed.error_code) &&
@@ -2332,6 +2333,7 @@ export class Store {
              WHERE id=? AND task_id=? AND status='failed'
                AND error_code IN (
                  'WORKSPACE_BASE_BRANCH_MISMATCH',
+                 'RECOVERY_REMOTE_TIP_QUERY_FAILED',
                  'RECOVERY_FETCH_FAILED',
                  'WORKSPACE_RECOVERY_PROOF_MISMATCH'
                )

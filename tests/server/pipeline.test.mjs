@@ -1808,6 +1808,7 @@ test("an existing queued turn can rebind to its prior reserved worker without re
 
 for (const refusalCode of [
   "WORKSPACE_BASE_BRANCH_MISMATCH",
+  "RECOVERY_REMOTE_TIP_QUERY_FAILED",
   "RECOVERY_FETCH_FAILED",
   "WORKSPACE_RECOVERY_PROOF_MISMATCH",
 ]) {
