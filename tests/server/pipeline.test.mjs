@@ -205,12 +205,17 @@ class RecoveryFailingFakeAdapter extends TrackingFakeAdapter {
 class PrerequisiteRecoveringFakeAdapter extends TrackingFakeAdapter {
   shouldFailResume = true;
 
+  constructor(config, failureCode = "PRESERVED_WORKSPACE_NOT_READY") {
+    super(config);
+    this.failureCode = failureCode;
+  }
+
   async resumePreserved(...args) {
     if (this.shouldFailResume) {
       this.shouldFailResume = false;
       this.resumeCalls += 1;
       throw Object.assign(new Error("Unity is unavailable after a crash"), {
-        code: "PRESERVED_WORKSPACE_NOT_READY",
+        code: this.failureCode,
       });
     }
     return super.resumePreserved(...args);
@@ -1603,6 +1608,69 @@ test("a pre-Codex infrastructure failure restarts the VM and resumes the same tu
   );
 });
 
+test("a pre-Codex task branch fetch timeout restarts the VM and resumes the same turn", async (t) => {
+  const config = createConfig();
+  const adapter = new PrerequisiteRecoveringFakeAdapter(
+    config,
+    "RECOVERY_FETCH_FAILED",
+  );
+  const store = new Store(config);
+  const { project, worker } = seedProjectAndWorker(store);
+  const scheduler = new Scheduler({ config, store, adapter });
+  t.after(async () => {
+    scheduler.stop();
+    await waitUntil(
+      () => scheduler.controllers.size === 0 && scheduler.pumping === false,
+      "scheduler cleanup",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+
+  const created = createTask(store, project.id, {
+    title: "Resume after task branch fetch recovery",
+    message: "Establish the original task conversation",
+  });
+  const first = store.claimNextTurn();
+  store.setTaskThread(created.task.id, "thread-fetch-recovery");
+  store.failTurn(
+    first.turn.id,
+    Object.assign(new Error("Preserve the established workspace"), {
+      code: "PRESERVED_FAILURE",
+    }),
+  );
+  const continued = store.appendTurn(created.task.id, {
+    message: "Continue the original turn after fetch recovery",
+  });
+  const turnCount = store.listTaskTurns(created.task.id).length;
+
+  await scheduler.start();
+  await waitUntil(
+    () =>
+      store.getTurn(continued.id).status === "success" &&
+      scheduler.status().activeTurns === 0,
+    "the same turn to resume after task branch fetch recovery",
+  );
+
+  assert.equal(store.listTaskTurns(created.task.id).length, turnCount);
+  assert.equal(adapter.resumeCalls, 2);
+  assert.equal(adapter.verifyCalls, 1);
+  assert.equal(adapter.recoveryCalls, 0);
+  assert.deepEqual(adapter.controlCalls, ["restart"]);
+  assert.equal(store.getWorker(worker.id).status, "ready");
+  assert.ok(
+    store
+      .listTaskEvents(created.task.id)
+      .some(
+        (event) =>
+          event.turnId === continued.id &&
+          event.type === "turn.infrastructure-recovery.started" &&
+          event.data.code === "RECOVERY_FETCH_FAILED",
+      ),
+  );
+});
+
 test("failed workspace proof reserves the workspace without VM restart or release", async (t) => {
   const config = createConfig();
   const adapter = new RecoveryFailingFakeAdapter(config);
@@ -1738,72 +1806,97 @@ test("an existing queued turn can rebind to its prior reserved worker without re
   assert.equal(resumed.resumePreservedWorkspace, true);
 });
 
-test("a non-mutating pre-Codex workspace refusal requeues the same archived turn", (t) => {
-  const { store, project, worker } = createHarness(t);
-  const created = createTask(store, project.id, {
-    title: "Same-turn workspace recovery",
-    message: "Keep every archived prompt byte",
-  });
-  const first = store.claimNextTurn();
-  store.setTaskThread(created.task.id, "thread-same-turn-recovery");
-  store.completeTurn(first.turn.id, {
-    codexFinal: {
-      status: "completed",
-      summary: "Committed before runtime validation",
-      changedFiles: [],
-      validation: [],
-      risks: [],
-    },
-    commitSha: "b".repeat(40),
-  });
-  store.setWorkerState(worker.id, "ready", {
-    currentTurnId: null,
-    error: null,
-  });
-  const continued = store.appendTurn(created.task.id, {
-    message: "Continue runtime validation in this exact turn",
-  });
-  const fingerprint = store.taskPromptFingerprint(created.task.id);
-  store.setWorkerState(worker.id, "reserved", {
-    currentTurnId: null,
-    error: "Preserved after infrastructure recovery",
-  });
-  store.rebindQueuedTurnToPreservedWorker(created.task.id, "Recovery operator");
-  const claimed = store.claimNextTurn();
-  assert.equal(claimed.turn.id, continued.id);
-  store.failTurn(
-    continued.id,
-    Object.assign(
-      new Error(
-        "Recovery expected clean restored branch 'main', but found a durable task branch; no mutation was attempted.",
+for (const refusalCode of [
+  "WORKSPACE_BASE_BRANCH_MISMATCH",
+  "RECOVERY_FETCH_FAILED",
+]) {
+  test(`a non-mutating pre-Codex ${refusalCode} refusal requeues the same archived turn behind current work`, (t) => {
+    const { store, project, worker } = createHarness(t);
+    const created = createTask(store, project.id, {
+      title: "Same-turn workspace recovery",
+      message: "Keep every archived prompt byte",
+    });
+    const first = store.claimNextTurn();
+    store.setTaskThread(created.task.id, "thread-same-turn-recovery");
+    store.completeTurn(first.turn.id, {
+      codexFinal: {
+        status: "completed",
+        summary: "Committed before runtime validation",
+        changedFiles: [],
+        validation: [],
+        risks: [],
+      },
+      commitSha: "b".repeat(40),
+    });
+    store.setWorkerState(worker.id, "ready", {
+      currentTurnId: null,
+      error: null,
+    });
+    const continued = store.appendTurn(created.task.id, {
+      message: "Continue runtime validation in this exact turn",
+    });
+    const fingerprint = store.taskPromptFingerprint(created.task.id);
+    store.setWorkerState(worker.id, "reserved", {
+      currentTurnId: null,
+      error: "Preserved after infrastructure recovery",
+    });
+    store.rebindQueuedTurnToPreservedWorker(
+      created.task.id,
+      "Recovery operator",
+    );
+    const claimed = store.claimNextTurn();
+    assert.equal(claimed.turn.id, continued.id);
+    store.failTurn(
+      continued.id,
+      Object.assign(
+        new Error("Task branch fetch timed out before the workspace changed."),
+        { code: refusalCode },
       ),
-      { code: "WORKSPACE_BASE_BRANCH_MISMATCH" },
-    ),
-  );
+    );
+    store.setWorkerState(worker.id, "ready", {
+      currentTurnId: null,
+      error: null,
+    });
+    const occupant = createTask(store, project.id, {
+      title: "Current work after the VM restart",
+      message: "Keep this unrelated current turn running.",
+    });
+    const occupyingContext = store.claimNextTurn();
+    assert.equal(occupyingContext.turn.id, occupant.turn.id);
+    assert.equal(store.getWorker(worker.id).status, "busy");
 
-  const requeued = store.rebindQueuedTurnToPreservedWorker(
-    created.task.id,
-    "Recovery operator",
-  );
+    const requeued = store.rebindQueuedTurnToPreservedWorker(
+      created.task.id,
+      "Recovery operator",
+    );
 
-  assert.equal(requeued.id, continued.id);
-  assert.equal(requeued.status, "queued");
-  assert.equal(requeued.workerId, worker.id);
-  assert.equal(requeued.startedAt, null);
-  assert.equal(requeued.finishedAt, null);
-  assert.equal(requeued.errorCode, null);
-  assert.equal(store.taskPromptFingerprint(created.task.id), fingerprint);
-  assert.equal(store.listTaskTurns(created.task.id).length, 2);
-  assert.equal(
-    store
-      .listTaskEvents(created.task.id)
-      .some((event) => event.type === "turn.preserved-worker.requeued"),
-    true,
-  );
-  const resumed = store.claimNextTurn();
-  assert.equal(resumed.turn.id, continued.id);
-  assert.equal(resumed.resumePreservedWorkspace, true);
-});
+    assert.equal(requeued.id, continued.id);
+    assert.equal(requeued.status, "queued");
+    assert.equal(requeued.workerId, worker.id);
+    assert.equal(requeued.startedAt, null);
+    assert.equal(requeued.finishedAt, null);
+    assert.equal(requeued.errorCode, null);
+    assert.equal(store.taskPromptFingerprint(created.task.id), fingerprint);
+    assert.equal(store.listTaskTurns(created.task.id).length, 2);
+    assert.equal(store.getWorker(worker.id).currentTurnId, occupant.turn.id);
+    assert.equal(
+      store
+        .listTaskEvents(created.task.id)
+        .some((event) => event.type === "turn.preserved-worker.requeued"),
+      true,
+    );
+    assert.equal(store.claimNextTurn(), null);
+    store.failTurn(
+      occupant.turn.id,
+      Object.assign(new Error("Finished unrelated current work"), {
+        code: "PRESERVED_FAILURE",
+      }),
+    );
+    const resumed = store.claimNextTurn();
+    assert.equal(resumed.turn.id, continued.id);
+    assert.equal(resumed.resumePreservedWorkspace, true);
+  });
+}
 
 test("autoRelease=false leaves a successful worker reserved", async (t) => {
   const config = createConfig();

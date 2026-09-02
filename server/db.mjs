@@ -2288,17 +2288,29 @@ export class Store {
       const failedWorker = failed?.worker_id
         ? this.getWorker(failed.worker_id)
         : null;
+      const activeWorkerTurn = failedWorker?.currentTurnId
+        ? this.getTurn(failedWorker.currentTurnId)
+        : null;
+      const workerCanKeepPinnedRetry =
+        failedWorker?.enabled === true &&
+        (failedWorker.projectId === task.projectId ||
+          failedWorker.projectId == null) &&
+        ((["ready", "reserved"].includes(failedWorker.status) &&
+          failedWorker.currentTurnId == null) ||
+          (failedWorker.status === "busy" &&
+            activeWorkerTurn?.workerId === failedWorker.id &&
+            ["preparing", "running", "saving", "cancel_requested"].includes(
+              activeWorkerTurn.status,
+            )));
       const safeWorkspaceRefusal =
         failed?.status === "failed" &&
-        failed.error_code === "WORKSPACE_BASE_BRANCH_MISMATCH" &&
+        ["WORKSPACE_BASE_BRANCH_MISMATCH", "RECOVERY_FETCH_FAILED"].includes(
+          failed.error_code,
+        ) &&
         failed.codex_final_json == null &&
         failed.delivery_audit_json == null &&
         failed.commit_sha == null &&
-        failedWorker?.enabled === true &&
-        failedWorker.status === "reserved" &&
-        failedWorker.currentTurnId == null &&
-        (failedWorker.projectId === task.projectId ||
-          failedWorker.projectId == null);
+        workerCanKeepPinnedRetry;
       if (!safeWorkspaceRefusal) {
         throw new HttpError(
           409,
@@ -2316,7 +2328,10 @@ export class Store {
              SET status='queued', started_at=NULL, finished_at=NULL,
                error_code=NULL, error_message=NULL
              WHERE id=? AND task_id=? AND status='failed'
-               AND error_code='WORKSPACE_BASE_BRANCH_MISMATCH'
+               AND error_code IN (
+                 'WORKSPACE_BASE_BRANCH_MISMATCH',
+                 'RECOVERY_FETCH_FAILED'
+               )
                AND codex_final_json IS NULL AND delivery_audit_json IS NULL
                AND commit_sha IS NULL`,
           )
@@ -2345,7 +2360,7 @@ export class Store {
           type: "turn.preserved-worker.requeued",
           phase: "queued",
           message:
-            "Requeued the same pre-Codex turn after a non-mutating workspace refusal; the archived prompt and worker identity are unchanged",
+            "Requeued the same pre-Codex turn after a non-mutating workspace or fetch refusal; the archived prompt and worker identity are unchanged",
           data: {
             workerId: failed.worker_id,
             branchName: task.branchName,
