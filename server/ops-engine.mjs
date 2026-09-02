@@ -471,14 +471,19 @@ export class OpsEngine {
         recoveredSourceTypes?.has(incident.context?.eventType),
       );
       if (incident.status !== "monitoring" && !sameRecoveryKind) continue;
-      const sameTask = event.taskId && incident.taskId === event.taskId;
-      const sameWorker = event.workerId && incident.workerId === event.workerId;
+      const sameTask = Boolean(
+        event.taskId && incident.taskId === event.taskId,
+      );
+      const sameWorker = Boolean(
+        event.workerId && incident.workerId === event.workerId,
+      );
+      const sameStandaloneWorker = !incident.taskId && sameWorker;
       const sameRecoveryTarget = Boolean(
         sameRecoveryKind &&
         (!incident.taskId || sameTask) &&
         (!incident.workerId || sameWorker),
       );
-      if (!sameTask && !sameWorker && !sameRecoveryTarget) continue;
+      if (!sameTask && !sameStandaloneWorker && !sameRecoveryTarget) continue;
       this.store.updateIncident(incident.id, {
         status: "resolved",
         lastAction: event.type,

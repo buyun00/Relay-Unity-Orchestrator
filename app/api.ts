@@ -193,6 +193,14 @@ export function fetchSnapshot(signal?: AbortSignal) {
         )
         .map((incident) => incident.taskId as string),
     );
+    for (const turn of rawOps.turns ?? []) {
+      if (
+        turn.targetTaskId &&
+        ["queued", "running"].includes(turn.status)
+      ) {
+        automaticallyRecoveringTaskIds.add(turn.targetTaskId);
+      }
+    }
     const systemThread = {
       ...EMPTY_SNAPSHOT.ops.thread,
       ...rawOps.thread,
