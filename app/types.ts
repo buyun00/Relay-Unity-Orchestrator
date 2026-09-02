@@ -12,6 +12,7 @@ export type WorkerStatus =
 export type TaskStatus =
   | "queued"
   | "running"
+  | "recovering"
   | "waiting_user"
   | "waiting_review"
   | "needs_attention"

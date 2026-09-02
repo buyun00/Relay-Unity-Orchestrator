@@ -1218,6 +1218,7 @@ kbd {
   box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.025);
 }
 .archive-dot.status-running,
+.archive-dot.status-recovering,
 .archive-dot.status-waiting_user {
   background: var(--signal);
 }
@@ -1371,6 +1372,7 @@ kbd {
   border-color: rgba(116, 167, 255, 0.15);
 }
 .status-monitoring,
+.status-recovering,
 .status-action_required,
 .status-acting {
   color: var(--warning);

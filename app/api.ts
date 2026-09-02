@@ -176,6 +176,23 @@ export function fetchSnapshot(signal?: AbortSignal) {
       ).map((turn) => [turn.id, turn.position]),
     );
     const rawOps = snapshot.ops ?? EMPTY_SNAPSHOT.ops;
+    const automaticallyRecoveringTaskIds = new Set(
+      (rawOps.incidents ?? [])
+        .filter(
+          (incident) =>
+            Boolean(incident.taskId) &&
+            !incident.resolvedAt &&
+            [
+              "open",
+              "queued",
+              "diagnosing",
+              "acting",
+              "monitoring",
+              "failed",
+            ].includes(incident.status),
+        )
+        .map((incident) => incident.taskId as string),
+    );
     const systemThread = {
       ...EMPTY_SNAPSHOT.ops.thread,
       ...rawOps.thread,
@@ -209,7 +226,9 @@ export function fetchSnapshot(signal?: AbortSignal) {
           : `TK-${String(task.number).padStart(4, "0")}`,
         status:
           (task.status as string) === "failed"
-            ? ("needs_attention" as const)
+            ? automaticallyRecoveringTaskIds.has(task.id)
+              ? ("recovering" as const)
+              : ("needs_attention" as const)
             : task.status,
       })),
       turns: turns.map((turn) => ({

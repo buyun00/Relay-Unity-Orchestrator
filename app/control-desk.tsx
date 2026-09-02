@@ -415,6 +415,7 @@ function estimateTaskStart({
 const taskStatusLabel: Record<string, string> = {
   queued: "排队中",
   running: "执行中",
+  recovering: "自动恢复中",
   waiting_user: "等待你确认",
   waiting_review: "等待审阅",
   needs_attention: "需要处理",
@@ -3130,8 +3131,9 @@ function TasksPage({
     ["all", "全部"],
     ["running", "执行中"],
     ["queued", "排队中"],
+    ["recovering", "自动恢复"],
     ["waiting_user", "等待我确认"],
-    ["needs_attention", "异常"],
+    ["needs_attention", "需要处理"],
     ["closed", "已完成"],
   ];
   const tasks = snapshot.tasks.filter((task) => {
