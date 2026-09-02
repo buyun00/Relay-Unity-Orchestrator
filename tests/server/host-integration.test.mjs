@@ -166,15 +166,17 @@ function recoveryProof({
   preservedBlob = auditBlob,
   expectedRemoteTip = "d".repeat(40),
   branchAction = "created",
+  remoteTipTimeoutSeconds = 45,
+  fetchTimeoutSeconds = 45,
 }) {
-  const attempt = (stage) => ({
+  const attempt = (stage, timeoutSeconds) => ({
     attempt: 1,
     stage,
     exitCode: 0,
     stdout: "",
     stderr: "",
     timedOut: false,
-    timeoutSeconds: 45,
+    timeoutSeconds,
     durationMs: 10,
     transient: false,
     backoffMilliseconds: 0,
@@ -216,8 +218,10 @@ function recoveryProof({
     expectedRemoteTip,
     remoteTip: expectedRemoteTip,
     remoteRef: "refs/heads/" + taskBranch,
-    remoteTipAttempts: [attempt("remote-tip-ls-remote")],
-    fetchAttempts: [attempt("task-branch-fetch")],
+    remoteTipAttempts: [
+      attempt("remote-tip-ls-remote", remoteTipTimeoutSeconds),
+    ],
+    fetchAttempts: [attempt("task-branch-fetch", fetchTimeoutSeconds)],
     branchAction,
     localTaskHeadBefore: null,
     localTaskHeadAfter: expectedRemoteTip,
@@ -806,6 +810,7 @@ test("a pre-Codex clean-main failure verifies the durable remote tip before reco
               auditFingerprint,
               auditBlob: "3".repeat(40),
               expectedRemoteTip: recoveryContext.task.latestCommitSha,
+              fetchTimeoutSeconds: 840,
             })
           : {
               ready: true,
@@ -848,7 +853,21 @@ test("a pre-Codex clean-main failure verifies the durable remote tip before reco
     recovery.args[recovery.args.indexOf("-ExpectedRemoteTip") + 1],
     recoveryContext.task.latestCommitSha,
   );
-  assert.equal(recovery.options.timeoutMs, 420_000);
+  assert.equal(
+    recovery.args[recovery.args.indexOf("-GitNetworkTimeoutSeconds") + 1],
+    "45",
+  );
+  assert.equal(
+    recovery.args[recovery.args.indexOf("-GitFetchTimeoutSeconds") + 1],
+    "840",
+  );
+  assert.equal(
+    recovery.args[
+      recovery.args.indexOf("-PowerShellDirectTimeoutSeconds") + 1
+    ],
+    "900",
+  );
+  assert.equal(recovery.options.timeoutMs, 960_000);
   assert.equal(
     progress.some(
       (entry) =>

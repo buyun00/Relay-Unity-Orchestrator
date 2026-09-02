@@ -513,7 +513,11 @@ function validateRecoveryProof(
   expectedRemoteTip,
 ) {
   const audit = requireInspectionAudit(inspection);
-  const attemptsAreBoundedAndSuccessful = (attempts) =>
+  const attemptsAreBoundedAndSuccessful = (
+    attempts,
+    expectedStage,
+    maxTimeoutSeconds,
+  ) =>
     Array.isArray(attempts) &&
     attempts.length >= 1 &&
     attempts.length <= 3 &&
@@ -522,8 +526,9 @@ function validateRecoveryProof(
     attempts.every(
       (attempt, index) =>
         attempt.attempt === index + 1 &&
+        attempt.stage === expectedStage &&
         attempt.timeoutSeconds > 0 &&
-        attempt.timeoutSeconds <= 120 &&
+        attempt.timeoutSeconds <= maxTimeoutSeconds &&
         attempt.backoffMilliseconds >= 0 &&
         attempt.backoffMilliseconds <= 4_000,
     );
@@ -568,8 +573,16 @@ function validateRecoveryProof(
     recovery.blobVerified !== true ||
     recovery.verifiedFiles.length !== 0 ||
     !branchActionMatches ||
-    !attemptsAreBoundedAndSuccessful(recovery.remoteTipAttempts) ||
-    !attemptsAreBoundedAndSuccessful(recovery.fetchAttempts)
+    !attemptsAreBoundedAndSuccessful(
+      recovery.remoteTipAttempts,
+      "remote-tip-ls-remote",
+      120,
+    ) ||
+    !attemptsAreBoundedAndSuccessful(
+      recovery.fetchAttempts,
+      "task-branch-fetch",
+      900,
+    )
   ) {
     throw Object.assign(
       new Error(
@@ -1185,11 +1198,12 @@ export class HyperVAdapter {
         ),
         SharePath: context.worker.sharePath || context.project.smbPath,
         GitNetworkTimeoutSeconds: 45,
-        PowerShellDirectTimeoutSeconds: 360,
+        GitFetchTimeoutSeconds: 840,
+        PowerShellDirectTimeoutSeconds: 900,
       },
       {
         signal,
-        timeoutMs: 420_000,
+        timeoutMs: 960_000,
         responseContract: "recovery-proof",
       },
     );

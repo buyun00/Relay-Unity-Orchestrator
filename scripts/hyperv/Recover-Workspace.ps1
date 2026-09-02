@@ -10,7 +10,8 @@ param(
     [string]$SharePath,
     [ValidateNotNullOrEmpty()][string]$ApprovedOverlayPathsJson = '[]',
     [ValidateRange(10, 120)][int]$GitNetworkTimeoutSeconds = 45,
-    [ValidateRange(60, 600)][int]$PowerShellDirectTimeoutSeconds = 360
+    [ValidateRange(60, 900)][int]$GitFetchTimeoutSeconds = 840,
+    [ValidateRange(60, 1200)][int]$PowerShellDirectTimeoutSeconds = 900
 )
 
 $ErrorActionPreference = 'Stop'
@@ -90,19 +91,20 @@ try {
     $remoteOutput = @(
         Invoke-RelayPowerShellDirect -VMName $VMName -Credential $credential -ArgumentList @(
             $GuestProjectPath, $RepoUrl, $BaseBranch, $TaskBranch,
-            $ExpectedRemoteTip, $GitNetworkTimeoutSeconds, $ApprovedOverlayPathsJson,
+            $ExpectedRemoteTip, $GitNetworkTimeoutSeconds, $GitFetchTimeoutSeconds,
+            $ApprovedOverlayPathsJson,
             $helperSource, $guestSource
         ) -Stage 'powershell-direct-recovery' -TimeoutSeconds $PowerShellDirectTimeoutSeconds -ScriptBlock {
             param(
                 $ProjectPath, $RepositoryUrl, $Base, $Branch,
-                $ExpectedTip, $GitTimeout, $ApprovedOverlaysJson,
+                $ExpectedTip, $GitTimeout, $GitFetchTimeout, $ApprovedOverlaysJson,
                 $HelperSource, $GuestSource
             )
             $ErrorActionPreference = 'Stop'
             Set-StrictMode -Version Latest
             $env:RELAY_APPROVED_OVERLAY_PATHS_JSON = $ApprovedOverlaysJson
             . ([scriptblock]::Create($HelperSource))
-            & ([scriptblock]::Create($GuestSource)) -ProjectPath $ProjectPath -RepositoryUrl $RepositoryUrl -BaseBranch $Base -TaskBranch $Branch -ExpectedRemoteTip $ExpectedTip -GitNetworkTimeoutSeconds $GitTimeout -OutputJson
+            & ([scriptblock]::Create($GuestSource)) -ProjectPath $ProjectPath -RepositoryUrl $RepositoryUrl -BaseBranch $Base -TaskBranch $Branch -ExpectedRemoteTip $ExpectedTip -GitNetworkTimeoutSeconds $GitTimeout -GitFetchTimeoutSeconds $GitFetchTimeout -OutputJson
         }
     )
     $records = @(

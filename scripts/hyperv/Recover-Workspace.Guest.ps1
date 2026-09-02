@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$TaskBranch,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$ExpectedRemoteTip,
     [ValidateRange(10, 120)][int]$GitNetworkTimeoutSeconds = 45,
+    [ValidateRange(60, 900)][int]$GitFetchTimeoutSeconds = 840,
     [switch]$OutputJson
 )
 
@@ -185,7 +186,7 @@ try {
     $fetch = Invoke-RelayGitWithRetry $ProjectPath @(
         'fetch', '--no-tags', '--no-prune', 'origin',
         "refs/heads/$($TaskBranch):refs/remotes/origin/$TaskBranch"
-    ) 'task-branch-fetch' @{} $GitNetworkTimeoutSeconds 3 1000
+    ) 'task-branch-fetch' @{} $GitFetchTimeoutSeconds 1 0
 } catch {
     $failure = New-RecoveryRefusal -Code 'RECOVERY_FETCH_FAILED' -Stage ([string]$_.Exception.Data['relayStage']) -Message $_.Exception.Message -WorkspaceState $workspaceState -OriginalBranch $originalBranch -OriginalHead $originalHead -Attempts @($_.Exception.Data['relayAttempts']) -ExitCode $_.Exception.Data['relayExitCode'] -Stdout ([string]$_.Exception.Data['relayStdout']) -Stderr ([string]$_.Exception.Data['relayStderr']) -TimedOut ([bool]$_.Exception.Data['relayTimedOut']) -RemoteTip $remoteTip
     return (Complete-Refusal $failure)

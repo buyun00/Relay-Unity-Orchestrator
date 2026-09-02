@@ -2304,9 +2304,11 @@ export class Store {
             )));
       const safeWorkspaceRefusal =
         failed?.status === "failed" &&
-        ["WORKSPACE_BASE_BRANCH_MISMATCH", "RECOVERY_FETCH_FAILED"].includes(
-          failed.error_code,
-        ) &&
+        [
+          "WORKSPACE_BASE_BRANCH_MISMATCH",
+          "RECOVERY_FETCH_FAILED",
+          "WORKSPACE_RECOVERY_PROOF_MISMATCH",
+        ].includes(failed.error_code) &&
         failed.codex_final_json == null &&
         failed.delivery_audit_json == null &&
         failed.commit_sha == null &&
@@ -2330,7 +2332,8 @@ export class Store {
              WHERE id=? AND task_id=? AND status='failed'
                AND error_code IN (
                  'WORKSPACE_BASE_BRANCH_MISMATCH',
-                 'RECOVERY_FETCH_FAILED'
+                 'RECOVERY_FETCH_FAILED',
+                 'WORKSPACE_RECOVERY_PROOF_MISMATCH'
                )
                AND codex_final_json IS NULL AND delivery_audit_json IS NULL
                AND commit_sha IS NULL`,
