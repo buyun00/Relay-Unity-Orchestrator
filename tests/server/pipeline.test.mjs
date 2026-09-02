@@ -731,6 +731,46 @@ test("queued turn without durable identity stays pinned to a disabled worker", (
   assert.equal(store.getTurn(created.turn.id).status, "queued");
 });
 
+test("workspace ownership evidence does not follow a durable turn to a different worker", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const disabled = store.createWorker({
+    id: "worker-disabled-workspace-owner",
+    name: "lin-worker-disabled-workspace-owner",
+    vmName: "lin-worker-disabled-workspace-owner",
+    projectId: project.id,
+    checkpointName: "PROJECT_READY",
+    internalIp: "172.30.240.14",
+    sharePath: "\\\\lin-worker-disabled-workspace-owner\\d\\ozdqp",
+    status: "reserved",
+    enabled: false,
+  });
+  const created = createTask(store, project.id, {
+    title: "Keep workspace ownership worker-local",
+  });
+  store.db
+    .prepare(
+      "UPDATE tasks SET codex_thread_id=?, latest_commit_sha=? WHERE id=?",
+    )
+    .run("thread-worker-local-ownership", "c".repeat(40), created.task.id);
+  store.db
+    .prepare("UPDATE turns SET worker_id=? WHERE id=?")
+    .run(disabled.id, created.turn.id);
+  store.emit({
+    taskId: created.task.id,
+    turnId: created.turn.id,
+    workerId: disabled.id,
+    type: "turn.workspace-established",
+    phase: "workspace-established",
+    message: "Established only on the disabled worker",
+  });
+
+  const reassigned = store.claimNextTurn();
+
+  assert.equal(reassigned.worker.id, worker.id);
+  assert.equal(reassigned.reassignedFromWorkerId, disabled.id);
+  assert.equal(reassigned.workspaceEstablished, false);
+});
+
 test("delivery failure automatically resumes the original task Codex once", async (t) => {
   const config = createConfig();
   const adapter = new FailFirstDeliveryFakeAdapter(config);

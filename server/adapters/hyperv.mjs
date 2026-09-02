@@ -939,10 +939,8 @@ export class HyperVAdapter {
     );
 
     const taskBranch = required(context.task.branchName, "task.branchName");
-    const workspaceEstablished = Boolean(
-      context.workspaceEstablished || context.task.codexThreadId,
-    );
-    if (!context.task.latestCommitSha && !workspaceEstablished) {
+    const workspaceEstablished = Boolean(context.workspaceEstablished);
+    if (!workspaceEstablished && inspection.branch !== taskBranch) {
       return this.retryInitialPreparation(context, inspection, {
         signal,
         onProgress,

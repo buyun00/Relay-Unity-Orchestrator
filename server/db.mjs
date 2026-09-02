@@ -2773,17 +2773,25 @@ export class Store {
     const worker = turn.workerId ? this.getWorker(turn.workerId) : null;
     const project = task ? this.getProject(task.projectId) : null;
     const attachments = this.listTurnAttachments(turnId);
+    const workspaceLifecycle = worker
+      ? this.db
+          .prepare(
+            `
+              SELECT task_id, type FROM events
+              WHERE worker_id=? AND type IN (
+                'turn.prepare',
+                'turn.workspace-established',
+                'turn.release',
+                'turn.released'
+              )
+              ORDER BY id DESC LIMIT 1
+            `,
+          )
+          .get(worker.id)
+      : null;
     const workspaceEstablished = Boolean(
-      task?.codexThreadId ||
-      this.db
-        .prepare(
-          `
-            SELECT 1 FROM events
-            WHERE task_id=? AND type='turn.workspace-established'
-            LIMIT 1
-          `,
-        )
-        .get(task?.id),
+      workspaceLifecycle?.type === "turn.workspace-established" &&
+        workspaceLifecycle.task_id === task?.id,
     );
     return {
       task,
