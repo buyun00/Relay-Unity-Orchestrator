@@ -1893,12 +1893,13 @@ test("initial preparation gives a cold shared-remote fetch one bounded transfer 
     path.resolve("server/adapters/hyperv.mjs"),
     "utf8",
   );
-  assert.match(source, /\$prepareBranchFetchTimeoutSeconds = 840/u);
+  assert.match(source, /\$prepareBranchFetchTimeoutSeconds = 3480/u);
   assert.match(
     source,
     /'prepare-branch-fetch' @\{\} \$prepareBranchFetchTimeoutSeconds 1 0/u,
   );
-  assert.match(hostSource, /\[int\]\$TimeoutSeconds = 900/u);
+  assert.match(hostSource, /\[int\]\$TimeoutSeconds = 3540/u);
+  assert.equal((adapterSource.match(/timeoutMs: 3_600_000/gu) || []).length, 1);
   assert.equal((adapterSource.match(/timeoutMs: 960_000/gu) || []).length, 2);
 });
 
@@ -1979,7 +1980,7 @@ test("recovery source suppresses prompts and forbids deletion or global Git muta
   assert.match(gitSource, /WaitForExit\(5000\)/u);
   assert.match(gitSource, /WaitAll\(\$streamTasks, 5000\)/u);
   assert.doesNotMatch(gitSource, /\$process\.WaitForExit\(\)/u);
-  assert.match(gitSource, /ValidateRange\(1, 1200\)/u);
+  assert.match(gitSource, /ValidateRange\(1, 3600\)/u);
   assert.match(directSource, /ValidateRange\(1, 3600\)/u);
   assert.match(recoverySource, /ls-remote.*--exit-code.*--refs/su);
   assert.match(recoverySource, /fetch.*--no-tags.*--no-prune/su);

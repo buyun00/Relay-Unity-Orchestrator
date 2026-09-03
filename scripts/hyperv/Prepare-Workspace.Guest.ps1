@@ -1017,10 +1017,10 @@ $taskRemoteExists = -not [string]::IsNullOrWhiteSpace($taskTipQuery.result.stdou
 $fetchBranch = if ($taskRemoteExists) { $Branch } else { $Base }
 $fetchDestination = "refs/remotes/origin/$fetchBranch"
 # Restored PROJECT_READY workers can be several large packs behind a shared
-# remote. A current cold transfer can exceed 270 seconds while still making
-# steady progress, so leave it one bounded 14-minute window below the outer
+# remote. A current cold transfer can exceed 14 minutes while still making
+# steady progress, so leave it one bounded 58-minute window below the outer
 # PowerShell Direct budget instead of repeatedly discarding a partial pack.
-$prepareBranchFetchTimeoutSeconds = 840
+$prepareBranchFetchTimeoutSeconds = 3480
 Invoke-RelayGitWithRetry $ProjectPath @(
     'fetch', '--no-tags', '--no-prune', 'origin',
     "refs/heads/$($fetchBranch):$fetchDestination"

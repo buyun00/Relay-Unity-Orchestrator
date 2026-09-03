@@ -2266,13 +2266,9 @@ export class Store {
   rebindQueuedTurnToPreservedWorker(taskId, actorName = null) {
     const task = this.getTask(taskId);
     if (!task) throw new HttpError(404, "TASK_NOT_FOUND", "Task not found");
-    if (!task.codexThreadId || !task.latestCommitSha) {
-      throw new HttpError(
-        409,
-        "PRESERVED_RESUME_IDENTITY_MISSING",
-        "A preserved resume requires both the existing Codex thread and the durable task commit",
-      );
-    }
+    const hasDurableResumeIdentity = Boolean(
+      task.codexThreadId && task.latestCommitSha,
+    );
 
     let queuedTurns = this.db
       .prepare(
@@ -2302,7 +2298,8 @@ export class Store {
             ["preparing", "running", "saving", "cancel_requested"].includes(
               activeWorkerTurn.status,
             )));
-      const safeWorkspaceRefusal =
+      const safePreservedWorkspaceRefusal =
+        hasDurableResumeIdentity &&
         failed?.status === "failed" &&
         [
           "WORKSPACE_BASE_BRANCH_MISMATCH",
@@ -2314,7 +2311,21 @@ export class Store {
         failed.delivery_audit_json == null &&
         failed.commit_sha == null &&
         workerCanKeepPinnedRetry;
-      if (!safeWorkspaceRefusal) {
+      const promptIntegrity = this.verifyTaskPromptIntegrity(taskId);
+      const safeInitialWorkspaceFailure =
+        !hasDurableResumeIdentity &&
+        failed?.status === "failed" &&
+        failed.error_code === "HYPERV_COMMAND_FAILED" &&
+        typeof failed.error_message === "string" &&
+        failed.error_message.includes("powershell-direct-workspace-prepare") &&
+        failed.error_message.includes("prepare-branch-fetch") &&
+        failed.codex_final_json == null &&
+        failed.delivery_audit_json == null &&
+        failed.commit_sha == null &&
+        promptIntegrity.intact &&
+        promptIntegrity.archivedTurns === promptIntegrity.liveTurns &&
+        workerCanKeepPinnedRetry;
+      if (!safePreservedWorkspaceRefusal && !safeInitialWorkspaceFailure) {
         throw new HttpError(
           409,
           "PRESERVED_RESUME_TURN_AMBIGUOUS",
@@ -2325,22 +2336,35 @@ export class Store {
       const timestamp = now();
       let event;
       this.transaction(() => {
-        const updated = this.db
-          .prepare(
-            `UPDATE turns
-             SET status='queued', started_at=NULL, finished_at=NULL,
-               error_code=NULL, error_message=NULL
-             WHERE id=? AND task_id=? AND status='failed'
-               AND error_code IN (
-                 'WORKSPACE_BASE_BRANCH_MISMATCH',
-                 'RECOVERY_REMOTE_TIP_QUERY_FAILED',
-                 'RECOVERY_FETCH_FAILED',
-                 'WORKSPACE_RECOVERY_PROOF_MISMATCH'
-               )
-               AND codex_final_json IS NULL AND delivery_audit_json IS NULL
-               AND commit_sha IS NULL`,
-          )
-          .run(failed.id, taskId);
+        const updated = safeInitialWorkspaceFailure
+          ? this.db
+              .prepare(
+                `UPDATE turns
+                 SET status='queued', started_at=NULL, finished_at=NULL,
+                   error_code=NULL, error_message=NULL
+                 WHERE id=? AND task_id=? AND status='failed'
+                   AND error_code='HYPERV_COMMAND_FAILED'
+                   AND error_message=?
+                   AND codex_final_json IS NULL
+                   AND delivery_audit_json IS NULL AND commit_sha IS NULL`,
+              )
+              .run(failed.id, taskId, failed.error_message)
+          : this.db
+              .prepare(
+                `UPDATE turns
+                 SET status='queued', started_at=NULL, finished_at=NULL,
+                   error_code=NULL, error_message=NULL
+                 WHERE id=? AND task_id=? AND status='failed'
+                   AND error_code IN (
+                     'WORKSPACE_BASE_BRANCH_MISMATCH',
+                     'RECOVERY_REMOTE_TIP_QUERY_FAILED',
+                     'RECOVERY_FETCH_FAILED',
+                     'WORKSPACE_RECOVERY_PROOF_MISMATCH'
+                   )
+                   AND codex_final_json IS NULL
+                   AND delivery_audit_json IS NULL AND commit_sha IS NULL`,
+              )
+              .run(failed.id, taskId);
         if (!updated.changes) {
           throw new HttpError(
             409,
@@ -2365,12 +2389,13 @@ export class Store {
           type: "turn.preserved-worker.requeued",
           phase: "queued",
           message:
-            "Requeued the same pre-Codex turn after a non-mutating workspace or fetch refusal; the archived prompt and worker identity are unchanged",
+            "Requeued the same pre-Codex turn after a non-mutating workspace or fetch failure; the archived prompt and worker identity are unchanged",
           data: {
             workerId: failed.worker_id,
             branchName: task.branchName,
             expectedHead: task.latestCommitSha,
             previousErrorCode: failed.error_code,
+            initialWorkspaceFailure: safeInitialWorkspaceFailure,
           },
         });
       });
@@ -2388,6 +2413,13 @@ export class Store {
     }
     const queued = queuedTurns[0];
     if (queued.worker_id) return this.getTurn(queued.id);
+    if (!hasDurableResumeIdentity) {
+      throw new HttpError(
+        409,
+        "PRESERVED_RESUME_IDENTITY_MISSING",
+        "Binding an unassigned preserved turn requires both the existing Codex thread and the durable task commit",
+      );
+    }
 
     const preserved = this.db
       .prepare(

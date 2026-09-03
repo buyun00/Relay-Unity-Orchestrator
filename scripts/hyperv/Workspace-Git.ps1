@@ -82,7 +82,7 @@ function Invoke-RelayGitProcess {
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [hashtable]$Environment = @{},
-        [ValidateRange(1, 1200)][int]$TimeoutSeconds = 60,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 60,
         [string]$Stage = ''
     )
 
@@ -228,7 +228,7 @@ function Invoke-RelayGitWithRetry {
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$Stage,
         [hashtable]$Environment = @{},
-        [ValidateRange(1, 1200)][int]$TimeoutSeconds = 60,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 60,
         [ValidateRange(1, 3)][int]$MaximumAttempts = 3,
         [ValidateRange(0, 10000)][int]$InitialBackoffMilliseconds = 1000,
         [scriptblock]$ProcessInvoker,
@@ -283,7 +283,7 @@ function Invoke-RelayGit {
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [hashtable]$Environment = @{},
-        [ValidateRange(1, 1200)][int]$TimeoutSeconds = 60,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 60,
         [string]$Stage = ''
     )
 

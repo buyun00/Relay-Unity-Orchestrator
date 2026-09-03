@@ -872,7 +872,7 @@ export class HyperVAdapter {
           this.config.gitAuthorEmail || "relay-unity-orchestrator@localhost",
         SharePath: context.worker.sharePath || context.project.smbPath,
       },
-      { signal, timeoutMs: 960_000 },
+      { signal, timeoutMs: 3_600_000 },
     );
     if (result.preservedBranch && result.preservedCommit) {
       onProgress?.(

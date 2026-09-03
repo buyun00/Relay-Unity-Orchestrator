@@ -1846,6 +1846,75 @@ test("an existing queued turn can rebind to its prior reserved worker without re
   assert.equal(resumed.resumePreservedWorkspace, true);
 });
 
+test("a pre-Codex prepare fetch timeout requeues the same immutable turn on its original worker", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Same initial turn recovery",
+    message: "Keep the original prompt and attachment references byte-for-byte",
+  });
+  const claimed = store.claimNextTurn();
+  const fingerprint = store.taskPromptFingerprint(created.task.id);
+  store.failTurn(
+    claimed.turn.id,
+    Object.assign(
+      new Error(
+        "PowerShell Direct stage 'powershell-direct-workspace-prepare' failed: Git stage 'prepare-branch-fetch' timed out after 840s",
+      ),
+      { code: "HYPERV_COMMAND_FAILED" },
+    ),
+  );
+  store.setWorkerState(worker.id, "ready", {
+    currentTurnId: null,
+    error: null,
+  });
+
+  const requeued = store.rebindQueuedTurnToPreservedWorker(
+    created.task.id,
+    "Recovery operator",
+  );
+
+  assert.equal(requeued.id, created.turn.id);
+  assert.equal(requeued.status, "queued");
+  assert.equal(requeued.workerId, worker.id);
+  assert.equal(requeued.startedAt, null);
+  assert.equal(requeued.finishedAt, null);
+  assert.equal(requeued.errorCode, null);
+  assert.equal(store.listTaskTurns(created.task.id).length, 1);
+  assert.equal(store.taskPromptFingerprint(created.task.id), fingerprint);
+  const resumed = store.claimNextTurn();
+  assert.equal(resumed.turn.id, created.turn.id);
+  assert.equal(resumed.resumePreservedWorkspace, true);
+});
+
+test("a generic pre-Codex Hyper-V failure cannot be requeued as a proven initial fetch failure", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Ambiguous initial failure",
+    message: "Do not reinterpret an unrelated Hyper-V failure",
+  });
+  const claimed = store.claimNextTurn();
+  store.failTurn(
+    claimed.turn.id,
+    Object.assign(new Error("PowerShell Direct transport failed"), {
+      code: "HYPERV_COMMAND_FAILED",
+    }),
+  );
+  store.setWorkerState(worker.id, "ready", {
+    currentTurnId: null,
+    error: null,
+  });
+
+  assert.throws(
+    () =>
+      store.rebindQueuedTurnToPreservedWorker(
+        created.task.id,
+        "Recovery operator",
+      ),
+    (error) => error.code === "PRESERVED_RESUME_TURN_AMBIGUOUS",
+  );
+  assert.equal(store.listTaskTurns(created.task.id).length, 1);
+});
+
 for (const refusalCode of [
   "WORKSPACE_BASE_BRANCH_MISMATCH",
   "RECOVERY_REMOTE_TIP_QUERY_FAILED",
