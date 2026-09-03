@@ -2276,55 +2276,68 @@ export class Store {
       )
       .all(taskId);
     if (queuedTurns.length === 0) {
-      const failed = this.db
+      const failedTurns = this.db
         .prepare(
-          "SELECT * FROM turns WHERE task_id=? ORDER BY sequence DESC LIMIT 1",
+          "SELECT * FROM turns WHERE task_id=? AND status='failed' ORDER BY sequence DESC",
         )
-        .get(taskId);
-      const failedWorker = failed?.worker_id
-        ? this.getWorker(failed.worker_id)
-        : null;
-      const activeWorkerTurn = failedWorker?.currentTurnId
-        ? this.getTurn(failedWorker.currentTurnId)
-        : null;
-      const workerCanKeepPinnedRetry =
-        failedWorker?.enabled === true &&
-        (failedWorker.projectId === task.projectId ||
-          failedWorker.projectId == null) &&
-        ((["ready", "reserved"].includes(failedWorker.status) &&
-          failedWorker.currentTurnId == null) ||
-          (failedWorker.status === "busy" &&
-            activeWorkerTurn?.workerId === failedWorker.id &&
-            ["preparing", "running", "saving", "cancel_requested"].includes(
-              activeWorkerTurn.status,
-            )));
+        .all(taskId);
+      const latestFailed = failedTurns[0];
+      const workerCanKeepPinnedRetry = (failedTurn) => {
+        const failedWorker = failedTurn?.worker_id
+          ? this.getWorker(failedTurn.worker_id)
+          : null;
+        const activeWorkerTurn = failedWorker?.currentTurnId
+          ? this.getTurn(failedWorker.currentTurnId)
+          : null;
+        return (
+          failedWorker?.enabled === true &&
+          (failedWorker.projectId === task.projectId ||
+            failedWorker.projectId == null) &&
+          ((["ready", "reserved"].includes(failedWorker.status) &&
+            failedWorker.currentTurnId == null) ||
+            (failedWorker.status === "busy" &&
+              activeWorkerTurn?.workerId === failedWorker.id &&
+              ["preparing", "running", "saving", "cancel_requested"].includes(
+                activeWorkerTurn.status,
+              )))
+        );
+      };
       const safePreservedWorkspaceRefusal =
         hasDurableResumeIdentity &&
-        failed?.status === "failed" &&
+        latestFailed?.status === "failed" &&
         [
           "WORKSPACE_BASE_BRANCH_MISMATCH",
           "RECOVERY_REMOTE_TIP_QUERY_FAILED",
           "RECOVERY_FETCH_FAILED",
           "WORKSPACE_RECOVERY_PROOF_MISMATCH",
-        ].includes(failed.error_code) &&
-        failed.codex_final_json == null &&
-        failed.delivery_audit_json == null &&
-        failed.commit_sha == null &&
-        workerCanKeepPinnedRetry;
+        ].includes(latestFailed.error_code) &&
+        latestFailed.codex_final_json == null &&
+        latestFailed.delivery_audit_json == null &&
+        latestFailed.commit_sha == null &&
+        workerCanKeepPinnedRetry(latestFailed);
       const promptIntegrity = this.verifyTaskPromptIntegrity(taskId);
+      const safeInitialWorkspaceFailures = !hasDurableResumeIdentity
+        ? failedTurns.filter(
+            (failedTurn) =>
+              failedTurn.error_code === "HYPERV_COMMAND_FAILED" &&
+              typeof failedTurn.error_message === "string" &&
+              failedTurn.error_message.includes(
+                "powershell-direct-workspace-prepare",
+              ) &&
+              failedTurn.error_message.includes("prepare-branch-fetch") &&
+              failedTurn.codex_final_json == null &&
+              failedTurn.delivery_audit_json == null &&
+              failedTurn.commit_sha == null &&
+              promptIntegrity.intact &&
+              promptIntegrity.archivedTurns === promptIntegrity.liveTurns &&
+              workerCanKeepPinnedRetry(failedTurn),
+          )
+        : [];
       const safeInitialWorkspaceFailure =
-        !hasDurableResumeIdentity &&
-        failed?.status === "failed" &&
-        failed.error_code === "HYPERV_COMMAND_FAILED" &&
-        typeof failed.error_message === "string" &&
-        failed.error_message.includes("powershell-direct-workspace-prepare") &&
-        failed.error_message.includes("prepare-branch-fetch") &&
-        failed.codex_final_json == null &&
-        failed.delivery_audit_json == null &&
-        failed.commit_sha == null &&
-        promptIntegrity.intact &&
-        promptIntegrity.archivedTurns === promptIntegrity.liveTurns &&
-        workerCanKeepPinnedRetry;
+        safeInitialWorkspaceFailures.length === 1;
+      const failed = safeInitialWorkspaceFailure
+        ? safeInitialWorkspaceFailures[0]
+        : latestFailed;
       if (!safePreservedWorkspaceRefusal && !safeInitialWorkspaceFailure) {
         throw new HttpError(
           409,

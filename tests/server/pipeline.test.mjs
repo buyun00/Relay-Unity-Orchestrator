@@ -1886,6 +1886,71 @@ test("a pre-Codex prepare fetch timeout requeues the same immutable turn on its 
   assert.equal(resumed.resumePreservedWorkspace, true);
 });
 
+test("a later unrelated failure does not hide the original immutable fetch-timeout turn", (t) => {
+  const { store, project, worker } = createHarness(t);
+  const created = createTask(store, project.id, {
+    title: "Recover only the original fetch-timeout turn",
+    message: "Keep this original prompt byte-for-byte",
+  });
+  const original = store.claimNextTurn();
+  store.failTurn(
+    original.turn.id,
+    Object.assign(
+      new Error(
+        "PowerShell Direct stage 'powershell-direct-workspace-prepare' failed: Git stage 'prepare-branch-fetch' timed out after 840s",
+      ),
+      { code: "HYPERV_COMMAND_FAILED" },
+    ),
+  );
+  store.setWorkerState(worker.id, "ready", {
+    currentTurnId: null,
+    error: null,
+  });
+
+  const spare = store.createWorker({
+    name: "later-failure-worker",
+    vmName: "later-failure-worker",
+    projectId: project.id,
+    checkpointName: "PROJECT_READY",
+    internalIp: "172.30.240.12",
+    sharePath: "\\\\later-failure-worker\\Work\\test-unity",
+    status: "ready",
+  });
+  const later = store.appendTurn(created.task.id, {
+    message: "Keep this later prompt too",
+  });
+  store.assignNextQueuedTurn(created.task.id, spare.id);
+  const laterClaim = store.claimNextTurn();
+  assert.equal(laterClaim.turn.id, later.id);
+  store.failTurn(
+    later.id,
+    Object.assign(new Error("VM failed to start because memory is exhausted"), {
+      code: "HYPERV_COMMAND_FAILED",
+    }),
+  );
+  store.setWorkerState(spare.id, "stopped", {
+    currentTurnId: null,
+    error: "Not enough memory resources",
+  });
+  const fingerprint = store.taskPromptFingerprint(created.task.id);
+
+  const requeued = store.rebindQueuedTurnToPreservedWorker(
+    created.task.id,
+    "Recovery operator",
+  );
+
+  assert.equal(requeued.id, original.turn.id);
+  assert.equal(requeued.status, "queued");
+  assert.equal(requeued.workerId, worker.id);
+  assert.equal(store.getTurn(later.id).status, "failed");
+  assert.equal(store.listTaskTurns(created.task.id).length, 2);
+  assert.equal(store.taskPromptFingerprint(created.task.id), fingerprint);
+  const resumed = store.claimNextTurn();
+  assert.equal(resumed.turn.id, original.turn.id);
+  assert.equal(resumed.worker.id, worker.id);
+  assert.equal(resumed.resumePreservedWorkspace, true);
+});
+
 test("a generic pre-Codex Hyper-V failure cannot be requeued as a proven initial fetch failure", (t) => {
   const { store, project, worker } = createHarness(t);
   const created = createTask(store, project.id, {
