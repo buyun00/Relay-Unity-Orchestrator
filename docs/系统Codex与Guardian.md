@@ -26,6 +26,10 @@ Relay 不再为 Worker 设置人工处理状态。控制服务保留一条 GPT-5
 
 Worker 不再有人工处理状态。任务执行、Unity 保存或 Git 交付失败后，工作区进入 `reserved`，系统把精确失败信息追加到原 Task/Codex 对话，并由 `resumePreserved` 在同一工作区继续。Codex 启动前若 VM、PowerShell Direct、SMB 或 Unity 前置条件失败，数据库保留并重新排队同一个 Turn，调度器重启对应 VM；Unity 只允许由虚拟机登录启动链恢复。若一次确定性重启仍未恢复，Worker 保持 `offline/preparing`，由基础设施守护链继续执行结构化 `worker.restart`，不会转成人工门禁。
 
+常驻 Supervisor 还会用确定性规则扫描工位占用：`reserved`、`preparing` 或 `busy` 工位若连续 15 分钟没有一个真正执行中的 Turn，持久记录 `worker.occupancy.stalled` 事件并且只为该工位拉起去重的 Ops Incident。正常 `ready` 空闲和正常长时间 Turn 不会触发。监控对话必须先只读确认最后 Turn、分支、HEAD 和工作树；只有工作树干净且结果已持久化时才能 `worker.release`。单纯 probe 不算恢复，未恢复的 Incident 会在阈值后继续同一监控链。
+
+队列活性是独立的强制约束：只要仍有 queued Turn，调度器为 paused/stopped 就立即记录 `scheduler.queue.stalled`；调度器虽在运行但连续 5 分钟没有任何 executing Turn 也记录同类事故。该事故必须进入同一条常驻监控对话，自动恢复不得在仍有队列时执行 `scheduler.pause`，而 `scheduler.resume` 只有在后续 `turn.prepare` 或 `turn.resume` 证明原队列开始消费后才算恢复。Worker 暂时仍不可用时事故保持 monitoring，并按 Supervisor 周期继续复查，不受普通事故最大尝试次数终止。
+
 Relay 后端重启时，运行中的原 Turn 也会直接重新排队，Worker 暂记 `offline` 并在健康探测通过后回到 `ready`。旧数据库中的历史人工状态会在启动时归一化为 `offline`。
 
 如果交付已经持久化，只是释放失败，Ops Codex 可以调用 `worker.release`。相同事故的自动尝试受 `PIPELINE_OPS_MAX_ATTEMPTS` 限制，避免无穷循环；新的错误证据会重新打开正在监控的事故。
@@ -76,6 +80,8 @@ PIPELINE_OPS_AUTO_DEPLOY=true
 PIPELINE_OPS_MAX_ATTEMPTS=4
 PIPELINE_OPS_MAX_CONCURRENT_SESSIONS=4
 PIPELINE_OPS_SUPERVISOR_INTERVAL_MS=300000
+PIPELINE_OPS_WORKER_OCCUPANCY_STALL_MS=900000
+PIPELINE_OPS_QUEUE_LIVENESS_STALL_MS=300000
 PIPELINE_OPS_CODEX_MODEL=gpt-5.6-luna
 PIPELINE_OPS_CODEX_REASONING_EFFORT=max
 PIPELINE_OPS_CODEX_FAST_MODE=false

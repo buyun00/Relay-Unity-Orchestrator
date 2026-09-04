@@ -289,6 +289,25 @@ test("completeTurn atomically persists turn.delivered and one eligible outbox re
   assert.equal(store.listBuildDispatches().length, 1);
 });
 
+test("eligible dispatch is completed immediately when Packer is bypassed", (t) => {
+  const config = createConfig({ ozdqpBuildAssumeSuccess: true });
+  const store = new Store(config);
+  t.after(() => {
+    store.close();
+    fs.rmSync(config.dataDirectory, { recursive: true, force: true });
+  });
+  const { context } = seedTurn(store);
+
+  complete(store, context.turn.id);
+
+  const dispatch = store.getBuildDispatchForTurn(context.turn.id);
+  assert.equal(dispatch.status, "accepted");
+  assert.equal(dispatch.buildStatus, "completed");
+  assert.equal(dispatch.buildStep, "打包成功");
+  assert.equal(dispatch.attemptCount, 0);
+  assert.equal(store.claimNextBuildDispatch(), null);
+});
+
 test("migration enables only an existing project whose repository matches OZDQP", () => {
   const config = createConfig();
   const legacy = new DatabaseSync(config.databasePath);

@@ -16,6 +16,32 @@ const recoverySchemaPath = fileURLToPath(
 );
 
 const SUPERVISED_TASK_STATUSES = new Set(["queued", "running", "failed"]);
+const OCCUPIED_WORKER_STATUSES = new Set(["reserved", "preparing", "busy"]);
+const EXECUTING_TURN_STATUSES = new Set([
+  "preparing",
+  "running",
+  "saving",
+  "cancel_requested",
+]);
+const QUEUE_LIVENESS_EVENT_TYPE = "scheduler.queue.stalled";
+const QUEUE_PROGRESS_EVENT_TYPES = new Set([
+  "scheduler.started",
+  "scheduler.resumed",
+  "turn.prepare",
+  "turn.resume",
+  "turn.workspace-established",
+  "turn.codex",
+  "turn.delivered",
+  "turn.released",
+  "turn.failed",
+  "worker.action.started",
+  "worker.action.completed",
+  "worker.action.failed",
+]);
+const PERSISTENT_LIVENESS_INCIDENT_TYPES = new Set([
+  QUEUE_LIVENESS_EVENT_TYPE,
+  "worker.occupancy.stalled",
+]);
 
 const INCIDENT_EVENT_TYPES = new Set([
   "turn.failed",
@@ -26,6 +52,8 @@ const INCIDENT_EVENT_TYPES = new Set([
   "guardian.health.failed",
   "guardian.restart.failed",
   "checkpoint.maintenance.failed",
+  "worker.occupancy.stalled",
+  QUEUE_LIVENESS_EVENT_TYPE,
 ]);
 
 const INCIDENT_RECOVERY_EVENT_TYPES = new Map([
@@ -37,7 +65,21 @@ const INCIDENT_RECOVERY_EVENT_TYPES = new Map([
     "checkpoint.maintenance.completed",
     new Set(["checkpoint.maintenance.failed"]),
   ],
+  [
+    "turn.prepare",
+    new Set([QUEUE_LIVENESS_EVENT_TYPE]),
+  ],
+  [
+    "turn.resume",
+    new Set([QUEUE_LIVENESS_EVENT_TYPE]),
+  ],
 ]);
+
+function requiresPersistentLivenessMonitoring(incident) {
+  return PERSISTENT_LIVENESS_INCIDENT_TYPES.has(
+    incident?.context?.eventType,
+  );
+}
 
 function normalizedFingerprintPart(value) {
   return String(value || "")
@@ -219,6 +261,10 @@ export class OpsEngine {
         repairReasoningEffort:
           this.config.opsRepairCodexReasoningEffort || "xhigh",
         activeTaskCount: this.supervisedTasks().length,
+        workerOccupancyStallMs: this.workerOccupancyStallMs(),
+        stalledWorkerCount: this.workerOccupancyCandidates().length,
+        queueLivenessStallMs: this.queueLivenessStallMs(),
+        queueLivenessProblem: Boolean(this.queueLivenessProblem()),
         lastCheckAt: this.lastSupervisorCheckAt,
         nextCheckAt: this.nextSupervisorCheckAt,
       },
@@ -230,6 +276,342 @@ export class OpsEngine {
       1_000,
       Number(this.config.opsSupervisorIntervalMs || 5 * 60 * 1000),
     );
+  }
+
+  workerOccupancyStallMs() {
+    return Math.max(
+      60_000,
+      Number(this.config.opsWorkerOccupancyStallMs || 15 * 60 * 1000),
+    );
+  }
+
+  queueLivenessStallMs() {
+    return Math.max(
+      60_000,
+      Number(
+        this.config.opsQueueLivenessStallMs || this.supervisorIntervalMs(),
+      ),
+    );
+  }
+
+  workerOccupancyCandidates(at = Date.now()) {
+    const cutoff = at - this.workerOccupancyStallMs();
+    const turns = this.store.listTurns();
+    const turnsById = new Map(turns.map((turn) => [turn.id, turn]));
+    const tasksById = new Map(
+      this.store.listTasks().map((task) => [task.id, task]),
+    );
+
+    return this.store.listWorkers().flatMap((worker) => {
+      if (!worker.enabled || !OCCUPIED_WORKER_STATUSES.has(worker.status)) {
+        return [];
+      }
+      const currentTurn = worker.currentTurnId
+        ? turnsById.get(worker.currentTurnId) || null
+        : null;
+      const currentTurnIsExecuting = Boolean(
+        currentTurn &&
+        currentTurn.workerId === worker.id &&
+        EXECUTING_TURN_STATUSES.has(currentTurn.status),
+      );
+      if (currentTurnIsExecuting) return [];
+
+      const latestTurn =
+        turns.find((turn) => turn.workerId === worker.id) || null;
+      const assignedQueuedTurn = turns.find(
+        (turn) => turn.workerId === worker.id && turn.status === "queued",
+      );
+      const stateChangedAt = [
+        worker.updatedAt,
+        currentTurn?.finishedAt,
+        assignedQueuedTurn?.createdAt,
+      ]
+        .map((value) => Date.parse(value || ""))
+        .filter(Number.isFinite)
+        .reduce((latest, value) => Math.max(latest, value), 0);
+      if (!stateChangedAt || stateChangedAt > cutoff) return [];
+
+      const relatedTurn = currentTurn || assignedQueuedTurn || latestTurn;
+      const task = relatedTurn
+        ? tasksById.get(relatedTurn.taskId) || null
+        : null;
+      const reason = worker.currentTurnId
+        ? currentTurn
+          ? "current-turn-is-not-executing"
+          : "current-turn-is-missing"
+        : `${worker.status}-without-active-turn`;
+      const stateKey = JSON.stringify({
+        workerStatus: worker.status,
+        currentTurnId: worker.currentTurnId || null,
+        relatedTurnId: relatedTurn?.id || null,
+        relatedTurnStatus: relatedTurn?.status || null,
+        taskStatus: task?.status || null,
+        stateChangedAt: new Date(stateChangedAt).toISOString(),
+      });
+      return [
+        {
+          worker,
+          task,
+          turn: relatedTurn,
+          reason,
+          stateKey,
+          stateChangedAt: new Date(stateChangedAt).toISOString(),
+          ageMs: Math.max(0, at - stateChangedAt),
+        },
+      ];
+    });
+  }
+
+  scanWorkerOccupancyProblems() {
+    const candidates = this.workerOccupancyCandidates();
+    if (!candidates.length) return [];
+    const cutoff = Date.now() - this.workerOccupancyStallMs();
+    const incidents = this.store.listIncidents({ limit: 1_000 });
+    const activeIncidentIds = new Set(
+      this.store
+        .listOpsTurns({ includeCleared: true })
+        .filter((turn) => ["queued", "running"].includes(turn.status))
+        .map((turn) => turn.incidentId)
+        .filter(Boolean),
+    );
+
+    for (const candidate of candidates) {
+      const existing = incidents.find(
+        (incident) =>
+          !incident.resolvedAt &&
+          incident.workerId === candidate.worker.id &&
+          incident.context?.eventType === "worker.occupancy.stalled",
+      );
+      if (existing) {
+        const staleMonitoring =
+          Boolean(this.config.opsAutoHandle) &&
+          !activeIncidentIds.has(existing.id) &&
+          ["open", "monitoring", "failed"].includes(existing.status) &&
+          Date.parse(existing.updatedAt || "") <= cutoff &&
+          requiresPersistentLivenessMonitoring(existing);
+        if (staleMonitoring) {
+          this.queueIncident(
+            existing,
+            `Worker occupancy is still unchanged after ${Math.round(candidate.ageMs / 60_000)} minutes; do not close this as a probe-only success.`,
+          );
+        }
+        continue;
+      }
+
+      const latestEvent = this.store.latestWorkerEvent(
+        candidate.worker.id,
+        "worker.occupancy.stalled",
+      );
+      if (
+        latestEvent?.data?.stateKey === candidate.stateKey &&
+        Date.parse(latestEvent.createdAt || "") > cutoff
+      ) {
+        continue;
+      }
+
+      this.store.emit({
+        taskId: candidate.task?.id || null,
+        turnId: candidate.turn?.id || null,
+        workerId: candidate.worker.id,
+        actorName: "Relay Worker Occupancy Watchdog",
+        type: "worker.occupancy.stalled",
+        phase: "worker-occupancy",
+        level: "error",
+        message: [
+          `Worker ${candidate.worker.name} has remained ${candidate.worker.status} without an executing turn for ${Math.round(candidate.ageMs / 60_000)} minutes.`,
+          candidate.task
+            ? `Latest related task is #${candidate.task.number} (${candidate.task.status}).`
+            : null,
+          candidate.turn
+            ? `Latest related turn is ${candidate.turn.status}${candidate.turn.errorCode ? ` (${candidate.turn.errorCode})` : ""}.`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" "),
+        data: {
+          code: "WORKER_OCCUPANCY_STALLED",
+          reason: candidate.reason,
+          ageMs: candidate.ageMs,
+          thresholdMs: this.workerOccupancyStallMs(),
+          stateKey: candidate.stateKey,
+          workerStatus: candidate.worker.status,
+          currentTurnId: candidate.worker.currentTurnId || null,
+          taskStatus: candidate.task?.status || null,
+          turnStatus: candidate.turn?.status || null,
+          turnErrorCode: candidate.turn?.errorCode || null,
+        },
+      });
+    }
+    return candidates;
+  }
+
+  queueLivenessProblem(at = Date.now()) {
+    const turns = this.store.listTurns();
+    const queuedTurns = turns.filter((turn) => turn.status === "queued");
+    if (!queuedTurns.length) return null;
+
+    const scheduler = this.scheduler.status();
+    const executingTurns = turns.filter((turn) =>
+      EXECUTING_TURN_STATUSES.has(turn.status),
+    );
+    const immediate = !scheduler.running || scheduler.paused;
+    if (!immediate && executingTurns.length) return null;
+
+    const oldestQueuedAt = queuedTurns
+      .map((turn) => Date.parse(turn.createdAt || ""))
+      .filter(Number.isFinite)
+      .reduce((oldest, value) => Math.min(oldest, value), at);
+    const latestProgressEvent = this.store.latestEventOfTypes(
+      QUEUE_PROGRESS_EVENT_TYPES,
+    );
+    const latestProgressAt = Date.parse(latestProgressEvent?.createdAt || "");
+    const stalledSince = Math.max(
+      oldestQueuedAt,
+      Number.isFinite(latestProgressAt) ? latestProgressAt : 0,
+    );
+    const ageMs = Math.max(0, at - stalledSince);
+    if (!immediate && ageMs < this.queueLivenessStallMs()) return null;
+
+    const workers = this.store
+      .listWorkers()
+      .filter((worker) => worker.enabled)
+      .map((worker) => ({
+        id: worker.id,
+        name: worker.name,
+        status: worker.status,
+        currentTurnId: worker.currentTurnId || null,
+        vm: worker.health?.vm || null,
+        heartbeat: worker.health?.heartbeat || null,
+        smb: worker.health?.smb || null,
+        unity: worker.health?.unity || null,
+      }));
+    const reason = !scheduler.running
+      ? "scheduler-stopped-with-queued-turns"
+      : scheduler.paused
+        ? "scheduler-paused-with-queued-turns"
+        : "queued-turns-without-execution";
+    const stateKey = JSON.stringify({
+      reason,
+      schedulerRunning: scheduler.running,
+      schedulerPaused: scheduler.paused,
+      queuedTurnIds: queuedTurns.map((turn) => turn.id).sort(),
+      executingTurnIds: executingTurns.map((turn) => turn.id).sort(),
+      workers: workers.map((worker) => ({
+        id: worker.id,
+        status: worker.status,
+        currentTurnId: worker.currentTurnId,
+      })),
+    });
+    return {
+      reason,
+      immediate,
+      ageMs,
+      stalledSince: new Date(stalledSince).toISOString(),
+      stateKey,
+      scheduler,
+      queuedTurns,
+      executingTurns,
+      workers,
+    };
+  }
+
+  scanQueueLivenessProblems() {
+    const problem = this.queueLivenessProblem();
+    if (!problem) return null;
+
+    const incidents = this.store.listIncidents({ limit: 1_000 });
+    const existing = incidents.find(
+      (incident) =>
+        !incident.resolvedAt &&
+        incident.context?.eventType === QUEUE_LIVENESS_EVENT_TYPE,
+    );
+    const activeIncident = existing
+      ? this.store
+          .listOpsTurns({ includeCleared: true })
+          .some(
+            (turn) =>
+              turn.incidentId === existing.id &&
+              ["queued", "running"].includes(turn.status),
+          )
+      : false;
+    const retryCutoff =
+      Date.now() - Math.min(this.queueLivenessStallMs(), this.supervisorIntervalMs());
+    if (existing) {
+      if (
+        this.config.opsAutoHandle &&
+        !activeIncident &&
+        ["open", "monitoring", "failed"].includes(existing.status) &&
+        (problem.immediate || Date.parse(existing.updatedAt || "") <= retryCutoff)
+      ) {
+        const refreshed = this.store.updateIncident(existing.id, {
+          status: "open",
+          error: `Queue liveness invariant still violated: ${problem.reason}`,
+          context: {
+            eventType: QUEUE_LIVENESS_EVENT_TYPE,
+            eventData: this.queueLivenessEventData(problem),
+            observedAt: new Date().toISOString(),
+          },
+        });
+        this.queueIncident(
+          refreshed,
+          `The queue still has ${problem.queuedTurns.length} turn(s) and no verified consumption. Restore scheduling or Worker capacity and keep monitoring until a turn enters prepare/resume.`,
+        );
+      }
+      return problem;
+    }
+
+    const latestEvent = this.store.latestEventOfTypes([
+      QUEUE_LIVENESS_EVENT_TYPE,
+    ]);
+    if (
+      !problem.immediate &&
+      latestEvent?.data?.stateKey === problem.stateKey &&
+      Date.parse(latestEvent.createdAt || "") > retryCutoff
+    ) {
+      return problem;
+    }
+
+    this.store.emit({
+      actorName: "Relay Queue Liveness Watchdog",
+      type: QUEUE_LIVENESS_EVENT_TYPE,
+      phase: "queue-liveness",
+      level: "error",
+      message: `Queue liveness invariant violated: ${problem.reason}`,
+      data: this.queueLivenessEventData(problem),
+    });
+    return problem;
+  }
+
+  queueLivenessEventData(problem) {
+    return {
+      code: "QUEUE_LIVENESS_STALLED",
+      reason: problem.reason,
+      immediate: problem.immediate,
+      ageMs: problem.ageMs,
+      thresholdMs: this.queueLivenessStallMs(),
+      stalledSince: problem.stalledSince,
+      stateKey: problem.stateKey,
+      scheduler: problem.scheduler,
+      queuedTurnCount: problem.queuedTurns.length,
+      queuedTurnIds: problem.queuedTurns.map((turn) => turn.id),
+      executingTurnCount: problem.executingTurns.length,
+      workers: problem.workers,
+    };
+  }
+
+  persistentLivenessProblemStillApplies(incident) {
+    switch (incident?.context?.eventType) {
+      case QUEUE_LIVENESS_EVENT_TYPE:
+        return this.store
+          .listTurns()
+          .some((candidate) => candidate.status === "queued");
+      case "worker.occupancy.stalled":
+        return this.workerOccupancyCandidates().some(
+          (candidate) => candidate.worker.id === incident.workerId,
+        );
+      default:
+        return false;
+    }
   }
 
   supervisedTasks() {
@@ -320,6 +702,8 @@ export class OpsEngine {
     });
     this.unsubscribe = this.store.onEvent((event) => this.onEvent(event));
     this.scanExistingProblems();
+    this.scanWorkerOccupancyProblems();
+    this.scanQueueLivenessProblems();
     this.scheduleNextSupervisorCheck();
     this.supervisorTimer = setInterval(() => {
       void this.runSupervisorCheck();
@@ -369,6 +753,8 @@ export class OpsEngine {
     if (!this.running) return null;
     this.lastSupervisorCheckAt = new Date().toISOString();
     this.scheduleNextSupervisorCheck();
+    this.scanWorkerOccupancyProblems();
+    this.scanQueueLivenessProblems();
     const tasks = force ? this.supervisedTasks() : this.supervisorCandidates();
     if (!tasks.length) return null;
     const activeSystemTurn = this.store
@@ -448,6 +834,9 @@ export class OpsEngine {
 
   onEvent(event) {
     if (!this.running) return;
+    if (event.type === "scheduler.paused") {
+      this.scanQueueLivenessProblems();
+    }
     if (
       event.type === "turn.delivered" ||
       event.type === "worker.action.completed" ||
@@ -546,9 +935,11 @@ export class OpsEngine {
     }
     if (
       this.config.opsAutoHandle &&
-      !this.unchangedBlockedRecovery(incident.taskId) &&
+      (requiresPersistentLivenessMonitoring(incident) ||
+        !this.unchangedBlockedRecovery(incident.taskId)) &&
       !incident.resolvedAt &&
-      incident.attemptCount < this.config.opsMaxAttempts &&
+      (requiresPersistentLivenessMonitoring(incident) ||
+        incident.attemptCount < this.config.opsMaxAttempts) &&
       !["queued", "diagnosing", "acting"].includes(incident.status)
     ) {
       this.queueIncident(incident, null, event.id);
@@ -712,6 +1103,8 @@ export class OpsEngine {
       ...actionPolicyPrompt(turn),
       "A normal task or validation failure must continue in the original task Codex conversation on its reserved workspace. Infrastructure failures must restart the exact VM and leave the same turn queued; never command-start Unity because the VM login startup chain owns Unity startup.",
       "Use worker.release only when delivery is already durable. Use worker.restart for infrastructure faults, not to discard uncommitted task work. Keep recoverable infrastructure offline/preparing until it becomes ready, and keep task work reserved for its original conversation; no worker state requires manual intervention.",
+      "A worker.occupancy.stalled incident means capacity has been lost: the Worker is reserved/preparing/busy but has no executing Turn for at least the configured threshold. Inspect the exact last Turn and workspace read-only. If the workspace is clean and its HEAD is already durable, use worker.release so the checkpoint is restored and the Worker returns to the pool. A probe alone is not a repair. If preservation is still required, keep the incident monitoring with concrete evidence and a recovery condition; never silently leave an empty reservation indefinitely.",
+      "A scheduler.queue.stalled incident is a persistent queue-liveness invariant: queued Turns must never be left behind a paused or stopped scheduler, or without an executing Turn after the configured grace period. Never use scheduler.pause while queued Turns exist. Resume the scheduler and recover exact Workers as needed, but do not resolve the incident until a turn.prepare or turn.resume event proves that the original queue is being consumed. Keep retrying this same monitoring chain at the supervisor cadence if capacity is still unavailable.",
       "For checkpoint-maintenance incidents, use checkpoint.refresh only after the evidence shows the entire Relay task queue is empty, the worker is idle, and the failure is safely retryable. The action atomically rechecks queued and executing turns plus worker readiness, and never touches a busy or reserved workspace. Use codex.repair only for a pre-Codex infrastructure failure that prevents the original task conversation from running.",
       "Checkpoint-maintenance invariant: never add, commit, or push guest-local .meta drift. The configured remote base branch is authoritative. The guarded refresh restores only pure unstaged Unity-generated .meta drift; if any non-.meta, staged, renamed, or copied work is present, preserve the entire workspace and keep the maintenance gate closed.",
       "Never delete or manipulate AVHDX/VHDX files. Checkpoint rotation is allowed only through the checkpoint maintenance action, which creates and canary-verifies the new PROJECT_READY before pruning the oldest managed checkpoint.",
@@ -819,21 +1212,31 @@ export class OpsEngine {
 
       if (turn.incidentId) {
         const incident = this.store.getIncident(turn.incidentId);
-        if (failed) {
+        if (incident?.resolvedAt) {
+          // A recovery event may arrive while a structured action is still
+          // completing. Never overwrite that verified resolution with the
+          // action's earlier pending state.
+        } else if (failed) {
+          const persistent = requiresPersistentLivenessMonitoring(incident);
           this.store.updateIncident(turn.incidentId, {
-            status: "open",
+            status: persistent ? "monitoring" : "open",
             error: actionResults
               .filter((item) => item.status === "failed")
               .map((item) => item.error)
               .join("; "),
           });
-          if (incident.attemptCount < this.config.opsMaxAttempts) {
+          if (!persistent && incident.attemptCount < this.config.opsMaxAttempts) {
             this.queueIncident(
               this.store.getIncident(turn.incidentId),
               "One or more proposed actions failed; choose another non-deleting recovery",
             );
           }
-        } else if (pending || policy.final.status === "monitoring") {
+        } else if (
+          pending ||
+          policy.final.status === "monitoring" ||
+          (requiresPersistentLivenessMonitoring(incident) &&
+            this.persistentLivenessProblemStillApplies(incident))
+        ) {
           this.store.updateIncident(turn.incidentId, {
             status: "monitoring",
           });
@@ -852,15 +1255,19 @@ export class OpsEngine {
       const incident = turn.incidentId
         ? this.store.getIncident(turn.incidentId)
         : null;
-      if (incident && incident.attemptCount < this.config.opsMaxAttempts) {
+      if (incident) {
         const reopened = this.store.reopenIncident(
           incident.id,
           error?.message || String(error),
         );
-        this.queueIncident(
-          reopened,
-          `System Codex execution failed: ${error?.message || String(error)}`,
-        );
+        if (requiresPersistentLivenessMonitoring(reopened)) {
+          this.store.updateIncident(reopened.id, { status: "monitoring" });
+        } else if (reopened.attemptCount < this.config.opsMaxAttempts) {
+          this.queueIncident(
+            reopened,
+            `System Codex execution failed: ${error?.message || String(error)}`,
+          );
+        }
       }
     }
   }
@@ -1555,10 +1962,30 @@ export class OpsEngine {
         );
         return { worker };
       }
-      case "scheduler.pause":
+      case "scheduler.pause": {
+        const queuedTurns = this.store
+          .listTurns()
+          .filter((candidate) => candidate.status === "queued");
+        if (turn.trigger !== "manual" && queuedTurns.length) {
+          throw new HttpError(
+            409,
+            "QUEUE_PRESENT_SCHEDULER_PAUSE_FORBIDDEN",
+            `Automatic recovery cannot pause the scheduler while ${queuedTurns.length} turn(s) are queued`,
+          );
+        }
         return { scheduler: this.scheduler.setPaused(true, actorName) };
-      case "scheduler.resume":
-        return { scheduler: this.scheduler.setPaused(false, actorName) };
+      }
+      case "scheduler.resume": {
+        const scheduler = this.scheduler.setPaused(false, actorName);
+        const queuedTurnCount = this.store
+          .listTurns()
+          .filter((candidate) => candidate.status === "queued").length;
+        return {
+          scheduler,
+          queuedTurnCount,
+          pending: queuedTurnCount > 0,
+        };
+      }
       case "relay.repair": {
         const repair = await this.repairManager.run({
           opsTurnId: turn.id,

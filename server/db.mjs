@@ -967,6 +967,57 @@ export class Store {
         this.db.exec(migration);
       }
     }
+    this.db.exec("DROP TRIGGER IF EXISTS build_dispatch_assume_success");
+    if (this.config.ozdqpBuildAssumeSuccess === true) {
+      this.db.exec(`
+        CREATE TRIGGER build_dispatch_assume_success
+        AFTER INSERT ON build_dispatches
+        WHEN NEW.status='pending'
+        BEGIN
+          UPDATE build_dispatches
+          SET status='accepted',
+            ozdqp_job_id='relay-assumed-success-' || NEW.id,
+            last_http_status=200,
+            last_error_code=NULL,
+            last_error_message=NULL,
+            accepted_at=NEW.created_at,
+            failed_at=NULL,
+            build_status='completed',
+            build_step='打包成功',
+            build_error_message=NULL,
+            build_started_at=NEW.created_at,
+            build_finished_at=NEW.created_at,
+            build_duration_seconds=0,
+            status_checked_at=NEW.created_at,
+            next_status_check_at=NULL,
+            status_check_attempt_count=0,
+            status_check_error_code=NULL,
+            status_check_error_message=NULL,
+            updated_at=NEW.created_at
+          WHERE id=NEW.id;
+        END;
+      `);
+      const timestamp = now();
+      this.db
+        .prepare(
+          `UPDATE build_dispatches
+           SET status='accepted',
+             ozdqp_job_id=COALESCE(ozdqp_job_id, 'relay-assumed-success-' || id),
+             last_http_status=200,
+             last_error_code=NULL, last_error_message=NULL,
+             accepted_at=COALESCE(accepted_at, created_at), failed_at=NULL,
+             build_status='completed', build_step='打包成功',
+             build_cdn_url=NULL, build_error_message=NULL,
+             build_started_at=COALESCE(build_started_at, accepted_at, created_at),
+             build_finished_at=?, build_duration_seconds=0,
+             status_checked_at=?, next_status_check_at=NULL,
+             status_check_attempt_count=0, status_check_error_code=NULL,
+             status_check_error_message=NULL, updated_at=?
+           WHERE status IN ('pending','sending','retrying','accepted')
+             AND (build_status IS NULL OR build_status<>'completed')`,
+        )
+        .run(timestamp, timestamp, timestamp);
+    }
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS build_dispatches_status_check_idx ON build_dispatches(status, next_status_check_at ASC)",
     );
@@ -1510,6 +1561,34 @@ export class Store {
       .all(afterId, limit)
       .reverse()
       .map(eventFromRow);
+  }
+
+  latestWorkerEvent(workerId, type) {
+    if (!workerId || !type) return null;
+    return eventFromRow(
+      this.db
+        .prepare(
+          `SELECT * FROM events
+           WHERE worker_id=? AND type=?
+           ORDER BY id DESC LIMIT 1`,
+        )
+        .get(workerId, type),
+    );
+  }
+
+  latestEventOfTypes(types) {
+    const normalized = [...new Set(types || [])].filter(Boolean);
+    if (!normalized.length) return null;
+    const placeholders = normalized.map(() => "?").join(", ");
+    return eventFromRow(
+      this.db
+        .prepare(
+          `SELECT * FROM events
+           WHERE type IN (${placeholders})
+           ORDER BY id DESC LIMIT 1`,
+        )
+        .get(...normalized),
+    );
   }
 
   listTaskEvents(taskId) {

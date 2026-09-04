@@ -187,6 +187,10 @@ export const config = Object.freeze({
     "relay-unity-orchestrator@localhost",
   approvedOverlayPaths: stringList(process.env.PIPELINE_APPROVED_OVERLAY_PATHS),
   ozdqpBuildEnabled: boolean(process.env.OZDQP_BUILD_ENABLED, true),
+  ozdqpBuildAssumeSuccess: boolean(
+    process.env.OZDQP_BUILD_ASSUME_SUCCESS,
+    true,
+  ),
   ozdqpBuildApiUrl:
     process.env.OZDQP_BUILD_API_URL?.trim() ||
     "http://10.100.3.209:8088/api/v1/builds",
@@ -227,6 +231,14 @@ export const config = Object.freeze({
   ),
   opsSupervisorIntervalMs: integer(
     process.env.PIPELINE_OPS_SUPERVISOR_INTERVAL_MS,
+    5 * 60 * 1000,
+  ),
+  opsWorkerOccupancyStallMs: integer(
+    process.env.PIPELINE_OPS_WORKER_OCCUPANCY_STALL_MS,
+    15 * 60 * 1000,
+  ),
+  opsQueueLivenessStallMs: integer(
+    process.env.PIPELINE_OPS_QUEUE_LIVENESS_STALL_MS,
     5 * 60 * 1000,
   ),
   opsCodexModel: process.env.PIPELINE_OPS_CODEX_MODEL?.trim() || "gpt-5.6-luna",

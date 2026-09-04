@@ -637,7 +637,7 @@ function buildStatusView(dispatch: BuildDispatch) {
     building: "正在构建热更",
     validating: "正在校验产物",
     publishing: "正在发布热更",
-    completed: "热更已就绪，可以查看",
+    completed: "打包成功",
     failed: "热更打包失败",
     unknown: "打包机已接单",
   };
@@ -3889,7 +3889,7 @@ function TaskDetail({
               <span className="eyebrow">HOT UPDATE BUILD</span>
               <h2>热更打包进度</h2>
               <p>
-                代码交付并成功拉起打包后，本任务就已完成并释放队列；下面的打包进度独立更新，不会延迟下一条任务。
+                代码交付后，本任务就已完成并释放队列；下面的打包状态独立更新，不会延迟下一条任务。
               </p>
             </div>
             <BuildStatusPill dispatch={buildDispatches[0]} />

@@ -32,6 +32,8 @@ function configFor(dataDirectory) {
     opsMaxAttempts: 4,
     opsMaxConcurrentSessions: 4,
     opsSupervisorIntervalMs: 60_000,
+    opsWorkerOccupancyStallMs: 15 * 60_000,
+    opsQueueLivenessStallMs: 5 * 60_000,
     codexModel: "test-model",
     codexReasoningEffort: "high",
     codexServiceTier: "default",
@@ -235,6 +237,75 @@ class PersistentSupervisorSession {
             ]
           : [],
         verification: "Verify the original task prompt and running state.",
+      },
+    };
+  }
+}
+
+class WorkerOccupancyRecoverySession {
+  calls = [];
+
+  constructor(workerId) {
+    this.workerId = workerId;
+  }
+
+  async run(options) {
+    this.calls.push(options);
+    options.onEvent?.({
+      type: "thread.started",
+      thread_id: "worker-occupancy-supervisor",
+    });
+    return {
+      threadId: "worker-occupancy-supervisor",
+      final: {
+        status: "action_required",
+        summary: "The empty reservation is safe to release.",
+        diagnosis:
+          "The latest needs_input turn has no workspace changes and no active executor.",
+        confidence: 0.99,
+        actions: [
+          {
+            type: "worker.release",
+            targetId: this.workerId,
+            message: "Release the clean, durably archived worker workspace.",
+            reason:
+              "The worker has no executing turn and the workspace is clean.",
+          },
+        ],
+        verification:
+          "Verify the worker returns to ready or accepts queued work.",
+      },
+    };
+  }
+}
+
+class QueueLivenessRecoverySession {
+  calls = [];
+
+  async run(options) {
+    this.calls.push(options);
+    options.onEvent?.({
+      type: "thread.started",
+      thread_id: "queue-liveness-supervisor",
+    });
+    return {
+      threadId: "queue-liveness-supervisor",
+      final: {
+        status: "action_required",
+        summary: "The paused scheduler must resume its preserved queue.",
+        diagnosis:
+          "Queued turns exist while the scheduler is paused, so no worker can claim them.",
+        confidence: 1,
+        actions: [
+          {
+            type: "scheduler.resume",
+            targetId: null,
+            message: "Resume queue consumption without recreating any turn.",
+            reason: "A queued turn must not remain behind a paused scheduler.",
+          },
+        ],
+        verification:
+          "Wait for turn.prepare or turn.resume from the original queue.",
       },
     };
   }
@@ -736,6 +807,8 @@ test("five-minute supervisor reuses Luna Max and spawns a fresh unrestricted Sol
     message: originalPrompt,
     userName: "Tester",
   });
+  const claimed = store.claimNextTurn();
+  assert.equal(claimed.task.id, task.id);
   const scheduler = new Scheduler({
     config,
     store,
@@ -1522,6 +1595,8 @@ test("the persistent supervisor stays quiet without tasks and checks after the c
     message: "Watch this task every configured interval.",
     userName: "Tester",
   });
+  const claimed = store.claimNextTurn();
+  assert.equal(claimed.task.id, task.id);
   await new Promise((resolve) => setTimeout(resolve, 80));
   assert.equal(
     supervisor.calls.length,
@@ -1543,4 +1618,304 @@ test("the persistent supervisor stays quiet without tasks and checks after the c
     .find((candidate) => candidate.trigger === "monitor");
   assert.ok(turn);
   assert.match(turn.userMessage, /Five-minute persistent supervisor check/u);
+});
+
+test("worker occupancy watchdog releases a stale empty reservation without disturbing its waiting task", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-worker-occupancy-watchdog-"),
+  );
+  const config = {
+    ...configFor(dataDirectory),
+    opsSupervisorIntervalMs: 60_000,
+    opsWorkerOccupancyStallMs: 60_000,
+  };
+  const store = new Store(config);
+  const { project, worker } = seed(store);
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "Needs external fixture",
+    message: "Wait for a real fixture without occupying a worker forever.",
+    userName: "Tester",
+  });
+  const claimed = store.claimNextTurn();
+  assert.equal(claimed.turn.id, turn.id);
+  const old = "2020-01-01T00:00:00.000Z";
+  store.db
+    .prepare(
+      `UPDATE turns SET status='failed', error_code='CODEX_NEEDS_INPUT',
+         error_message='Fixture required', codex_final_json=?, finished_at=?
+       WHERE id=?`,
+    )
+    .run(
+      JSON.stringify({
+        status: "needs_input",
+        summary: "No changes were made.",
+        changedFiles: [],
+        validation: ["Worktree clean"],
+        risks: [],
+        question: "Provide a fixture.",
+      }),
+      old,
+      turn.id,
+    );
+  store.db
+    .prepare("UPDATE tasks SET status='waiting_user', updated_at=? WHERE id=?")
+    .run(old, task.id);
+  store.db
+    .prepare(
+      `UPDATE workers SET status='reserved', current_turn_id=NULL,
+         last_error='Codex requires user input', updated_at=? WHERE id=?`,
+    )
+    .run(old, worker.id);
+
+  const session = new WorkerOccupancyRecoverySession(worker.id);
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { sessionRunner: session },
+  );
+  t.after(async () => {
+    ops.stop();
+    await ops.waitForIdle();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  assert.equal(ops.workerOccupancyCandidates().length, 1);
+  await ops.start();
+  await waitUntil(
+    () => store.getWorker(worker.id).status === "ready",
+    "stale empty reservation release",
+  );
+
+  assert.equal(store.getTask(task.id).status, "waiting_user");
+  assert.equal(store.getTurn(turn.id).status, "failed");
+  assert.equal(store.getWorker(worker.id).currentTurnId, null);
+  const occupancyEvents = store
+    .listEvents({ limit: 1_000 })
+    .filter((event) => event.type === "worker.occupancy.stalled");
+  assert.equal(occupancyEvents.length, 1);
+  assert.equal(occupancyEvents[0].taskId, task.id);
+  assert.equal(occupancyEvents[0].data.code, "WORKER_OCCUPANCY_STALLED");
+  assert.equal(session.calls.length, 1);
+  assert.match(session.calls[0].prompt, /capacity has been lost/iu);
+  assert.deepEqual(ops.workerOccupancyCandidates(), []);
+  ops.scanWorkerOccupancyProblems();
+  assert.equal(
+    store
+      .listEvents({ limit: 1_000 })
+      .filter((event) => event.type === "worker.occupancy.stalled").length,
+    1,
+    "resolved state must not create a duplicate occupancy incident",
+  );
+});
+
+test("queue liveness watchdog resumes a paused scheduler and waits for verified consumption", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-queue-liveness-watchdog-"),
+  );
+  const config = {
+    ...configFor(dataDirectory),
+    phaseMs: 20,
+    opsSupervisorIntervalMs: 60_000,
+    opsQueueLivenessStallMs: 60_000,
+  };
+  const store = new Store(config);
+  const { project, worker } = seed(store);
+  store.updateWorker(
+    worker.id,
+    { enabled: false, status: "stopped" },
+    "Queue liveness test",
+  );
+  const { task, turn } = store.createTask({
+    projectId: project.id,
+    title: "Paused queue must recover",
+    message: "Consume this original turn after scheduler recovery.",
+    userName: "Tester",
+  });
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  await scheduler.start({ paused: true });
+  const session = new QueueLivenessRecoverySession();
+  const ops = new OpsEngine(
+    {
+      config,
+      store,
+      scheduler,
+      repairManager: { run: async () => null },
+    },
+    { sessionRunner: session },
+  );
+  t.after(async () => {
+    ops.stop();
+    await ops.waitForIdle();
+    scheduler.stop();
+    await scheduler.waitForIdle();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  assert.equal(store.getTurn(turn.id).status, "queued");
+  await ops.start();
+  await waitUntil(
+    () => scheduler.status().paused === false,
+    "queue watchdog scheduler resume",
+  );
+  const monitoringIncident = await waitUntil(
+    () =>
+      store
+        .listIncidents({ limit: 100 })
+        .find(
+          (incident) =>
+            incident.context?.eventType === "scheduler.queue.stalled" &&
+            incident.status === "monitoring",
+        ),
+    "queue incident to remain monitoring without a worker",
+  );
+  assert.equal(monitoringIncident.resolvedAt, null);
+  assert.equal(store.getTurn(turn.id).status, "queued");
+
+  store.updateWorker(
+    worker.id,
+    { enabled: true, status: "ready" },
+    "Queue liveness test",
+  );
+  scheduler.notifyQueueChanged();
+  await waitUntil(
+    () =>
+      store
+        .listTaskEvents(task.id)
+        .some((event) => ["turn.prepare", "turn.resume"].includes(event.type)),
+    "original queue consumption proof",
+  );
+  await waitUntil(
+    () =>
+      store
+        .listIncidents({ limit: 100 })
+        .some(
+          (incident) =>
+            incident.context?.eventType === "scheduler.queue.stalled" &&
+            Boolean(incident.resolvedAt),
+        ),
+    "verified queue liveness incident resolution",
+  );
+
+  const incident = store
+    .listIncidents({ limit: 100 })
+    .find(
+      (candidate) =>
+        candidate.context?.eventType === "scheduler.queue.stalled",
+    );
+  assert.ok(incident);
+  assert.equal(incident.lastAction, "turn.prepare");
+  assert.equal(session.calls.length, 1);
+  assert.match(session.calls[0].prompt, /queue-liveness invariant/iu);
+  const resumeAction = store
+    .listOpsActions()
+    .find((action) => action.type === "scheduler.resume");
+  assert.equal(resumeAction?.status, "completed");
+});
+
+test("automatic recovery cannot pause a scheduler that still has queued turns", async (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-queue-pause-guard-"),
+  );
+  const config = configFor(dataDirectory);
+  const store = new Store(config);
+  const { project } = seed(store);
+  store.createTask({
+    projectId: project.id,
+    title: "Keep queue live",
+    message: "Do not pause this queued turn.",
+    userName: "Tester",
+  });
+  const scheduler = new Scheduler({
+    config,
+    store,
+    adapter: new FakeAdapter(config),
+  });
+  const ops = new OpsEngine({
+    config,
+    store,
+    scheduler,
+    repairManager: { run: async () => null },
+  });
+  t.after(() => {
+    ops.stop();
+    scheduler.stop();
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    () =>
+      ops.performAction(
+        { trigger: "incident", incidentId: null },
+        {
+          type: "scheduler.pause",
+          targetId: null,
+          message: "Pause automatically.",
+          reason: "Synthetic recovery action.",
+        },
+        {},
+      ),
+    (error) => error.code === "QUEUE_PRESENT_SCHEDULER_PAUSE_FORBIDDEN",
+  );
+  assert.equal(scheduler.status().paused, false);
+  assert.equal(
+    store.listTurns().filter((candidate) => candidate.status === "queued")
+      .length,
+    1,
+  );
+});
+
+test("running scheduler with a stale unconsumed queue is a liveness incident", (t) => {
+  const dataDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "relay-unconsumed-queue-watchdog-"),
+  );
+  const config = {
+    ...configFor(dataDirectory),
+    opsQueueLivenessStallMs: 60_000,
+  };
+  const store = new Store(config);
+  const { project } = seed(store);
+  const { turn } = store.createTask({
+    projectId: project.id,
+    title: "Unconsumed queue",
+    message: "This queue has no active executor.",
+    userName: "Tester",
+  });
+  const old = "2020-01-01T00:00:00.000Z";
+  store.db.prepare("UPDATE turns SET created_at=? WHERE id=?").run(old, turn.id);
+  const scheduler = {
+    status: () => ({ running: true, paused: false, activeTurns: 0 }),
+  };
+  const ops = new OpsEngine({
+    config,
+    store,
+    scheduler,
+    repairManager: { run: async () => null },
+  });
+  t.after(() => {
+    store.close();
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  const problem = ops.queueLivenessProblem();
+  assert.equal(problem?.reason, "queued-turns-without-execution");
+  assert.equal(problem?.queuedTurns.length, 1);
+  assert.equal(problem?.executingTurns.length, 0);
 });
